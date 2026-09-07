@@ -8,7 +8,8 @@ A Flask-based Crime Management Portal integrated with real **Kaggle / NCRB Crime
 - 🔍 **Crime Statistics Explorer** — Multi-filter search by State, District, Year, Crime Category with pagination
 - 👩 **Women & Children Reports** — Dedicated domain analytics
 - 💰 **Property & Arrest Statistics** — Stolen vs recovered property, Arrest/Conviction data
-- 🏢 **Operational Modules** — Police Stations, FIR Management, Criminal Records, Case Files
+- 🏢 **Operational Modules** — Add stations and officers, file FIRs, maintain criminal records, and open/update case files
+- 🔗 **Dataset Context in Operations** — NCRB state coverage, crime-category, arrest, and yearly reference tables are shown alongside operational records; aggregate historical statistics remain separate from individual records
 - 📡 **REST API** — `/api/stats` JSON endpoint
 
 ## Dataset
