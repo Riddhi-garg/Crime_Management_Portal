@@ -4,6 +4,7 @@ Integrated with Real Kaggle/NCRB Crime Statistics Dataset (2001-2014)
 """
 
 import os
+import json
 import sqlite3
 import datetime
 from flask import Flask, render_template_string, request, jsonify, redirect
@@ -14,6 +15,9 @@ app.config['SECRET_KEY'] = 'crms-kaggle-ncrb-key-2026'
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, 'data')
 DB_PATH = os.path.join(DATA_DIR, 'crms.db')
+POLICE_STATIONS_GEOJSON = os.path.join(
+    DATA_DIR, 'police', 'stations', 'INDIA_POLICE_STATIONS.geojson'
+)
 
 
 def get_db_connection():
@@ -161,6 +165,7 @@ HTML_NAVBAR = """
         <li class="nav-item"><a class="nav-link" href="/women-children-analytics" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">Women &amp; Children</a></li>
         <li class="nav-item"><a class="nav-link" href="/property-arrest-analytics" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">Property &amp; Arrests</a></li>
         <li class="nav-item"><a class="nav-link" href="/police-stations" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">Police Stations</a></li>
+        <li class="nav-item"><a class="nav-link" href="/police-station-map" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">Station Map</a></li>
         <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">FIR Management</a></li>
         <li class="nav-item"><a class="nav-link" href="/criminal-records" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">Criminal Records</a></li>
         <li class="nav-item"><a class="nav-link" href="/case-files" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">Case Files</a></li>
@@ -824,6 +829,62 @@ def _table_exists(conn, table_name):
     ).fetchone() is not None
 
 
+def _load_police_stations_geojson():
+        with open(POLICE_STATIONS_GEOJSON, 'r', encoding='utf-8') as file:
+                return json.load(file)
+
+
+@app.route('/api/police-stations')
+def api_police_stations():
+        if not os.path.exists(POLICE_STATIONS_GEOJSON):
+                return jsonify({'error': 'Police station GeoJSON file is not available'}), 404
+        return jsonify(_load_police_stations_geojson())
+
+
+@app.route('/police-station-map')
+def police_station_map():
+        if not os.path.exists(POLICE_STATIONS_GEOJSON):
+                content = "<h2 class='text-info'>Police Station Map</h2><p>The station GeoJSON file is not available.</p>"
+                return render_template_string(HTML_LAYOUT, content=content), 404
+
+        body = """
+        <div class="d-flex justify-content-between align-items-center mb-3">
+                <div>
+                        <h2 class="text-info mb-1">India Police Station Map</h2>
+                        <p class="text-muted mb-0">Reference locations from the local GeoJSON dataset.</p>
+                </div>
+                <span id="station-count" class="source-badge">Loading stations...</span>
+        </div>
+        <div class="card p-2"><div id="station-map" style="height: 70vh; min-height: 480px;"></div></div>
+        <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+        <script>
+            const map = L.map('station-map').setView([22.5, 82.5], 5);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '&copy; OpenStreetMap contributors'
+            }).addTo(map);
+            fetch('/api/police-stations')
+                .then(response => response.json())
+                .then(data => {
+                    const features = data.features || [];
+                    document.getElementById('station-count').textContent = `${features.length.toLocaleString()} stations`;
+                    const layer = L.geoJSON(data, {
+                        pointToLayer: (feature, latlng) => L.circleMarker(latlng, {
+                            radius: 4, color: '#c0392b', fillColor: '#f0c040', fillOpacity: 0.8
+                        }),
+                        onEachFeature: (feature, layer) => {
+                            const properties = feature.properties || {};
+                            layer.bindPopup(`<strong>${properties.ps || 'Police Station'}</strong><br>${properties.district || ''}, ${properties.state || ''}`);
+                        }
+                    }).addTo(map);
+                    if (features.length) map.fitBounds(layer.getBounds(), {padding: [20, 20]});
+                })
+                .catch(() => { document.getElementById('station-count').textContent = 'Unable to load stations'; });
+        </script>
+        """
+        return render_template_string(HTML_LAYOUT, content=body)
+
+
 # OPERATIONAL MODULES
 @app.route('/police-stations')
 def police_stations():
@@ -842,6 +903,11 @@ def police_stations():
         GROUP BY state ORDER BY reported_cases DESC LIMIT 10
     """).fetchall() if _table_exists(conn, 'crime_statistics') else []
     conn.close()
+
+    geojson_stations = []
+    if os.path.exists(POLICE_STATIONS_GEOJSON):
+        geojson_data = _load_police_stations_geojson()
+        geojson_stations = [feature.get('properties', {}) for feature in geojson_data.get('features', [])]
     
     stations_html = "".join([f"""
     <tr>
@@ -868,11 +934,28 @@ def police_stations():
         <td>{s['reported_cases']:,}</td><td>{s['latest_year']}</td></tr>
     """ for s in dataset_summary]) or "<tr><td colspan='4' class='text-center text-muted py-4'>Run the dataset import to show NCRB coverage.</td></tr>"
     station_options = "".join(f'<option value="{s["station_id"]}">{s["station_name"]}</option>' for s in stations)
+    geojson_rows = "".join([f"""
+    <tr><td class="fw-bold text-warning">{station.get('ps') or 'Police Station'}</td>
+        <td>{station.get('district') or 'N/A'}</td><td>{station.get('state') or 'N/A'}</td>
+        <td>{station.get('latitude')}, {station.get('longitude')}</td></tr>
+    """ for station in geojson_stations[:100]]) or "<tr><td colspan='4' class='text-center text-muted py-4'>Police station GeoJSON not available.</td></tr>"
 
     body = f"""
     <h2 class="text-warning mb-3">🏢 Police Stations & Officer Directory</h2>
     <div class="card p-4 mb-4">
-        <div class="d-flex justify-content-between align-items-center mb-3"><h4 class="text-info m-0">Police Precincts</h4><a href="/police-stations#add-station" class="btn btn-warning btn-sm">Add Station</a></div>
+        <div class="d-flex justify-content-between align-items-center mb-3">
+            <div><h4 class="text-info m-0">Police Station Reference Data</h4>
+            <small class="text-muted">{len(geojson_stations):,} locations from the downloaded GeoJSON dataset</small></div>
+            <a href="/police-station-map" class="btn btn-outline-info btn-sm">Open Station Map</a>
+        </div>
+        <div class="table-responsive"><table class="table table-dark table-hover align-middle">
+            <thead><tr><th>Station Name</th><th>District</th><th>State / UT</th><th>Coordinates</th></tr></thead>
+            <tbody>{geojson_rows}</tbody>
+        </table></div>
+        <small class="text-muted">Showing the first 100 reference locations. These records are not operational station accounts.</small>
+    </div>
+    <div class="card p-4 mb-4">
+        <div class="d-flex justify-content-between align-items-center mb-3"><h4 class="text-info m-0">Operational Police Precincts</h4><a href="/police-stations#add-station" class="btn btn-warning btn-sm">Add Station</a></div>
         <div class="table-responsive">
             <table class="table table-dark table-hover align-middle">
                 <thead><tr><th>ID</th><th>Station Name</th><th>Address</th><th>Contact Number</th></tr></thead>

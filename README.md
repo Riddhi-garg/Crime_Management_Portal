@@ -11,6 +11,7 @@ A Flask-based Crime Management Portal integrated with real **Kaggle / NCRB Crime
 - 🏢 **Operational Modules** — Add stations and officers, file FIRs, maintain criminal records, and open/update case files
 - 🔗 **Dataset Context in Operations** — NCRB state coverage, crime-category, arrest, and yearly reference tables are shown alongside operational records; aggregate historical statistics remain separate from individual records
 - 📡 **REST API** — `/api/stats` JSON endpoint
+- 🗺️ **Police Station Map** — 16,459 station locations from the local GeoJSON dataset at `/police-station-map`
 
 ## Dataset
 
@@ -22,6 +23,8 @@ Real NCRB district-wise crime statistics from `archive/` folder:
 - `04_02_Person_arrested_and_their_disposal_*_IPC_crime_*.csv`
 
 > **341,108** IPC crime records across **28 states**, **950 districts**, **14 years**, **97 crime categories**.
+
+Police station reference locations are loaded from `data/police/stations/INDIA_POLICE_STATIONS.geojson`. The data is available through `/api/police-stations` and displayed on the Leaflet map at `/police-station-map`; operational stations added through the portal remain separate.
 
 ## Setup & Run
 
