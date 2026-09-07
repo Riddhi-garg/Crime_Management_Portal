@@ -1,7 +1,7 @@
 """
 Import and Cleaning Pipeline for Kaggle/NCRB Crime Datasets
 Processes district-wise IPC crimes, crimes against women, crimes against children,
-property stolen & recovered, arrest statistics, and police infrastructure into SQLite data/crms.db.
+property stolen & recovered, and arrest statistics into SQLite data/crms.db.
 """
 
 import os
@@ -129,22 +129,6 @@ def create_schema(conn):
     );
     """)
 
-    # 6. Dataful Police Stations and Outposts Dataset
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS police_infrastructure_statistics (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        data_as_on TEXT NOT NULL,
-        state TEXT NOT NULL,
-        station_or_outpost TEXT NOT NULL,
-        station_or_outpost_type TEXT NOT NULL,
-        category TEXT NOT NULL,
-        value INTEGER DEFAULT 0,
-        unit TEXT,
-        note TEXT,
-        source TEXT NOT NULL DEFAULT 'Dataful/BPRD Police Organizations'
-    );
-    """)
-
     # Create Indexes for fast querying & dynamic charts
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_cs_state ON crime_statistics(state);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_cs_district ON crime_statistics(district);")
@@ -157,8 +141,6 @@ def create_schema(conn):
 
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_ccs_state ON children_crime_statistics(state);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_ccs_year ON children_crime_statistics(year);")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pis_state ON police_infrastructure_statistics(state);")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pis_date ON police_infrastructure_statistics(data_as_on);")
 
     conn.commit()
 
@@ -359,53 +341,6 @@ def process_arrest_statistics(conn):
     return inserted
 
 
-def process_police_infrastructure(conn):
-    """Import Dataful dataset 20145 downloaded as a CSV export."""
-    filepath = os.path.join(ARCHIVE_DIR, 'dataful_police_stations_and_outposts.csv')
-    if not os.path.exists(filepath):
-        print(f"File not found: {os.path.basename(filepath)} (download Dataful dataset 20145 first)")
-        return 0
-
-    cursor = conn.cursor()
-    records = []
-    with open(filepath, 'r', encoding='utf-8-sig', errors='ignore') as f:
-        reader = csv.DictReader(f)
-        required = {
-            'data_as_on', 'state', 'station_or_outpost',
-            'station_or_outpost_type', 'category', 'value', 'unit', 'note'
-        }
-        headers = {clean_name(name).lower() for name in (reader.fieldnames or [])}
-        missing = required - headers
-        if missing:
-            raise ValueError(
-                f"Dataful police infrastructure CSV is missing columns: {', '.join(sorted(missing))}"
-            )
-
-        for row in reader:
-            normalized = {clean_name(key).lower(): clean_name(value) for key, value in row.items()}
-            state = normalized.get('state', '')
-            if not state or is_total_row(state):
-                continue
-            records.append((
-                normalized.get('data_as_on', ''), state,
-                normalized.get('station_or_outpost', ''),
-                normalized.get('station_or_outpost_type', ''),
-                normalized.get('category', ''), safe_int(normalized.get('value')),
-                normalized.get('unit', ''),
-                normalized.get('note', '').replace('<nil>', '') or None,
-                'Dataful/BPRD Police Organizations (Dataset 20145)'
-            ))
-
-    if records:
-        cursor.executemany("""
-        INSERT INTO police_infrastructure_statistics
-        (data_as_on, state, station_or_outpost, station_or_outpost_type, category, value, unit, note, source)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, records)
-        conn.commit()
-    return len(records)
-
-
 def run_pipeline():
     print("=" * 60)
     print("KAGGLE/NCRB CRIME DATA IMPORT & CLEANING PIPELINE")
@@ -421,7 +356,6 @@ def run_pipeline():
     cursor.execute("DELETE FROM children_crime_statistics;")
     cursor.execute("DELETE FROM property_crime_statistics;")
     cursor.execute("DELETE FROM arrest_statistics;")
-    cursor.execute("DELETE FROM police_infrastructure_statistics;")
     conn.commit()
     
     # 1. Main IPC Crime Datasets
@@ -453,9 +387,6 @@ def run_pipeline():
     # 5. Arrest Statistics
     arrest_count = process_arrest_statistics(conn)
 
-    # 6. Dataful Police Stations and Outposts Dataset (2011-2024)
-    police_infrastructure_count = process_police_infrastructure(conn)
-
     conn.close()
 
     print("\n" + "=" * 60)
@@ -476,7 +407,6 @@ def run_pipeline():
     print(f"Crimes Against Children Records Inserted: {children_res['inserted_records']}")
     print(f"Property Stolen/Recovered Records Inserted: {prop_count}")
     print(f"Arrest & Disposal Records Inserted: {arrest_count}")
-    print(f"Police Stations & Outposts Records Inserted: {police_infrastructure_count}")
     print("=" * 60 + "\n")
 
 
