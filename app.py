@@ -161,11 +161,12 @@ HTML_NAVBAR = """
         <li class="nav-item"><a class="nav-link" href="/women-children-analytics" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">Women &amp; Children</a></li>
         <li class="nav-item"><a class="nav-link" href="/property-arrest-analytics" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">Property &amp; Arrests</a></li>
         <li class="nav-item"><a class="nav-link" href="/police-stations" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">Police Stations</a></li>
+        <li class="nav-item"><a class="nav-link" href="/police-infrastructure" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">Police Infrastructure</a></li>
         <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">FIR Management</a></li>
         <li class="nav-item"><a class="nav-link" href="/criminal-records" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">Criminal Records</a></li>
         <li class="nav-item"><a class="nav-link" href="/case-files" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">Case Files</a></li>
       </ul>
-      <span class="badge p-2" style="background-color: #c0392b; font-family: 'Times New Roman', Times, serif;">NCRB / Kaggle Dataset</span>
+    <span class="badge p-2" style="background-color: #c0392b; font-family: 'Times New Roman', Times, serif;">NCRB / Dataful Datasets</span>
     </div>
   </div>
 </nav>
@@ -241,7 +242,7 @@ HTML_LAYOUT = """
         {{ content | safe }}
     </div>
     <footer class="text-center py-3 mt-5" style="background-color: #f8f9fa; border-top: 1px solid #dee2e6;">
-        <small style="color: #555555;">Data Source: Kaggle / NCRB Crime Statistics Dataset (2001-2014) | Crime Management Portal</small>
+        <small style="color: #555555;">Data Source: Kaggle / NCRB and Dataful / BPRD datasets | Crime Management Portal</small>
     </footer>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 </body>
@@ -804,6 +805,44 @@ def property_arrest_analytics():
     return render_template_string(HTML_LAYOUT, content=body)
 
 
+@app.route('/police-infrastructure')
+def police_infrastructure():
+    conn = get_db_connection()
+    if not _table_exists(conn, 'police_infrastructure_statistics'):
+        conn.close()
+        return render_template_string(
+            HTML_LAYOUT,
+            content="<h2 class='text-info'>Police Infrastructure</h2><p>Run the dataset import to load Dataful dataset 20145.</p>"
+        )
+
+    rows = conn.execute("""
+        SELECT state, station_or_outpost, station_or_outpost_type,
+               SUM(CASE WHEN category = 'Actual' THEN value ELSE 0 END) AS actual,
+               SUM(CASE WHEN category = 'Sanctioned' THEN value ELSE 0 END) AS sanctioned
+        FROM police_infrastructure_statistics
+        GROUP BY state, station_or_outpost, station_or_outpost_type
+        ORDER BY state, station_or_outpost, station_or_outpost_type
+    """).fetchall()
+    conn.close()
+
+    table_rows = ''.join(
+        f"<tr><td>{row['state']}</td><td>{row['station_or_outpost']}</td>"
+        f"<td>{row['station_or_outpost_type']}</td><td>{row['sanctioned']:,}</td>"
+        f"<td>{row['actual']:,}</td></tr>"
+        for row in rows
+    ) or "<tr><td colspan='5' class='text-center text-muted py-4'>No Dataful police infrastructure records loaded.</td></tr>"
+
+    body = f"""
+    <h2 class="text-info mb-2">Police Stations &amp; Outposts</h2>
+    <p class="text-muted">Dataful dataset 20145, sourced from the Bureau of Police Research and Development.</p>
+    <div class="card p-4"><div class="table-responsive"><table class="table table-dark table-hover align-middle">
+        <thead><tr><th>State / UT</th><th>Asset</th><th>Region</th><th>Sanctioned</th><th>Actual</th></tr></thead>
+        <tbody>{table_rows}</tbody>
+    </table></div></div>
+    """
+    return render_template_string(HTML_LAYOUT, content=body)
+
+
 # --- Status option sets shared by the operational modules ---
 FIR_STATUSES = ["Pending", "Under Investigation", "Chargesheet Filed", "Closed"]
 CASE_STATUSES = ["Active", "Under Trial", "Closed", "Dismissed"]
@@ -1176,7 +1215,7 @@ def api_stats():
     conn = get_db_connection()
     try:
         stats = {
-            "dataset_source": "Kaggle / NCRB Crime Statistics Dataset (2001-2014)",
+            "dataset_source": "Kaggle / NCRB Crime Statistics and Dataful / BPRD datasets",
             "total_crime_cases": conn.execute("SELECT SUM(case_count) FROM crime_statistics").fetchone()[0],
             "total_stat_entries": conn.execute("SELECT COUNT(*) FROM crime_statistics").fetchone()[0],
             "states_and_uts": conn.execute("SELECT COUNT(DISTINCT state) FROM crime_statistics").fetchone()[0],
@@ -1187,6 +1226,11 @@ def api_stats():
             ],
             "crime_categories": conn.execute("SELECT COUNT(DISTINCT crime_type) FROM crime_statistics").fetchone()[0]
         }
+        if _table_exists(conn, 'police_infrastructure_statistics'):
+            stats["police_infrastructure_records"] = conn.execute(
+                "SELECT COUNT(*) FROM police_infrastructure_statistics"
+            ).fetchone()[0]
+            stats["police_infrastructure_source"] = "Dataful/BPRD Dataset 20145"
     except Exception as e:
         stats = {"error": str(e)}
     return jsonify(stats)
