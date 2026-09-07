@@ -5,7 +5,8 @@ Integrated with Real Kaggle/NCRB Crime Statistics Dataset (2001-2014)
 
 import os
 import sqlite3
-from flask import Flask, render_template_string, request, jsonify
+import datetime
+from flask import Flask, render_template_string, request, jsonify, redirect
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'crms-kaggle-ncrb-key-2026'
@@ -803,16 +804,44 @@ def property_arrest_analytics():
     return render_template_string(HTML_LAYOUT, content=body)
 
 
-# OPERATIONAL MODULES (Preserved with clear empty state support)
+# --- Status option sets shared by the operational modules ---
+FIR_STATUSES = ["Pending", "Under Investigation", "Chargesheet Filed", "Closed"]
+CASE_STATUSES = ["Active", "Under Trial", "Closed", "Dismissed"]
+CRIMINAL_STATUSES = ["Wanted", "Arrested", "Convicted", "Released", "Absconding"]
+
+
+def _options_html(items, current):
+    return "".join(
+        f'<option value="{item}"{" selected" if item == current else ""}>{item}</option>'
+        for item in items
+    )
+
+
+def _table_exists(conn, table_name):
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,)
+    ).fetchone() is not None
+
+
+# OPERATIONAL MODULES
 @app.route('/police-stations')
 def police_stations():
     conn = get_db_connection()
-    stations = conn.execute("SELECT * FROM police_stations").fetchall()
+    stations = conn.execute("SELECT * FROM police_stations ORDER BY station_id DESC").fetchall()
     officers = conn.execute("""
         SELECT o.*, s.station_name 
         FROM police_officers o 
         LEFT JOIN police_stations s ON o.station_id = s.station_id
+        ORDER BY o.officer_id DESC
     """).fetchall()
+    dataset_summary = conn.execute("""
+        SELECT state, COUNT(DISTINCT district) AS districts,
+               SUM(case_count) AS reported_cases, MAX(year) AS latest_year
+        FROM crime_statistics
+        GROUP BY state ORDER BY reported_cases DESC LIMIT 10
+    """).fetchall() if _table_exists(conn, 'crime_statistics') else []
+    conn.close()
     
     stations_html = "".join([f"""
     <tr>
@@ -834,10 +863,16 @@ def police_stations():
     </tr>
     """ for o in officers]) or "<tr><td colspan='6' class='text-center text-muted py-4'>No operational police officers registered yet.</td></tr>"
 
+    dataset_rows = "".join([f"""
+    <tr><td class="fw-bold text-warning">{s['state']}</td><td>{s['districts']}</td>
+        <td>{s['reported_cases']:,}</td><td>{s['latest_year']}</td></tr>
+    """ for s in dataset_summary]) or "<tr><td colspan='4' class='text-center text-muted py-4'>Run the dataset import to show NCRB coverage.</td></tr>"
+    station_options = "".join(f'<option value="{s["station_id"]}">{s["station_name"]}</option>' for s in stations)
+
     body = f"""
     <h2 class="text-warning mb-3">🏢 Police Stations & Officer Directory</h2>
     <div class="card p-4 mb-4">
-        <h4 class="text-info mb-3">Police Precincts</h4>
+        <div class="d-flex justify-content-between align-items-center mb-3"><h4 class="text-info m-0">Police Precincts</h4><a href="/police-stations#add-station" class="btn btn-warning btn-sm">Add Station</a></div>
         <div class="table-responsive">
             <table class="table table-dark table-hover align-middle">
                 <thead><tr><th>ID</th><th>Station Name</th><th>Address</th><th>Contact Number</th></tr></thead>
@@ -846,8 +881,28 @@ def police_stations():
         </div>
     </div>
 
+    <div class="card p-4 mb-4">
+        <h4 class="text-info mb-3">NCRB Dataset Coverage by State</h4>
+        <div class="table-responsive"><table class="table table-dark table-hover align-middle">
+            <thead><tr><th>State / UT</th><th>Districts</th><th>Reported Cases</th><th>Latest Year</th></tr></thead>
+            <tbody>{dataset_rows}</tbody>
+        </table></div>
+    </div>
+
+    <div class="card p-4 mb-4" id="add-station">
+        <h4 class="text-info mb-3">Add Police Station</h4>
+        <form method="POST" action="/police-stations/add" class="row g-2">
+            <div class="col-md-3"><input class="form-control" name="station_name" placeholder="Station name" required></div>
+            <div class="col-md-3"><input class="form-control" name="address" placeholder="Address" required></div>
+            <div class="col-md-2"><input class="form-control" name="city" placeholder="City" required></div>
+            <div class="col-md-2"><input class="form-control" name="state" placeholder="State" required></div>
+            <div class="col-md-2"><input class="form-control" name="contact_number" placeholder="Contact number" required></div>
+            <div class="col-12"><button type="submit" class="btn btn-warning">Add Station</button></div>
+        </form>
+    </div>
+
     <div class="card p-4">
-        <h4 class="text-info mb-3">Deputed Police Officers</h4>
+        <div class="d-flex justify-content-between align-items-center mb-3"><h4 class="text-info m-0">Deputed Police Officers</h4><a href="/police-stations#add-officer" class="btn btn-warning btn-sm">Add Officer</a></div>
         <div class="table-responsive">
             <table class="table table-dark table-hover align-middle">
                 <thead><tr><th>Badge No</th><th>Officer Name</th><th>Rank</th><th>Station</th><th>Phone</th><th>Email</th></tr></thead>
@@ -855,8 +910,41 @@ def police_stations():
             </table>
         </div>
     </div>
+
+    <div class="card p-4 mt-4" id="add-officer">
+        <h4 class="text-info mb-3">Add Police Officer</h4>
+        <form method="POST" action="/police-stations/add-officer" class="row g-2">
+            <div class="col-md-2"><input class="form-control" name="name" placeholder="Name" required></div>
+            <div class="col-md-2"><input class="form-control" name="rank" placeholder="Rank" required></div>
+            <div class="col-md-2"><input class="form-control" name="badge_number" placeholder="Badge number" required></div>
+            <div class="col-md-2"><input class="form-control" name="phone" placeholder="Phone" required></div>
+            <div class="col-md-2"><input type="email" class="form-control" name="email" placeholder="Email" required></div>
+            <div class="col-md-2"><select class="form-select" name="station_id" required><option value="">Station</option>{station_options}</select></div>
+            <div class="col-12"><button type="submit" class="btn btn-warning">Add Officer</button></div>
+        </form>
+    </div>
     """
     return render_template_string(HTML_LAYOUT, content=body)
+
+
+@app.route('/police-stations/add', methods=['POST'])
+def add_police_station():
+    conn = get_db_connection()
+    conn.execute("INSERT INTO police_stations (station_name, address, city, state, contact_number) VALUES (?, ?, ?, ?, ?)",
+                 (request.form['station_name'], request.form['address'], request.form['city'], request.form['state'], request.form['contact_number']))
+    conn.commit()
+    conn.close()
+    return redirect('/police-stations')
+
+
+@app.route('/police-stations/add-officer', methods=['POST'])
+def add_police_officer():
+    conn = get_db_connection()
+    conn.execute("INSERT INTO police_officers (name, rank, badge_number, phone, email, station_id) VALUES (?, ?, ?, ?, ?, ?)",
+                 (request.form['name'], request.form['rank'], request.form['badge_number'], request.form['phone'], request.form['email'], request.form['station_id']))
+    conn.commit()
+    conn.close()
+    return redirect('/police-stations')
 
 
 @app.route('/fir-management')
@@ -868,7 +956,14 @@ def fir_management():
         LEFT JOIN crimes c ON f.crime_id = c.crime_id
         LEFT JOIN victims v ON f.victim_id = v.victim_id
         LEFT JOIN police_stations s ON f.station_id = s.station_id
+        ORDER BY f.fir_id DESC
     """).fetchall()
+    stations = conn.execute("SELECT * FROM police_stations ORDER BY station_name").fetchall()
+    crime_categories = conn.execute("""
+        SELECT crime_type, SUM(case_count) AS total
+        FROM crime_statistics GROUP BY crime_type ORDER BY total DESC LIMIT 10
+    """).fetchall() if _table_exists(conn, 'crime_statistics') else []
+    conn.close()
 
     firs_html = "".join([f"""
     <tr>
@@ -877,13 +972,16 @@ def fir_management():
         <td>{f['victim_name']}</td>
         <td>{f['station_name']}</td>
         <td>{f['filing_date']}</td>
-        <td><span class="badge bg-info">{f['status']}</span></td>
+        <td><form method="POST" action="/fir-management/{f['fir_id']}/status" class="d-flex gap-1"><select name="status" class="form-select form-select-sm">{_options_html(FIR_STATUSES, f['status'])}</select><button class="btn btn-sm btn-outline-primary">Update</button></form></td>
     </tr>
     """ for f in firs]) or "<tr><td colspan='6' class='text-center text-muted py-4'>No individual FIR records filed yet. Analytical crime statistics are managed in <a href='/crime-statistics'>Crime Statistics</a>.</td></tr>"
+    category_rows = "".join(f"<tr><td>{c['crime_type']}</td><td class='fw-bold text-danger'>{c['total']:,}</td></tr>" for c in crime_categories) or "<tr><td colspan='2' class='text-center text-muted'>Run the dataset import to show categories.</td></tr>"
+    station_options = "".join(f'<option value="{s["station_id"]}">{s["station_name"]}</option>' for s in stations) or '<option value="" disabled selected>Add a police station first</option>'
+    category_options = "".join(f'<option value="{c["crime_type"]}">' for c in crime_categories)
 
     body = f"""
     <h2 class="text-warning mb-3">📄 FIR (First Information Report) Registry</h2>
-    <div class="card p-4">
+    <div class="card p-4 mb-4">
         <div class="table-responsive">
             <table class="table table-dark table-hover align-middle">
                 <thead><tr><th>FIR Number</th><th>Crime Type</th><th>Complainant/Victim</th><th>Police Station</th><th>Filing Date</th><th>Status</th></tr></thead>
@@ -891,14 +989,70 @@ def fir_management():
             </table>
         </div>
     </div>
+
+    <div class="row g-4">
+        <div class="col-lg-7"><div class="card p-4">
+            <h4 class="text-info mb-3">NCRB Crime Categories Reference</h4>
+            <div class="table-responsive"><table class="table table-dark table-hover"><thead><tr><th>Crime Category</th><th>Reported Cases</th></tr></thead><tbody>{category_rows}</tbody></table></div>
+        </div></div>
+        <div class="col-lg-5"><div class="card p-4">
+            <h4 class="text-info mb-3">File New FIR</h4>
+            <form method="POST" action="/fir-management/add">
+                <input class="form-control mb-2" name="crime_type" list="crime-categories" placeholder="Crime type" required><datalist id="crime-categories">{category_options}</datalist>
+                <textarea class="form-control mb-2" name="crime_description" placeholder="Crime description" rows="2" required></textarea>
+                <div class="row g-2 mb-2"><div class="col"><input type="date" class="form-control" name="crime_date" required></div><div class="col"><input type="time" class="form-control" name="crime_time"></div></div>
+                <input class="form-control mb-2" name="location" placeholder="Location" required>
+                <div class="row g-2 mb-2"><div class="col"><input class="form-control" name="city" placeholder="City" required></div><div class="col"><input class="form-control" name="state" placeholder="State" required></div></div>
+                <select class="form-select mb-3" name="severity"><option>Minor</option><option selected>Major</option><option>Critical</option></select>
+                <input class="form-control mb-2" name="victim_name" placeholder="Victim / complainant name" required>
+                <div class="row g-2 mb-2"><div class="col"><input type="number" min="0" class="form-control" name="victim_age" placeholder="Age"></div><div class="col"><select class="form-select" name="victim_gender"><option>Male</option><option>Female</option><option>Other</option></select></div></div>
+                <input class="form-control mb-2" name="victim_phone" placeholder="Victim phone" required><input class="form-control mb-2" name="victim_address" placeholder="Victim address">
+                <input class="form-control mb-2" name="fir_number" placeholder="FIR number" required><select class="form-select mb-2" name="station_id" required>{station_options}</select>
+                <input type="date" class="form-control mb-2" name="filing_date" required><textarea class="form-control mb-3" name="fir_description" placeholder="FIR narrative" rows="2" required></textarea>
+                <button type="submit" class="btn btn-warning w-100">File FIR</button>
+            </form>
+        </div></div>
+    </div>
     """
     return render_template_string(HTML_LAYOUT, content=body)
+
+
+@app.route('/fir-management/add', methods=['POST'])
+def add_fir():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO crimes (crime_type, description, crime_date, crime_time, location, city, state, severity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (request.form['crime_type'], request.form['crime_description'], request.form['crime_date'], request.form.get('crime_time') or None,
+                 request.form['location'], request.form['city'], request.form['state'], request.form['severity']))
+    crime_id = cur.lastrowid
+    cur.execute("INSERT INTO victims (name, age, gender, address, phone) VALUES (?, ?, ?, ?, ?)",
+                (request.form['victim_name'], request.form.get('victim_age') or None, request.form.get('victim_gender', 'Other'), request.form.get('victim_address'), request.form['victim_phone']))
+    victim_id = cur.lastrowid
+    cur.execute("INSERT INTO FIR (fir_number, crime_id, victim_id, station_id, filing_date, description) VALUES (?, ?, ?, ?, ?, ?)",
+                (request.form['fir_number'], crime_id, victim_id, request.form['station_id'], request.form['filing_date'], request.form['fir_description']))
+    conn.commit()
+    conn.close()
+    return redirect('/fir-management')
+
+
+@app.route('/fir-management/<int:fir_id>/status', methods=['POST'])
+def update_fir_status(fir_id):
+    conn = get_db_connection()
+    conn.execute("UPDATE FIR SET status = ? WHERE fir_id = ?", (request.form['status'], fir_id))
+    conn.commit()
+    conn.close()
+    return redirect('/fir-management')
 
 
 @app.route('/criminal-records')
 def criminal_records():
     conn = get_db_connection()
-    criminals = conn.execute("SELECT * FROM criminals").fetchall()
+    criminals = conn.execute("SELECT * FROM criminals ORDER BY criminal_id DESC").fetchall()
+    arrest_context = conn.execute("""
+        SELECT crime_head, SUM(persons_arrested) AS arrested, SUM(persons_convicted) AS convicted
+        FROM arrest_statistics GROUP BY crime_head ORDER BY arrested DESC LIMIT 10
+    """).fetchall() if _table_exists(conn, 'arrest_statistics') else []
+    conn.close()
     
     criminals_html = "".join([f"""
     <tr>
@@ -907,13 +1061,14 @@ def criminal_records():
         <td>{cr['alias'] or 'N/A'}</td>
         <td>{cr['gender']}</td>
         <td>{cr['identification_details'] or 'N/A'}</td>
-        <td><span class="badge bg-danger">{cr['status']}</span></td>
+        <td><form method="POST" action="/criminal-records/{cr['criminal_id']}/status" class="d-flex gap-1"><select name="status" class="form-select form-select-sm">{_options_html(CRIMINAL_STATUSES, cr['status'])}</select><button class="btn btn-sm btn-outline-primary">Update</button></form></td>
     </tr>
     """ for cr in criminals]) or "<tr><td colspan='6' class='text-center text-muted py-4'>No individual criminal dossiers registered. View overall arrest numbers in <a href='/property-arrest-analytics'>Arrest Statistics</a>.</td></tr>"
+    arrest_rows = "".join(f"<tr><td>{a['crime_head']}</td><td>{a['arrested']:,}</td><td>{a['convicted']:,}</td></tr>" for a in arrest_context) or "<tr><td colspan='3' class='text-center text-muted'>Run the dataset import to show arrest context.</td></tr>"
 
     body = f"""
     <h2 class="text-danger mb-3">👤 Criminal Record Dossiers</h2>
-    <div class="card p-4">
+    <div class="card p-4 mb-4">
         <div class="table-responsive">
             <table class="table table-dark table-hover align-middle">
                 <thead><tr><th>ID</th><th>Name</th><th>Alias</th><th>Gender</th><th>Identification Details</th><th>Status</th></tr></thead>
@@ -921,8 +1076,29 @@ def criminal_records():
             </table>
         </div>
     </div>
+    <div class="row g-4"><div class="col-lg-7"><div class="card p-4"><h4 class="text-info mb-3">NCRB Arrest Context</h4><div class="table-responsive"><table class="table table-dark table-hover"><thead><tr><th>Crime Head</th><th>Arrested</th><th>Convicted</th></tr></thead><tbody>{arrest_rows}</tbody></table></div></div></div>
+    <div class="col-lg-5"><div class="card p-4"><h4 class="text-info mb-3">Add Criminal Record</h4><form method="POST" action="/criminal-records/add"><input class="form-control mb-2" name="name" placeholder="Full name" required><input class="form-control mb-2" name="alias" placeholder="Alias"><div class="row g-2 mb-2"><div class="col"><input type="date" class="form-control" name="date_of_birth"></div><div class="col"><select class="form-select" name="gender"><option>Male</option><option>Female</option><option>Other</option></select></div></div><input class="form-control mb-2" name="address" placeholder="Address"><input class="form-control mb-2" name="phone" placeholder="Phone"><input class="form-control mb-2" name="identification_details" placeholder="Identification details"><select class="form-select mb-3" name="status">{_options_html(CRIMINAL_STATUSES, 'Wanted')}</select><button type="submit" class="btn btn-warning w-100">Add Criminal Record</button></form></div></div></div>
     """
     return render_template_string(HTML_LAYOUT, content=body)
+
+
+@app.route('/criminal-records/add', methods=['POST'])
+def add_criminal():
+    conn = get_db_connection()
+    conn.execute("INSERT INTO criminals (name, alias, date_of_birth, gender, address, phone, identification_details, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 (request.form['name'], request.form.get('alias') or None, request.form.get('date_of_birth') or None, request.form.get('gender', 'Other'), request.form.get('address'), request.form.get('phone'), request.form.get('identification_details'), request.form.get('status', 'Wanted')))
+    conn.commit()
+    conn.close()
+    return redirect('/criminal-records')
+
+
+@app.route('/criminal-records/<int:criminal_id>/status', methods=['POST'])
+def update_criminal_status(criminal_id):
+    conn = get_db_connection()
+    conn.execute("UPDATE criminals SET status = ? WHERE criminal_id = ?", (request.form['status'], criminal_id))
+    conn.commit()
+    conn.close()
+    return redirect('/criminal-records')
 
 
 @app.route('/case-files')
@@ -933,7 +1109,12 @@ def case_files():
         FROM cases c
         LEFT JOIN FIR f ON c.fir_id = f.fir_id
         LEFT JOIN police_officers po ON c.investigating_officer_id = po.officer_id
+        ORDER BY c.case_id DESC
     """).fetchall()
+    open_firs = conn.execute("SELECT fir_id, fir_number FROM FIR WHERE fir_id NOT IN (SELECT fir_id FROM cases)").fetchall()
+    officers = conn.execute("SELECT * FROM police_officers ORDER BY name").fetchall()
+    dataset_years = conn.execute("SELECT year, SUM(case_count) AS total FROM crime_statistics GROUP BY year ORDER BY year").fetchall() if _table_exists(conn, 'crime_statistics') else []
+    conn.close()
 
     cases_html = "".join([f"""
     <tr>
@@ -941,15 +1122,18 @@ def case_files():
         <td>{cs['fir_number']}</td>
         <td>{cs['officer_name'] or 'Unassigned'}</td>
         <td><span class="badge bg-warning text-dark">{cs['priority']}</span></td>
-        <td><span class="badge bg-success">{cs['case_status']}</span></td>
+        <td><form method="POST" action="/case-files/{cs['case_id']}/status" class="d-flex gap-1"><select name="case_status" class="form-select form-select-sm">{_options_html(CASE_STATUSES, cs['case_status'])}</select><button class="btn btn-sm btn-outline-primary">Update</button></form></td>
         <td>{cs['start_date']}</td>
         <td>{cs['remarks'] or ''}</td>
     </tr>
     """ for cs in cases]) or "<tr><td colspan='7' class='text-center text-muted py-4'>No active individual court cases registered. Overall statistical reports are available in <a href='/analytics'>Analytics</a>.</td></tr>"
+    year_rows = "".join(f"<tr><td>{y['year']}</td><td>{y['total']:,}</td></tr>" for y in dataset_years) or "<tr><td colspan='2' class='text-center text-muted'>Run the dataset import to show yearly context.</td></tr>"
+    fir_options = "".join(f'<option value="{f["fir_id"]}">{f["fir_number"]}</option>' for f in open_firs) or '<option value="" disabled selected>No unassigned FIRs</option>'
+    officer_options = "".join(f'<option value="{o["officer_id"]}">{o["name"]} ({o["rank"]})</option>' for o in officers) or '<option value="">Unassigned</option>'
 
     body = f"""
     <h2 class="text-info mb-3">⚖️ Active & Closed Case Files</h2>
-    <div class="card p-4">
+    <div class="card p-4 mb-4">
         <div class="table-responsive">
             <table class="table table-dark table-hover align-middle">
                 <thead><tr><th>Case Number</th><th>FIR Ref</th><th>Investigating Officer</th><th>Priority</th><th>Status</th><th>Start Date</th><th>Remarks</th></tr></thead>
@@ -957,8 +1141,33 @@ def case_files():
             </table>
         </div>
     </div>
+    <div class="row g-4"><div class="col-lg-7"><div class="card p-4"><h4 class="text-info mb-3">NCRB Yearly Reference</h4><div class="table-responsive"><table class="table table-dark table-hover"><thead><tr><th>Year</th><th>Reported Cases</th></tr></thead><tbody>{year_rows}</tbody></table></div></div></div>
+    <div class="col-lg-5"><div class="card p-4"><h4 class="text-info mb-3">Open New Case File</h4><form method="POST" action="/case-files/add"><input class="form-control mb-2" name="case_number" placeholder="Case number" required><select class="form-select mb-2" name="fir_id" required>{fir_options}</select><select class="form-select mb-2" name="investigating_officer_id">{officer_options}</select><div class="row g-2 mb-2"><div class="col"><select class="form-select" name="priority"><option>Low</option><option selected>Medium</option><option>High</option></select></div><div class="col"><input type="date" class="form-control" name="start_date" required></div></div><textarea class="form-control mb-3" name="remarks" placeholder="Remarks" rows="2"></textarea><button type="submit" class="btn btn-warning w-100">Open Case</button></form></div></div></div>
     """
     return render_template_string(HTML_LAYOUT, content=body)
+
+
+@app.route('/case-files/add', methods=['POST'])
+def add_case():
+    conn = get_db_connection()
+    conn.execute("INSERT INTO cases (case_number, fir_id, investigating_officer_id, priority, start_date, remarks) VALUES (?, ?, ?, ?, ?, ?)",
+                 (request.form['case_number'], request.form['fir_id'], request.form.get('investigating_officer_id') or None, request.form.get('priority', 'Medium'), request.form['start_date'], request.form.get('remarks')))
+    conn.commit()
+    conn.close()
+    return redirect('/case-files')
+
+
+@app.route('/case-files/<int:case_id>/status', methods=['POST'])
+def update_case_status(case_id):
+    conn = get_db_connection()
+    status = request.form['case_status']
+    if status == 'Closed':
+        conn.execute("UPDATE cases SET case_status = ?, closing_date = ? WHERE case_id = ?", (status, datetime.date.today().isoformat(), case_id))
+    else:
+        conn.execute("UPDATE cases SET case_status = ? WHERE case_id = ?", (status, case_id))
+    conn.commit()
+    conn.close()
+    return redirect('/case-files')
 
 
 # REST API ENDPOINTS
