@@ -21,7 +21,7 @@ Real NCRB district-wise crime statistics from `archive/` folder:
 - `10_Property_stolen_and_recovered.csv`
 - `04_02_Person_arrested_and_their_disposal_*_IPC_crime_*.csv`
 
-> **341,108** IPC crime records across **38 states**, **950 districts**, **14 years**, **97 crime categories**.
+> **341,108** IPC crime records across **28 states**, **950 districts**, **14 years**, **97 crime categories**.
 
 ## Setup & Run
 
