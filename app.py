@@ -7,6 +7,7 @@ import os
 import json
 import sqlite3
 import datetime
+from html import escape
 from flask import Flask, render_template_string, request, jsonify, redirect
 
 app = Flask(__name__)
@@ -834,6 +835,54 @@ def _load_police_stations_geojson():
                 return json.load(file)
 
 
+def _station_options(stations, placeholder='Station'):
+    options = [f'<option value="">{escape(placeholder)}</option>']
+    options.extend(
+        f'<option value="{station["station_id"]}">{escape(station["station_name"])}</option>'
+        for station in stations
+    )
+    if os.path.exists(POLICE_STATIONS_GEOJSON):
+        reference_stations = _load_police_stations_geojson().get('features', [])
+        options.append('<option disabled>--- Reference stations ---</option>')
+        options.extend(
+            f'<option value="geo:{properties.get("ps_cd")}">'
+            f'{escape(properties.get("ps") or "Police Station")} '
+            f'({escape(properties.get("district") or "")}, {escape(properties.get("state") or "")})</option>'
+            for feature in reference_stations
+            if (properties := feature.get('properties', {})).get('ps_cd')
+        )
+    return ''.join(options)
+
+
+def _resolve_station_id(conn, raw_station_id):
+    if not raw_station_id or not raw_station_id.startswith('geo:'):
+        return raw_station_id
+    station_code = raw_station_id.removeprefix('geo:')
+    data = _load_police_stations_geojson()
+    properties = next(
+        (feature.get('properties', {}) for feature in data.get('features', [])
+         if str(feature.get('properties', {}).get('ps_cd')) == station_code),
+        None
+    )
+    if not properties:
+        raise ValueError('Selected reference police station was not found')
+    station_name = f"{properties.get('ps', 'Police Station')} ({properties.get('state', 'India')})"
+    existing = conn.execute(
+        'SELECT station_id FROM police_stations WHERE station_name = ?', (station_name,)
+    ).fetchone()
+    if existing:
+        return existing['station_id']
+    cursor = conn.execute(
+        """INSERT INTO police_stations
+           (station_name, address, city, state, contact_number)
+           VALUES (?, ?, ?, ?, ?)""",
+        (station_name, properties.get('district') or 'Reference location',
+         properties.get('district') or 'Reference location',
+         properties.get('state') or 'India', 'GeoJSON reference')
+    )
+    return cursor.lastrowid
+
+
 @app.route('/api/police-stations')
 def api_police_stations():
         if not os.path.exists(POLICE_STATIONS_GEOJSON):
@@ -933,7 +982,7 @@ def police_stations():
     <tr><td class="fw-bold text-warning">{s['state']}</td><td>{s['districts']}</td>
         <td>{s['reported_cases']:,}</td><td>{s['latest_year']}</td></tr>
     """ for s in dataset_summary]) or "<tr><td colspan='4' class='text-center text-muted py-4'>Run the dataset import to show NCRB coverage.</td></tr>"
-    station_options = "".join(f'<option value="{s["station_id"]}">{s["station_name"]}</option>' for s in stations)
+    station_options = _station_options(stations)
     geojson_rows = "".join([f"""
     <tr><td class="fw-bold text-warning">{station.get('ps') or 'Police Station'}</td>
         <td>{station.get('district') or 'N/A'}</td><td>{station.get('state') or 'N/A'}</td>
@@ -1002,7 +1051,7 @@ def police_stations():
             <div class="col-md-2"><input class="form-control" name="badge_number" placeholder="Badge number" required></div>
             <div class="col-md-2"><input class="form-control" name="phone" placeholder="Phone" required></div>
             <div class="col-md-2"><input type="email" class="form-control" name="email" placeholder="Email" required></div>
-            <div class="col-md-2"><select class="form-select" name="station_id" required><option value="">Station</option>{station_options}</select></div>
+            <div class="col-md-2"><select class="form-select" name="station_id" required>{station_options}</select></div>
             <div class="col-12"><button type="submit" class="btn btn-warning">Add Officer</button></div>
         </form>
     </div>
@@ -1023,8 +1072,9 @@ def add_police_station():
 @app.route('/police-stations/add-officer', methods=['POST'])
 def add_police_officer():
     conn = get_db_connection()
+    station_id = _resolve_station_id(conn, request.form['station_id'])
     conn.execute("INSERT INTO police_officers (name, rank, badge_number, phone, email, station_id) VALUES (?, ?, ?, ?, ?, ?)",
-                 (request.form['name'], request.form['rank'], request.form['badge_number'], request.form['phone'], request.form['email'], request.form['station_id']))
+                 (request.form['name'], request.form['rank'], request.form['badge_number'], request.form['phone'], request.form['email'], station_id))
     conn.commit()
     conn.close()
     return redirect('/police-stations')
@@ -1059,7 +1109,7 @@ def fir_management():
     </tr>
     """ for f in firs]) or "<tr><td colspan='6' class='text-center text-muted py-4'>No individual FIR records filed yet. Analytical crime statistics are managed in <a href='/crime-statistics'>Crime Statistics</a>.</td></tr>"
     category_rows = "".join(f"<tr><td>{c['crime_type']}</td><td class='fw-bold text-danger'>{c['total']:,}</td></tr>" for c in crime_categories) or "<tr><td colspan='2' class='text-center text-muted'>Run the dataset import to show categories.</td></tr>"
-    station_options = "".join(f'<option value="{s["station_id"]}">{s["station_name"]}</option>' for s in stations) or '<option value="" disabled selected>Add a police station first</option>'
+    station_options = _station_options(stations, 'Select police station')
     category_options = "".join(f'<option value="{c["crime_type"]}">' for c in crime_categories)
 
     body = f"""
@@ -1104,6 +1154,7 @@ def fir_management():
 def add_fir():
     conn = get_db_connection()
     cur = conn.cursor()
+    station_id = _resolve_station_id(conn, request.form['station_id'])
     cur.execute("INSERT INTO crimes (crime_type, description, crime_date, crime_time, location, city, state, severity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (request.form['crime_type'], request.form['crime_description'], request.form['crime_date'], request.form.get('crime_time') or None,
                  request.form['location'], request.form['city'], request.form['state'], request.form['severity']))
@@ -1112,7 +1163,7 @@ def add_fir():
                 (request.form['victim_name'], request.form.get('victim_age') or None, request.form.get('victim_gender', 'Other'), request.form.get('victim_address'), request.form['victim_phone']))
     victim_id = cur.lastrowid
     cur.execute("INSERT INTO FIR (fir_number, crime_id, victim_id, station_id, filing_date, description) VALUES (?, ?, ?, ?, ?, ?)",
-                (request.form['fir_number'], crime_id, victim_id, request.form['station_id'], request.form['filing_date'], request.form['fir_description']))
+                (request.form['fir_number'], crime_id, victim_id, station_id, request.form['filing_date'], request.form['fir_description']))
     conn.commit()
     conn.close()
     return redirect('/fir-management')
