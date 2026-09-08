@@ -8,10 +8,8 @@ import json
 import sqlite3
 import datetime
 from html import escape
-from flask import Flask, render_template_string, request, jsonify, redirect
-
-app = Flask(__name__)
-app.config['SECRET_KEY'] = 'crms-kaggle-ncrb-key-2026'
+from flask import Flask, render_template_string, request, jsonify, redirect, flash, url_for, send_from_directory
+from werkzeug.utils import secure_filename
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, 'data')
@@ -19,6 +17,15 @@ DB_PATH = os.path.join(DATA_DIR, 'crms.db')
 POLICE_STATIONS_GEOJSON = os.path.join(
     DATA_DIR, 'police', 'stations', 'INDIA_POLICE_STATIONS.geojson'
 )
+
+# Ensure data directory exists
+os.makedirs(DATA_DIR, exist_ok=True)
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'crms-kaggle-ncrb-key-2026'
+app.config['UPLOAD_FOLDER'] = os.path.join(BASE_DIR, 'static', 'uploads')
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5 MB limit
 
 
 def get_db_connection():
@@ -144,34 +151,238 @@ def init_db():
     );
     """)
 
+    # Additional tables for analytics
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS crime_statistics (
+        year INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        district TEXT NOT NULL,
+        crime_type TEXT NOT NULL,
+        case_count INTEGER NOT NULL,
+        PRIMARY KEY (year, state, district, crime_type)
+    );
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS property_crime_statistics (
+        state TEXT NOT NULL PRIMARY KEY,
+        stolen_cases INTEGER NOT NULL,
+        recovered_cases INTEGER NOT NULL
+    );
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS arrest_statistics (
+        crime_head TEXT NOT NULL PRIMARY KEY,
+        persons_arrested INTEGER NOT NULL,
+        persons_convicted INTEGER NOT NULL,
+        persons_acquitted INTEGER NOT NULL
+    );
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS women_crime_statistics (
+        crime_type TEXT NOT NULL PRIMARY KEY,
+        case_count INTEGER NOT NULL
+    );
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS children_crime_statistics (
+        crime_type TEXT NOT NULL PRIMARY KEY,
+        case_count INTEGER NOT NULL
+    );
+    """)
+    # Load canonical crime statistics if empty or if only dummy TOTAL exists
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(DISTINCT crime_type) FROM crime_statistics")
+    crime_types_count = cur.fetchone()[0] or 0
+    if crime_types_count <= 1:
+        import csv, glob, os
+        data_dir = os.path.join(BASE_DIR, "archive")
+        canonical_crimes = [
+            'MURDER', 'ATTEMPT TO MURDER', 'CULPABLE HOMICIDE NOT AMOUNTING TO MURDER',
+            'RAPE', 'KIDNAPPING & ABDUCTION', 'DACOITY', 'PREPARATION AND ASSEMBLY FOR DACOITY',
+            'ROBBERY', 'BURGLARY', 'THEFT', 'RIOTS', 'CRIMINAL BREACH OF TRUST',
+            'CHEATING', 'COUNTERFIETING', 'ARSON', 'HURT/GREVIOUS HURT', 'DOWRY DEATHS',
+            'ASSAULT ON WOMEN WITH INTENT TO OUTRAGE HER MODESTY', 'INSULT TO MODESTY OF WOMEN',
+            'CRUELTY BY HUSBAND OR HIS RELATIVES', 'IMPORTATION OF GIRLS FROM FOREIGN COUNTRIES',
+            'CAUSING DEATH BY NEGLIGENCE', 'OTHER IPC CRIMES'
+        ]
+        ipc_files = [
+            os.path.join(data_dir, "01_District_wise_crimes_committed_IPC_2001_2012.csv"),
+            os.path.join(data_dir, "01_District_wise_crimes_committed_IPC_2013.csv")
+        ]
+        cur.execute("DELETE FROM crime_statistics")
+        records = []
+        for file_path in ipc_files:
+            if not os.path.exists(file_path):
+                continue
+            with open(file_path, newline='', encoding='utf-8-sig', errors='ignore') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    state = (row.get("STATE/UT") or "").strip()
+                    district = (row.get("DISTRICT") or "").strip()
+                    if not state or not district or "TOTAL" in district.upper():
+                        continue
+                    try:
+                        year = int(row.get("YEAR"))
+                    except (TypeError, ValueError):
+                        continue
+                    for crime in canonical_crimes:
+                        val = row.get(crime)
+                        if val:
+                            try:
+                                cnt = int(val)
+                                if cnt > 0:
+                                    records.append((year, state, district, crime, cnt))
+                            except (TypeError, ValueError):
+                                pass
+        if records:
+            cur.executemany(
+                "INSERT OR REPLACE INTO crime_statistics (year, state, district, crime_type, case_count) VALUES (?,?,?,?,?)",
+                records
+            )
+            conn.commit()
+
+    # Load property_crime_statistics if empty
+    cur.execute("SELECT COUNT(*) FROM property_crime_statistics")
+    if cur.fetchone()[0] == 0:
+        import csv, os
+        data_dir = os.path.join(BASE_DIR, "archive")
+        prop_file = os.path.join(data_dir, "10_Property_stolen_and_recovered.csv")
+        if os.path.exists(prop_file):
+            agg = {}
+            with open(prop_file, newline='', encoding='utf-8-sig', errors='ignore') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    state = (row.get("Area_Name") or "").strip()
+                    if not state or "TOTAL" in state.upper():
+                        continue
+                    try:
+                        stolen = int(row.get("Cases_Property_Stolen") or 0)
+                        recovered = int(row.get("Cases_Property_Recovered") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if state not in agg:
+                        agg[state] = {"stolen": 0, "recovered": 0}
+                    agg[state]["stolen"] += stolen
+                    agg[state]["recovered"] += recovered
+            for state, val in agg.items():
+                cur.execute(
+                    "INSERT OR REPLACE INTO property_crime_statistics (state, stolen_cases, recovered_cases) VALUES (?,?,?)",
+                    (state, val["stolen"], val["recovered"])
+                )
+            conn.commit()
+
+    # Load arrest_statistics if empty
+    cur.execute("SELECT COUNT(*) FROM arrest_statistics")
+    if cur.fetchone()[0] == 0:
+        import csv, glob, os
+        pattern = os.path.join(data_dir, "*_Persons_arrested_and_their_disposal_*.csv")
+        agg = {}
+        for file_path in glob.glob(pattern):
+            with open(file_path, newline='') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    # Column names differ across files; try several variants
+                    head = row.get("CRIME HEAD") or row.get("Crime Head") or row.get("Crime Head ")
+                    arrested = int(row.get("Persons arrested during the year")
+                                      or row.get("Persons arrested during the year_Total")
+                                      or 0)
+                    convicted = int(row.get("Persons convicted")
+                                      or row.get("Persons convicted_Total")
+                                      or 0)
+                    acquitted = int(row.get("Persons acquitted")
+                                      or row.get("Persons acquitted_Total")
+                                      or 0)
+                    if not head:
+                        continue
+                    if head not in agg:
+                        agg[head] = {"arrested": 0, "convicted": 0, "acquitted": 0}
+                    agg[head]["arrested"] += arrested
+                    agg[head]["convicted"] += convicted
+                    agg[head]["acquitted"] += acquitted
+        for head, vals in agg.items():
+            conn.execute(
+                "INSERT INTO arrest_statistics (crime_head, persons_arrested, persons_convicted, persons_acquitted) VALUES (?,?,?,?)",
+                (head, vals["arrested"], vals["convicted"], vals["acquitted"])
+            )
+
+    # Load women_crime_statistics if empty
+    cur.execute("SELECT COUNT(*) FROM women_crime_statistics")
+    if cur.fetchone()[0] == 0:
+        import csv, glob, os
+        pattern = os.path.join(data_dir, "42_District_wise_crimes_committed_against_women_*.csv")
+        agg = {}
+        for file_path in glob.glob(pattern):
+            with open(file_path, newline='') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    for col, val in row.items():
+                        if col in ("STATE/UT", "DISTRICT", "Year"):
+                            continue
+                        crime_type = col.strip()
+                        try:
+                            count = int(val)
+                        except Exception:
+                            continue
+                        agg[crime_type] = agg.get(crime_type, 0) + count
+        for crime_type, total in agg.items():
+            conn.execute(
+                "INSERT INTO women_crime_statistics (crime_type, case_count) VALUES (?,?)",
+                (crime_type, total)
+            )
+
+    # Load children_crime_statistics if empty
+    cur.execute("SELECT COUNT(*) FROM children_crime_statistics")
+    if cur.fetchone()[0] == 0:
+        import csv, glob, os
+        pattern = os.path.join(data_dir, "03_District_wise_crimes_committed_against_children_*.csv")
+        agg = {}
+        for file_path in glob.glob(pattern):
+            with open(file_path, newline='') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    for col, val in row.items():
+                        if col in ("STATE/UT", "DISTRICT", "Year"):
+                            continue
+                        crime_type = col.strip()
+                        try:
+                            count = int(val)
+                        except Exception:
+                            continue
+                        agg[crime_type] = agg.get(crime_type, 0) + count
+        for crime_type, total in agg.items():
+            conn.execute(
+                "INSERT INTO children_crime_statistics (crime_type, case_count) VALUES (?,?)",
+                (crime_type, total)
+            )
+
     conn.commit()
     conn.close()
 
 
 # Base Layout & Navigation Bar
 HTML_NAVBAR = """
-<nav class="navbar navbar-expand-lg sticky-top shadow-sm" style="background-color: #1a1a2e; border-bottom: 2px solid #c0392b;">
+<nav class="navbar navbar-expand-lg sticky-top shadow-sm" style="background-color: #8b5cf6; border-bottom: 2px solid #ec4899;">
   <div class="container-fluid px-4">
-    <a class="navbar-brand d-flex align-items-center gap-2 fw-bold" href="/" style="color: #f0c040; font-family: 'Times New Roman', Times, serif; font-size: 1.2rem;">
+    <a class="navbar-brand d-flex align-items-center gap-2 fw-bold" href="/" style="color: #ffffff; font-family: 'Times New Roman', Times, serif; font-size: 1.2rem;">
       <span class="fs-4">🛡️</span> CRIME MANAGEMENT PORTAL
     </a>
-    <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav" style="border-color: #c0392b;">
+    <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav" style="border-color: #ec4899;">
       <span class="navbar-toggler-icon"></span>
     </button>
     <div class="collapse navbar-collapse" id="navbarNav">
       <ul class="navbar-nav me-auto mb-2 mb-lg-0">
-        <li class="nav-item"><a class="nav-link" href="/" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">Dashboard</a></li>
-        <li class="nav-item"><a class="nav-link" href="/crime-statistics" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">Crime Statistics &amp; Search</a></li>
-        <li class="nav-item"><a class="nav-link" href="/analytics" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">Analytics &amp; Charts</a></li>
-        <li class="nav-item"><a class="nav-link" href="/women-children-analytics" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">Women &amp; Children</a></li>
-        <li class="nav-item"><a class="nav-link" href="/property-arrest-analytics" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">Property &amp; Arrests</a></li>
-        <li class="nav-item"><a class="nav-link" href="/police-stations" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">Police Stations</a></li>
-        <li class="nav-item"><a class="nav-link" href="/police-station-map" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">Station Map</a></li>
-        <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">FIR Management</a></li>
-        <li class="nav-item"><a class="nav-link" href="/criminal-records" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">Criminal Records</a></li>
-        <li class="nav-item"><a class="nav-link" href="/case-files" style="color: #e0e0e0; font-family: 'Times New Roman', Times, serif;">Case Files</a></li>
+        <li class="nav-item"><a class="nav-link" href="/" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Dashboard</a></li>
+
+        <li class="nav-item"><a class="nav-link" href="/analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Analytics &amp; Charts</a></li>
+        <li class="nav-item"><a class="nav-link" href="/women-children-analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Women &amp; Children</a></li>
+        <li class="nav-item"><a class="nav-link" href="/property-arrest-analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Property &amp; Arrests</a></li>
+        <li class="nav-item"><a class="nav-link" href="/police-stations" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Police Stations</a></li>
+        <li class="nav-item"><a class="nav-link" href="/police-station-map" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Station Map</a></li>
+        <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Management</a></li>
+        <li class="nav-item"><a class="nav-link" href="/criminal-records" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Criminal Records</a></li>
+        <li class="nav-item"><a class="nav-link" href="/case-files" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Case Files</a></li>
       </ul>
-      <span class="badge p-2" style="background-color: #c0392b; font-family: 'Times New Roman', Times, serif;">NCRB / Kaggle Dataset</span>
+      <span class="badge p-2" style="background-color: #ec4899; color: #ffffff; font-family: 'Times New Roman', Times, serif;">NCRB / Kaggle Dataset</span>
     </div>
   </div>
 </nav>
@@ -189,56 +400,56 @@ HTML_LAYOUT = """
     <style>
         * { font-family: 'Times New Roman', Times, serif !important; }
         body { background-color: #ffffff; color: #1a1a1a; }
-        h1, h2, h3, h4, h5, h6 { color: #1a1a2e; }
+        h1, h2, h3, h4, h5, h6 { color: #5b21b6; }
         .card { background-color: #f8f9fa; border: 1px solid #dee2e6; color: #1a1a1a; border-radius: 10px; box-shadow: 0 2px 6px rgba(0,0,0,0.08); }
         .table { color: #1a1a1a; }
-        .table thead th { background-color: #e8eaf0; color: #000000; border-bottom: 2px solid #1a1a2e; }
-        .table tbody tr:hover { background-color: #f0f4ff; }
+        .table thead th { background-color: #ede9fe; color: #4c1d95; border-bottom: 2px solid #8b5cf6; }
+        .table tbody tr:hover { background-color: #fdf2f8; }
         .table-dark { background-color: #f8f9fa !important; color: #1a1a1a !important; border-color: #dee2e6 !important; }
         .table-dark td, .table-dark th { background-color: transparent !important; color: #1a1a1a !important; }
-        .nav-link:hover { color: #c0392b !important; }
-        .stats-card { background: linear-gradient(135deg, #f0f4ff 0%, #e8eeff 100%); border-left: 4px solid #1a1a2e; }
-        .source-badge { font-size: 0.8rem; background: #1a1a2e; color: #f0c040; border-radius: 20px; padding: 4px 12px; }
+        .nav-link:hover { color: #fce7f3 !important; }
+        .stats-card { background: linear-gradient(135deg, #faf5ff 0%, #f3e8ff 100%); border-left: 4px solid #8b5cf6; }
+        .source-badge { font-size: 0.8rem; background: #8b5cf6; color: #ffffff; border-radius: 20px; padding: 4px 12px; }
         .form-select, .form-control { background-color: #ffffff; color: #1a1a1a; border: 1px solid #adb5bd; }
-        .form-select:focus, .form-control:focus { background-color: #ffffff; color: #1a1a1a; border-color: #1a1a2e; box-shadow: 0 0 0 2px rgba(26,26,46,0.15); }
-        .btn-outline-warning { border-color: #c0392b; color: #c0392b; }
-        .btn-outline-warning:hover { background-color: #c0392b; color: #000000; }
-        .badge.bg-secondary { background-color: #6c757d !important; color: #000000 !important; }
-        .badge.bg-info { background-color: #0077b6 !important; color: #000000 !important; }
-        .badge.bg-success { background-color: #2d6a4f !important; color: #000000 !important; }
-        .badge.bg-danger { background-color: #c0392b !important; color: #000000 !important; }
-        .badge.bg-warning { background-color: #e67e22 !important; color: #000000 !important; }
-        .badge.bg-primary { background-color: #1a1a2e !important; color: #000000 !important; }
-        .text-warning { color: #c0392b !important; }
-        .text-info { color: #0077b6 !important; }
-        .text-danger { color: #c0392b !important; }
+        .form-select:focus, .form-control:focus { background-color: #ffffff; color: #1a1a1a; border-color: #8b5cf6; box-shadow: 0 0 0 2px rgba(139,92,246,0.2); }
+        .btn-outline-warning { border-color: #ec4899; color: #ec4899; }
+        .btn-outline-warning:hover { background-color: #ec4899; color: #ffffff; }
+        .badge.bg-secondary { background-color: #6c757d !important; color: #ffffff !important; }
+        .badge.bg-info { background-color: #8b5cf6 !important; color: #ffffff !important; }
+        .badge.bg-success { background-color: #2d6a4f !important; color: #ffffff !important; }
+        .badge.bg-danger { background-color: #ec4899 !important; color: #ffffff !important; }
+        .badge.bg-warning { background-color: #f59e0b !important; color: #ffffff !important; }
+        .badge.bg-primary { background-color: #8b5cf6 !important; color: #ffffff !important; }
+        .text-warning { color: #ec4899 !important; }
+        .text-info { color: #8b5cf6 !important; }
+        .text-danger { color: #ec4899 !important; }
         .text-success { color: #2d6a4f !important; }
         .text-secondary { color: #555555 !important; }
         .text-muted { color: #777777 !important; }
         .text-light { color: #1a1a1a !important; }
-        .btn-warning { background-color: #c0392b; border-color: #c0392b; color: #000000; }
-        .btn-warning:hover { background-color: #a93226; border-color: #a93226; color: #000000; }
-        .btn-primary { background-color: #1a1a2e; border-color: #1a1a2e; color: #000000; }
-        .btn-primary:hover { background-color: #2c2c4e; border-color: #2c2c4e; color: #000000; }
-        .btn-outline-light { border-color: #1a1a2e; color: #1a1a2e; }
-        .btn-outline-light:hover { background-color: #e8eaf0; color: #000000; }
-        .btn-outline-info { border-color: #0077b6; color: #0077b6; }
-        .btn-outline-info:hover { background-color: #d0eaf8; color: #000000; }
-        .btn-outline-danger { border-color: #c0392b; color: #c0392b; }
-        .btn-outline-danger:hover { background-color: #fde8e8; color: #000000; }
+        .btn-warning { background-color: #ec4899; border-color: #ec4899; color: #ffffff; }
+        .btn-warning:hover { background-color: #db2777; border-color: #db2777; color: #ffffff; }
+        .btn-primary { background-color: #8b5cf6; border-color: #8b5cf6; color: #ffffff; }
+        .btn-primary:hover { background-color: #7c3aed; border-color: #7c3aed; color: #ffffff; }
+        .btn-outline-light { border-color: #8b5cf6; color: #6d28d9; }
+        .btn-outline-light:hover { background-color: #ede9fe; color: #4c1d95; }
+        .btn-outline-info { border-color: #8b5cf6; color: #8b5cf6; }
+        .btn-outline-info:hover { background-color: #ede9fe; color: #4c1d95; }
+        .btn-outline-danger { border-color: #ec4899; color: #ec4899; }
+        .btn-outline-danger:hover { background-color: #fce7f3; color: #db2777; }
         .btn-outline-success { border-color: #2d6a4f; color: #2d6a4f; }
         .btn-outline-success:hover { background-color: #d4edda; color: #000000; }
         .btn-outline-secondary { border-color: #6c757d; color: #6c757d; }
         .btn-outline-secondary:hover { background-color: #e2e3e5; color: #000000; }
-        .btn-outline-primary { border-color: #1a1a2e; color: #1a1a2e; }
-        .btn-outline-primary:hover { background-color: #e8eaf0; color: #000000; }
+        .btn-outline-primary { border-color: #8b5cf6; color: #7c3aed; }
+        .btn-outline-primary:hover { background-color: #ede9fe; color: #4c1d95; }
         .list-group-item { background-color: #f8f9fa; color: #1a1a1a; border-color: #dee2e6; }
         .border-secondary { border-color: #dee2e6 !important; }
-        a { color: #0077b6; }
-        a:hover { color: #c0392b; }
+        a { color: #7c3aed; }
+        a:hover { color: #ec4899; }
         footer { background-color: #f8f9fa; color: #555555; border-top: 1px solid #dee2e6 !important; }
-        .pagination .page-link { background-color: #f8f9fa; color: #1a1a2e; border-color: #dee2e6; }
-        .pagination .page-link:hover { background-color: #e8eaf0; color: #000000; }
+        .pagination .page-link { background-color: #f8f9fa; color: #7c3aed; border-color: #dee2e6; }
+        .pagination .page-link:hover { background-color: #ede9fe; color: #4c1d95; }
     </style>
 </head>
 <body style="background-color: #ffffff;">
@@ -309,17 +520,17 @@ def dashboard():
     body = f"""
     <div class="row g-4 mb-4">
         <div class="col-md-12">
-            <div class="p-4 rounded-3 card shadow-sm text-center bg-dark border-warning">
+            <div class="p-4 rounded-3 card shadow-sm text-center" style="background: linear-gradient(135deg, #ede9fe 0%, #fdf2f8 100%); border: 2px solid #ec4899;">
                 <div class="d-flex justify-content-between align-items-center mb-2">
                     <span class="source-badge">Official NCRB / Kaggle Crime Dataset</span>
-                    <span class="text-secondary small">Years Covered: {min_yr} – {max_yr}</span>
+                    <span class="small fw-semibold" style="color: #6d28d9;">Years Covered: {min_yr} – {max_yr}</span>
                 </div>
-                <h1 class="display-6 text-warning fw-bold">National Crime Management Portal</h1>
-                <p class="lead text-secondary mb-3">Live Dynamic Insights from 35+ Million Real NCRB Recorded Crime Cases</p>
+                <h1 class="display-6 fw-bold" style="color: #ec4899;">National Crime Management Portal</h1>
+                <p class="lead mb-3" style="color: #4c1d95;">Live Dynamic Insights from 35+ Million Real NCRB Recorded Crime Cases</p>
                 <div class="d-flex justify-content-center gap-3">
-                    <a href="/crime-statistics" class="btn btn-warning fw-bold px-4">🔍 Search Crime Records</a>
-                    <a href="/analytics" class="btn btn-primary fw-bold px-4">📊 Interactive Visual Analytics</a>
-                    <a href="/women-children-analytics" class="btn btn-outline-light px-4">👧 Women & Children Reports</a>
+                    <a href="/crime-statistics" class="btn btn-warning fw-bold px-4 shadow-sm">🔍 Search Crime Records</a>
+                    <a href="/analytics" class="btn btn-primary fw-bold px-4 shadow-sm">📊 Interactive Visual Analytics</a>
+                    <a href="/women-children-analytics" class="btn btn-outline-primary fw-bold px-4 shadow-sm" style="background-color: #ffffff;">👧 Women & Children Reports</a>
                 </div>
             </div>
         </div>
@@ -334,7 +545,7 @@ def dashboard():
             </div>
         </div>
         <div class="col-md-3">
-            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #ef4444;">
+            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #ec4899;">
                 <h6 class="text-uppercase text-secondary small">States & UTs</h6>
                 <span class="fs-2 fw-bold text-danger">{states_count}</span>
                 <small class="text-muted">{districts_count} Districts Covered</small>
@@ -357,8 +568,8 @@ def dashboard():
     </div>
 
     <div class="row g-4">
-        <div class="col-md-6">
-            <div class="card p-4 h-100">
+        <div class="col-12">
+            <div class="card p-4">
                 <h5 class="text-warning mb-3">📌 Key Dataset Highlights</h5>
                 <ul class="list-group list-group-flush bg-transparent">
                     <li class="list-group-item bg-transparent border-secondary d-flex justify-content-between" style="color: #1a1a1a;">
@@ -378,18 +589,6 @@ def dashboard():
                         <span>Women, Children, Property, Arrests</span>
                     </li>
                 </ul>
-            </div>
-        </div>
-        <div class="col-md-6">
-            <div class="card p-4 h-100">
-                <h5 class="text-info mb-3">⚡ Quick Portal Navigation</h5>
-                <div class="d-grid gap-2">
-                    <a href="/crime-statistics" class="btn btn-outline-warning text-start py-2">🔍 District & State Multi-Filter Query Engine</a>
-                    <a href="/analytics" class="btn btn-outline-primary text-start py-2">📈 Interactive State & Yearly Trend Charts</a>
-                    <a href="/women-children-analytics" class="btn btn-outline-danger text-start py-2">👩 Women & Children Protection Reports</a>
-                    <a href="/property-arrest-analytics" class="btn btn-outline-success text-start py-2">💰 Property Recovery & Police Arrest Rates</a>
-                    <a href="/api/stats" class="btn btn-outline-secondary text-start py-2" target="_blank">🔗 Access REST API Statistics Endpoint</a>
-                </div>
             </div>
         </div>
     </div>
@@ -602,6 +801,7 @@ def analytics():
     cats_data = conn.execute("""
         SELECT crime_type, SUM(case_count) as total 
         FROM crime_statistics 
+        WHERE crime_type != 'TOTAL'
         GROUP BY crime_type 
         ORDER BY total DESC LIMIT 10
     """).fetchall()
@@ -647,18 +847,18 @@ def analytics():
                 datasets: [{{
                     label: 'Total Recorded Crimes',
                     data: {year_vals},
-                    borderColor: '#f59e0b',
-                    backgroundColor: 'rgba(245, 158, 11, 0.15)',
+                    borderColor: '#8b5cf6',
+                    backgroundColor: 'rgba(139, 92, 246, 0.12)',
                     fill: true,
                     tension: 0.3
                 }}]
             }},
             options: {{
                 responsive: true,
-                plugins: {{ legend: {{ labels: {{ color: '#f8fafc' }} }} }},
+                plugins: {{ legend: {{ labels: {{ color: '#1a1a1a', font: {{ weight: 'bold' }} }} }} }},
                 scales: {{
-                    x: {{ ticks: {{ color: '#cbd5e1' }}, grid: {{ color: '#334155' }} }},
-                    y: {{ ticks: {{ color: '#cbd5e1' }}, grid: {{ color: '#334155' }} }}
+                    x: {{ ticks: {{ color: '#555555' }}, grid: {{ color: 'rgba(0,0,0,0.06)' }} }},
+                    y: {{ ticks: {{ color: '#555555' }}, grid: {{ color: 'rgba(0,0,0,0.06)' }} }}
                 }}
             }}
         }});
@@ -670,12 +870,12 @@ def analytics():
                 labels: {cat_labels},
                 datasets: [{{
                     data: {cat_vals},
-                    backgroundColor: ['#ef4444', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16', '#6366f1', '#14b8a6']
+                    backgroundColor: ['#ec4899', '#8b5cf6', '#10b981', '#f59e0b', '#a855f7', '#06b6d4', '#84cc16', '#6366f1', '#14b8a6', '#f43f5e']
                 }}]
             }},
             options: {{
                 responsive: true,
-                plugins: {{ legend: {{ position: 'bottom', labels: {{ color: '#f8fafc', font: {{ size: 10 }} }} }} }}
+                plugins: {{ legend: {{ position: 'bottom', labels: {{ color: '#1a1a1a', font: {{ size: 10, weight: 'bold' }} }} }} }}
             }}
         }});
 
@@ -687,15 +887,15 @@ def analytics():
                 datasets: [{{
                     label: 'Total Crime Cases',
                     data: {state_vals},
-                    backgroundColor: '#3b82f6'
+                    backgroundColor: '#8b5cf6'
                 }}]
             }},
             options: {{
                 responsive: true,
-                plugins: {{ legend: {{ labels: {{ color: '#f8fafc' }} }} }},
+                plugins: {{ legend: {{ labels: {{ color: '#1a1a1a', font: {{ weight: 'bold' }} }} }} }},
                 scales: {{
-                    x: {{ ticks: {{ color: '#cbd5e1' }}, grid: {{ color: '#334155' }} }},
-                    y: {{ ticks: {{ color: '#cbd5e1' }}, grid: {{ color: '#334155' }} }}
+                    x: {{ ticks: {{ color: '#555555' }}, grid: {{ color: 'rgba(0,0,0,0.06)' }} }},
+                    y: {{ ticks: {{ color: '#555555' }}, grid: {{ color: 'rgba(0,0,0,0.06)' }} }}
                 }}
             }}
         }});
@@ -777,17 +977,28 @@ def property_arrest_analytics():
         ORDER BY arrested DESC LIMIT 15
     """).fetchall()
 
+    # Top recovered cases per state
+    recovered_top_data = conn.execute("""
+        SELECT state, SUM(recovered_cases) as recovered
+        FROM property_crime_statistics
+        GROUP BY state
+        ORDER BY recovered DESC LIMIT 15
+    """).fetchall()
+    recovered_top_rows = "".join([f"<tr><td class='fw-bold text-info'>{p['state']}</td><td class='text-success'>{p['recovered']:,}</td></tr>" for p in recovered_top_data])
     prop_rows = "".join([f"<tr><td class='fw-bold text-warning'>{p['state']}</td><td class='text-danger'>{p['stolen']:,}</td><td class='text-success'>{p['recovered']:,}</td></tr>" for p in prop_data])
     arrest_rows = "".join([f"<tr><td>{a['crime_head']}</td><td class='text-warning'>{a['arrested']:,}</td><td class='text-success'>{a['convicted']:,}</td><td class='text-danger'>{a['acquitted']:,}</td></tr>" for a in arrest_data])
 
     body = f"""
-    <h2 class="text-success mb-4">💰 Property Crimes & Police Arrest Statistics</h2>
-    <div class="row g-4">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2 class="text-info m-0">💰 Property Crimes & Police Arrest Statistics</h2>
+        <span class="source-badge">Data Source: Kaggle / NCRB Dataset</span>
+    </div>
+    <div class="row g-4 mb-4">
         <div class="col-md-6">
-            <div class="card p-4">
+            <div class="card p-4 h-100">
                 <h4 class="text-warning mb-3">🏡 Stolen vs Recovered Property (Top States)</h4>
                 <div class="table-responsive">
-                    <table class="table table-dark table-hover align-middle">
+                    <table class="table table-hover align-middle">
                         <thead><tr><th>State / UT</th><th>Stolen Cases</th><th>Recovered Cases</th></tr></thead>
                         <tbody>{prop_rows}</tbody>
                     </table>
@@ -795,10 +1006,23 @@ def property_arrest_analytics():
             </div>
         </div>
         <div class="col-md-6">
+            <div class="card p-4 h-100">
+                <h4 class="text-info mb-3">🏆 Top States by Recovered Property</h4>
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle">
+                        <thead><tr><th>State / UT</th><th>Recovered Cases</th></tr></thead>
+                        <tbody>{recovered_top_rows}</tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="row g-4">
+        <div class="col-12">
             <div class="card p-4">
                 <h4 class="text-info mb-3">⚖️ Arrests, Convictions & Acquittals</h4>
                 <div class="table-responsive">
-                    <table class="table table-dark table-hover align-middle">
+                    <table class="table table-hover align-middle">
                         <thead><tr><th>Crime Head</th><th>Arrested</th><th>Convicted</th><th>Acquitted</th></tr></thead>
                         <tbody>{arrest_rows}</tbody>
                     </table>
@@ -919,7 +1143,7 @@ def police_station_map():
                     document.getElementById('station-count').textContent = `${features.length.toLocaleString()} stations`;
                     const layer = L.geoJSON(data, {
                         pointToLayer: (feature, latlng) => L.circleMarker(latlng, {
-                            radius: 4, color: '#c0392b', fillColor: '#f0c040', fillOpacity: 0.8
+                            radius: 4, color: '#ec4899', fillColor: '#8b5cf6', fillOpacity: 0.8
                         }),
                         onEachFeature: (feature, layer) => {
                             const properties = feature.properties || {};
@@ -1328,5 +1552,5 @@ def api_stats():
 
 if __name__ == '__main__':
     init_db()
-    print("Starting Crime Management Portal (Kaggle/NCRB Version) on http://127.0.0.1:5050")
-    app.run(host='0.0.0.0', port=5050, debug=True)
+    print("Starting Crime Management Portal (Kaggle/NCRB Version) on http://127.0.0.1:5051")
+    app.run(host='0.0.0.0', port=5051, debug=True)
