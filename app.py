@@ -10,6 +10,7 @@ import datetime
 from html import escape
 from flask import Flask, render_template_string, request, jsonify, redirect, flash, url_for, send_from_directory
 from werkzeug.utils import secure_filename
+from crime_pattern_analysis import get_filter_options, get_districts_for_state, run_full_analysis
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, 'data')
@@ -381,6 +382,7 @@ HTML_NAVBAR = """
         <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Management</a></li>
         <li class="nav-item"><a class="nav-link" href="/criminal-records" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Criminal Records</a></li>
         <li class="nav-item"><a class="nav-link" href="/case-files" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Case Files</a></li>
+        <li class="nav-item"><a class="nav-link" href="/crime-patterns" style="color: #fce7f3; font-weight: bold; font-family: 'Times New Roman', Times, serif;">🔗 Pattern Detector</a></li>
       </ul>
       <span class="badge p-2" style="background-color: #ec4899; color: #ffffff; font-family: 'Times New Roman', Times, serif;">NCRB / Kaggle Dataset</span>
     </div>
@@ -1548,6 +1550,354 @@ def api_stats():
     except Exception as e:
         stats = {"error": str(e)}
     return jsonify(stats)
+
+
+@app.route('/api/districts')
+def api_districts():
+    state = request.args.get('state', '').strip()
+    if not state:
+        return jsonify([])
+    conn = get_db_connection()
+    districts = get_districts_for_state(conn, state)
+    conn.close()
+    return jsonify(districts)
+
+
+@app.route('/crime-patterns', methods=['GET'])
+def crime_patterns():
+    conn = get_db_connection()
+    try:
+        filter_opts = get_filter_options(conn)
+    except Exception as e:
+        conn.close()
+        body = f'<div class="alert alert-danger">Error loading filters: {escape(str(e))}</div>'
+        return render_template_string(HTML_LAYOUT, content=body)
+
+    crimes  = filter_opts.get('crimes', [])
+    states  = filter_opts.get('states', [])
+    years   = filter_opts.get('years', list(range(2001, 2014)))
+
+    # Form values with defaults
+    sel_crime    = request.args.get('crime_type', 'THEFT')
+    sel_state    = request.args.get('state',      'MAHARASHTRA')
+    sel_district = request.args.get('district',   '')
+    sel_sy       = int(request.args.get('start_year', 2001))
+    sel_ey       = int(request.args.get('end_year',   2013))
+    submitted    = 'crime_type' in request.args
+
+    # Build district dropdown options via JS; pre-populate if state selected
+    districts_for_selected = get_districts_for_state(conn, sel_state) if sel_state else []
+
+    # ── Crime dropdown ──────────────────────────────────────────────────────
+    crime_opts = ''.join(
+        f'<option value="{c}" {"selected" if c == sel_crime else ""}>{c}</option>'
+        for c in crimes
+    )
+    state_opts = ''.join(
+        f'<option value="{s}" {"selected" if s == sel_state else ""}>{s}</option>'
+        for s in states
+    )
+    district_opts = '<option value="">All Districts (State-level)</option>' + ''.join(
+        f'<option value="{d}" {"selected" if d == sel_district else ""}>{d}</option>'
+        for d in districts_for_selected
+    )
+    year_opts_s = ''.join(
+        f'<option value="{y}" {"selected" if y == sel_sy else ""}>{y}</option>'
+        for y in years
+    )
+    year_opts_e = ''.join(
+        f'<option value="{y}" {"selected" if y == sel_ey else ""}>{y}</option>'
+        for y in years
+    )
+
+    # ── Run analysis only when form submitted ───────────────────────────────
+    results_html = ''
+    if submitted:
+        try:
+            data = run_full_analysis(conn, sel_crime, sel_state, sel_district, sel_sy, sel_ey)
+            results_html = _build_pattern_results(data, sel_crime, sel_state, sel_district)
+        except Exception as e:
+            results_html = f'<div class="alert alert-danger mt-3"><b>Analysis error:</b> {escape(str(e))}</div>'
+
+    conn.close()
+
+    body = f"""
+<div class="container-fluid py-4">
+  <div class="row mb-4">
+    <div class="col-12">
+      <h2 style="color:#5b21b6;">🔗 AI-Powered Crime Pattern &amp; Similarity Detector</h2>
+      <p class="text-muted">Analyze historical crime trends, detect anomalies, find similar crime patterns across regions, and identify clusters — powered by real NCRB/Kaggle data (2001–2013).</p>
+    </div>
+  </div>
+
+  <!-- Filter Form -->
+  <div class="card mb-4 p-4" style="border-left:4px solid #8b5cf6;">
+    <form method="GET" action="/crime-patterns" id="patternForm">
+      <div class="row g-3 align-items-end">
+        <div class="col-md-3">
+          <label class="form-label fw-bold">Crime Type</label>
+          <select class="form-select" name="crime_type" id="crimeType">{crime_opts}</select>
+        </div>
+        <div class="col-md-3">
+          <label class="form-label fw-bold">State / UT</label>
+          <select class="form-select" name="state" id="stateSelect" onchange="loadDistricts()">{state_opts}</select>
+        </div>
+        <div class="col-md-2">
+          <label class="form-label fw-bold">District</label>
+          <select class="form-select" name="district" id="districtSelect">{district_opts}</select>
+        </div>
+        <div class="col-md-1">
+          <label class="form-label fw-bold">From</label>
+          <select class="form-select" name="start_year">{year_opts_s}</select>
+        </div>
+        <div class="col-md-1">
+          <label class="form-label fw-bold">To</label>
+          <select class="form-select" name="end_year">{year_opts_e}</select>
+        </div>
+        <div class="col-md-2">
+          <button type="submit" class="btn w-100" style="background:#8b5cf6;color:#fff;">🔍 Analyze</button>
+        </div>
+      </div>
+    </form>
+  </div>
+
+  {results_html}
+</div>
+
+<script>
+function loadDistricts() {{
+  var state = document.getElementById('stateSelect').value;
+  var sel   = document.getElementById('districtSelect');
+  sel.innerHTML = '<option value="">Loading...</option>';
+  fetch('/api/districts?state=' + encodeURIComponent(state))
+    .then(r => r.json())
+    .then(function(districts) {{
+      sel.innerHTML = '<option value="">All Districts (State-level)</option>';
+      districts.forEach(function(d) {{
+        var opt = document.createElement('option');
+        opt.value = d; opt.textContent = d;
+        sel.appendChild(opt);
+      }});
+    }})
+    .catch(function() {{ sel.innerHTML = '<option value="">All Districts (State-level)</option>'; }});
+}}
+</script>
+"""
+    return render_template_string(HTML_LAYOUT, content=body)
+
+
+def _build_pattern_results(data, crime_type, state, district):
+    """Build the HTML results section from run_full_analysis() output."""
+    if data.get('error'):
+        return f'<div class="alert alert-warning mt-3">⚠️ {escape(data["error"])}</div>'
+
+    trend    = data.get('trend', {})
+    spikes   = data.get('spikes', [])
+    similar  = data.get('similarity_rankings', [])
+    clusters = data.get('clusters', {})
+    insights = data.get('ai_insights', [])
+    series   = data.get('target_series', {})
+    comp_ser = data.get('comparison_series', {})
+
+    location_label = f"{state}" + (f" / {district}" if district else " (State-level)")
+
+    # ── Trend Card ──────────────────────────────────────────────────────────
+    direction = trend.get('direction', 'N/A')
+    net_pct   = trend.get('net_change_pct', 0)
+    peak_yr   = trend.get('peak_year', 'N/A')
+    low_yr    = trend.get('lowest_year', 'N/A')
+    slope     = trend.get('slope', 0)
+
+    dir_color  = '#2d6a4f' if direction == 'Increasing' else ('#ec4899' if direction == 'Decreasing' else '#8b5cf6')
+    trend_badge = f'<span class="badge" style="background:{dir_color};font-size:1rem;">{direction}</span>'
+
+    trend_html = f"""
+<div class="card mb-4 p-4">
+  <h5 style="color:#5b21b6;">📈 Trend Analysis — {escape(crime_type)} in {escape(location_label)}</h5>
+  <div class="row text-center mt-3">
+    <div class="col-md-3"><div class="p-3 rounded" style="background:#faf5ff;">
+      <div style="font-size:1.8rem;">{trend_badge}</div><small class="text-muted">Overall Trend</small></div></div>
+    <div class="col-md-3"><div class="p-3 rounded" style="background:#faf5ff;">
+      <div style="font-size:1.8rem;font-weight:bold;color:#5b21b6;">{net_pct:+.1f}%</div><small class="text-muted">Net Change</small></div></div>
+    <div class="col-md-3"><div class="p-3 rounded" style="background:#faf5ff;">
+      <div style="font-size:1.8rem;font-weight:bold;color:#5b21b6;">{peak_yr}</div><small class="text-muted">Peak Year</small></div></div>
+    <div class="col-md-3"><div class="p-3 rounded" style="background:#faf5ff;">
+      <div style="font-size:1.8rem;font-weight:bold;color:#5b21b6;">{low_yr}</div><small class="text-muted">Lowest Year</small></div></div>
+  </div>
+</div>"""
+
+    # ── Spikes / Drops ──────────────────────────────────────────────────────
+    spike_items = ''
+    for sp in spikes:
+        ev_type  = sp.get('event', 'spike')
+        yr       = sp.get('year', '')
+        pct      = sp.get('change_pct', 0)
+        prev_val = sp.get('prev_value', 0)
+        cur_val  = sp.get('value', 0)
+        icon = '🔺' if ev_type == 'spike' else '🔻'
+        col  = '#ec4899' if ev_type == 'spike' else '#8b5cf6'
+        spike_items += f'<div class="d-flex align-items-center mb-2 p-2 rounded" style="background:#fff0f6;border-left:4px solid {col};">{icon} <b class="ms-2">{yr}</b>: {ev_type.capitalize()} of <b>{pct:+.1f}%</b> &nbsp;<span class="text-muted">({int(prev_val):,} → {int(cur_val):,} cases)</span></div>'
+
+    spikes_html = f"""
+<div class="card mb-4 p-4">
+  <h5 style="color:#5b21b6;">⚡ Anomaly & Spike Detection</h5>
+  {''.join([spike_items]) if spikes else '<p class="text-muted">No significant anomalies detected in the selected range.</p>'}
+</div>"""
+
+    # ── Yearly trend chart + top similar overlay ────────────────────────────
+    years_sorted = sorted(series.keys())
+    labels_js = str(years_sorted)
+    target_js  = str([series.get(y, 0) for y in years_sorted])
+
+    # Pick top 3 similar for overlay
+    top3_datasets = ''
+    palette = ['#ec4899', '#f59e0b', '#10b981']
+    for idx, sim in enumerate(similar[:3]):
+        loc_name = sim.get('location', '')
+        s_data   = comp_ser.get(loc_name, {})
+        vals     = [s_data.get(y, 0) for y in years_sorted]
+        color    = palette[idx]
+        top3_datasets += f""",
+      {{
+        label: '{escape(loc_name)} ({sim.get("score_pct", 0):.1f}%)',
+        data: {vals},
+        borderColor: '{color}',
+        backgroundColor: 'transparent',
+        borderWidth: 1.5,
+        borderDash: [5,3],
+        pointRadius: 3
+      }}"""
+
+    trend_chart_html = f"""
+<div class="card mb-4 p-4">
+  <h5 style="color:#5b21b6;">📊 Yearly Crime Trend Chart</h5>
+  <canvas id="trendChart" height="100"></canvas>
+</div>
+<script>
+new Chart(document.getElementById('trendChart'), {{
+  type: 'line',
+  data: {{
+    labels: {labels_js},
+    datasets: [
+      {{
+        label: '{escape(location_label)}',
+        data: {target_js},
+        borderColor: '#8b5cf6',
+        backgroundColor: 'rgba(139,92,246,0.08)',
+        borderWidth: 2.5,
+        fill: true,
+        pointRadius: 4
+      }}{top3_datasets}
+    ]
+  }},
+  options: {{
+    responsive: true,
+    plugins: {{
+      legend: {{ labels: {{ color: '#1a1a1a' }} }},
+      title: {{ display: false }}
+    }},
+    scales: {{
+      x: {{ ticks: {{ color: '#1a1a1a' }} }},
+      y: {{ ticks: {{ color: '#1a1a1a' }} }}
+    }}
+  }}
+}});
+</script>"""
+
+    # ── Similarity Table ────────────────────────────────────────────────────
+    sim_rows = ''
+    for rank, sim in enumerate(similar[:15], 1):
+        loc      = sim.get('location', '')
+        score    = sim.get('score_pct', 0)
+        pattern  = sim.get('pattern', 'N/A')
+        bar_w    = int(score)
+        bar_col  = '#2d6a4f' if score >= 75 else ('#f59e0b' if score >= 50 else '#ec4899')
+        medal    = ['🥇', '🥈', '🥉'][rank - 1] if rank <= 3 else str(rank)
+        sim_rows += f"""
+<tr>
+  <td class="text-center">{medal}</td>
+  <td><b>{escape(loc)}</b></td>
+  <td>
+    <div style="background:#ede9fe;border-radius:4px;height:14px;width:100%;">
+      <div style="background:{bar_col};width:{bar_w}%;height:14px;border-radius:4px;"></div>
+    </div>
+    <small>{score:.1f}%</small>
+  </td>
+  <td><span class="badge" style="background:#8b5cf6;">{escape(pattern)}</span></td>
+</tr>"""
+
+    # Similarity bar chart (top 8)
+    sim_labels = str([s.get('location','') for s in similar[:8]])
+    sim_scores = str([round(s.get('score_pct', 0), 1) for s in similar[:8]])
+    sim_colors_js = str(['#2d6a4f' if s.get('score_pct',0)>=75 else ('#f59e0b' if s.get('score_pct',0)>=50 else '#ec4899') for s in similar[:8]])
+
+    if sim_rows:
+        sim_table_content = f'''<table class="table table-hover"><thead><tr><th>#</th><th>Region</th><th style="width:30%">Similarity Score</th><th>Pattern</th></tr></thead><tbody>{sim_rows}</tbody></table>'''
+        sim_chart_content = f'''<canvas id="simBarChart" height="80"></canvas>'''
+        sim_script_content = f'''<script>new Chart(document.getElementById("simBarChart"), {{ type:"bar", data:{{ labels:{sim_labels}, datasets:[{{ label:"Similarity %", data:{sim_scores}, backgroundColor:{sim_colors_js} }}] }}, options:{{ indexAxis:"y", responsive:true, plugins:{{ legend:{{ display:false }} }}, scales:{{ x:{{ max:100, ticks:{{ color:"#1a1a1a" }} }}, y:{{ ticks:{{ color:"#1a1a1a" }} }} }} }} }});</script>'''
+    else:
+        sim_table_content = '<p class="text-muted">Not enough data to compute similarity rankings.</p>'
+        sim_chart_content = ''
+        sim_script_content = ''
+
+    similarity_html = f"""
+<div class="card mb-4 p-4">
+  <h5 style="color:#5b21b6;">🔁 Similarity Rankings (Pearson Correlation)</h5>
+  <p class="text-muted small">Regions with the most similar crime trend <i>shapes</i> to {escape(location_label)}. Score = correlation mapped 0–100%.</p>
+  {sim_table_content}
+  {sim_chart_content}
+</div>
+{sim_script_content}"""
+
+    # ── Cluster Cards ───────────────────────────────────────────────────────
+    cluster_cards = ''
+    cluster_meta = [
+        ('high_volume_high_growth',   'High Volume + High Growth',   '🔴', '#fee2e2', '#dc2626'),
+        ('high_volume_low_growth',    'High Volume + Stable/Slow',   '🟠', '#fff7ed', '#ea580c'),
+        ('low_volume_high_growth',    'Low Volume + High Growth',    '🟡', '#fefce8', '#ca8a04'),
+        ('low_volume_low_growth',     'Low Volume + Low Activity',   '🟢', '#f0fdf4', '#16a34a'),
+    ]
+    for key, label, icon, bg, border in cluster_meta:
+        members = clusters.get(key, [])
+        badges  = ' '.join(f'<span class="badge me-1" style="background:{border};font-size:0.75rem;">{escape(m)}</span>' for m in members)
+        cluster_cards += f"""
+<div class="col-md-6 mb-3">
+  <div class="card h-100 p-3" style="border-left:4px solid {border};background:{bg};">
+    <h6 style="color:{border};">{icon} {label}</h6>
+    <p class="text-muted small mb-2">{len(members)} region(s)</p>
+    <div>{badges if badges else '<span class="text-muted small">No regions in this cluster</span>'}</div>
+  </div>
+</div>"""
+
+    clusters_html = f"""
+<div class="card mb-4 p-4">
+  <h5 style="color:#5b21b6;">🗺️ Crime Clusters — {escape(crime_type)}</h5>
+  <p class="text-muted small">Regions grouped by crime volume &amp; growth trend across the selected period.</p>
+  <div class="row">{cluster_cards}</div>
+</div>"""
+
+    # ── AI Insights ─────────────────────────────────────────────────────────
+    insight_type_style = {
+        'warning':  ('⚠️', '#fef9c3', '#ca8a04'),
+        'danger':   ('🚨', '#fee2e2', '#dc2626'),
+        'success':  ('✅', '#f0fdf4', '#16a34a'),
+        'info':     ('💡', '#eff6ff', '#2563eb'),
+        'primary':  ('📌', '#f5f3ff', '#7c3aed'),
+    }
+    insight_items = ''
+    for ins in insights:
+        itype = ins.get('type', 'info')
+        itext = ins.get('text', '')
+        icon_d, bg_d, col_d = insight_type_style.get(itype, ('💡', '#eff6ff', '#2563eb'))
+        insight_items += f'<div class="d-flex align-items-start mb-3 p-3 rounded" style="background:{bg_d};border-left:4px solid {col_d};">{icon_d}<span class="ms-2">{escape(itext)}</span></div>'
+
+    insights_html = f"""
+<div class="card mb-4 p-4">
+  <h5 style="color:#5b21b6;">🤖 AI Insights</h5>
+  {insight_items if insight_items else '<p class="text-muted">No insights generated.</p>'}
+</div>"""
+
+    return trend_html + spikes_html + trend_chart_html + similarity_html + clusters_html + insights_html
 
 
 if __name__ == '__main__':
