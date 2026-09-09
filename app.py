@@ -618,10 +618,10 @@ def crime_statistics():
     years = [r[0] for r in conn.execute("SELECT DISTINCT year FROM crime_statistics ORDER BY year DESC").fetchall()]
     crimes = [r[0] for r in conn.execute("SELECT DISTINCT crime_type FROM crime_statistics ORDER BY crime_type").fetchall()]
 
-    districts_query = "SELECT DISTINCT district FROM crime_statistics"
     if selected_state:
-        districts_query += f" WHERE state = '{selected_state}'"
-    districts = [r[0] for r in conn.execute(districts_query + " ORDER BY district").fetchall()]
+        districts = [r[0] for r in conn.execute("SELECT DISTINCT district FROM crime_statistics WHERE state = ? ORDER BY district", (selected_state,)).fetchall()]
+    else:
+        districts = [r[0] for r in conn.execute("SELECT DISTINCT district FROM crime_statistics ORDER BY district").fetchall()]
 
     # Build filtered query
     where_clauses = []
@@ -648,7 +648,7 @@ def crime_statistics():
 
     # Fetch page items
     data_sql = f"""
-        SELECT state, district, year, crime_type, case_count, source 
+        SELECT state, district, year, crime_type, case_count, 'NCRB / Kaggle' AS source 
         FROM crime_statistics
         {where_sql}
         ORDER BY case_count DESC, year DESC, state, district
@@ -664,12 +664,12 @@ def crime_statistics():
     if rows:
         rows_html = "".join([f"""
         <tr>
-            <td class="fw-bold text-warning">{r['state']}</td>
+            <td class="fw-bold" style="color: #4c1d95;">{r['state']}</td>
             <td>{r['district']}</td>
-            <td><span class="badge bg-secondary">{r['year']}</span></td>
-            <td><span class="badge bg-info text-dark">{r['crime_type']}</span></td>
-            <td class="fw-bold text-danger fs-6">{r['case_count']:,}</td>
-            <td><span class="source-badge">{r['source']}</span></td>
+            <td><span class="badge" style="background-color: #ede9fe; color: #4c1d95;">{r['year']}</span></td>
+            <td><span class="badge" style="background-color: #8b5cf6; color: #ffffff;">{r['crime_type']}</span></td>
+            <td class="fw-bold fs-6" style="color: #ec4899;">{r['case_count']:,}</td>
+            <td><span class="badge" style="background-color: #ec4899; color: #ffffff;">{r['source']}</span></td>
         </tr>
         """ for r in rows])
     else:
@@ -691,11 +691,11 @@ def crime_statistics():
 
     body = f"""
     <div class="d-flex justify-content-between align-items-center mb-4">
-        <h2 class="text-warning m-0">🔍 Kaggle/NCRB Crime Statistics Explorer</h2>
-        <span class="source-badge">Data Source: Kaggle / NCRB Dataset</span>
+        <h2 class="m-0" style="color: #5b21b6;">🔍 Kaggle/NCRB Crime Statistics Explorer</h2>
+        <span class="badge p-2" style="background-color: #ec4899; color: #ffffff;">Data Source: Kaggle / NCRB Dataset</span>
     </div>
 
-    <div class="card p-4 mb-4">
+    <div class="card p-4 mb-4" style="border-left: 4px solid #8b5cf6;">
         <form method="GET" action="/crime-statistics" class="row g-3">
             <div class="col-md-3">
                 <label class="form-label text-secondary small fw-bold">State / UT</label>
@@ -726,21 +726,21 @@ def crime_statistics():
                 </select>
             </div>
             <div class="col-md-1 d-flex align-items-end">
-                <button type="submit" class="btn btn-warning w-100 fw-bold">Filter</button>
+                <button type="submit" class="btn w-100 fw-bold" style="background-color: #8b5cf6; color: #ffffff;">Filter</button>
             </div>
         </form>
     </div>
 
     <div class="card p-4">
         <div class="d-flex justify-content-between align-items-center mb-3">
-            <h5 class="text-info m-0">
+            <h5 class="m-0" style="color: #5b21b6;">
                 Matching Statistics: <span class="fw-bold" style="color: #1a1a1a;">{total_matches:,} Entries</span> 
-                (<span class="text-danger fw-bold">{sum_cases:,} Total Cases</span>)
+                (<span class="fw-bold" style="color: #ec4899;">{sum_cases:,} Total Cases</span>)
             </h5>
             <a href="/crime-statistics" class="btn btn-outline-secondary btn-sm">Reset Filters</a>
         </div>
         <div class="table-responsive">
-            <table class="table table-dark table-hover align-middle">
+            <table class="table table-hover align-middle">
                 <thead>
                     <tr>
                         <th>State / UT</th>
