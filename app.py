@@ -7,10 +7,30 @@ import os
 import json
 import sqlite3
 import datetime
+from functools import wraps
 from html import escape
-from flask import Flask, render_template_string, request, jsonify, redirect, flash, url_for, send_from_directory
+from flask import Flask, render_template_string, request, jsonify, redirect, flash, url_for, send_from_directory, session
 from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
 from crime_pattern_analysis import get_filter_options, get_districts_for_state, run_full_analysis
+
+# The four account types the portal issues logins to. Every users.role value
+# must be one of these; the login/registration flow only ever assigns one of
+# these four.
+ROLES = ['Citizen', 'Police', 'Court', 'District Magistrate']
+
+# Which of the four roles may reach which write actions. View-only pages are
+# open to any signed-in user regardless of role.
+ROLE_PERMISSIONS = {
+    'add_police_station':   ['Police', 'District Magistrate'],
+    'add_police_officer':   ['Police', 'District Magistrate'],
+    'add_fir':               ['Citizen', 'Police', 'District Magistrate'],
+    'update_fir_status':     ['Police', 'District Magistrate'],
+    'add_criminal':          ['Police', 'District Magistrate'],
+    'update_criminal_status':['Police', 'District Magistrate'],
+    'add_case':               ['Court', 'Police', 'District Magistrate'],
+    'update_case_status':     ['Court', 'District Magistrate'],
+}
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, 'data')
@@ -36,6 +56,60 @@ def get_db_connection():
     return conn
 
 
+def render_page(content, status_code=200):
+    """Render a page inside the shared layout, injecting the signed-in user
+    (if any) so the navbar can show who's logged in."""
+    html = render_template_string(
+        HTML_LAYOUT,
+        content=content,
+        current_user_name=session.get('full_name'),
+        current_user_role=session.get('role'),
+    )
+    return (html, status_code) if status_code != 200 else html
+
+
+def login_required(view_func):
+    """Redirect anonymous visitors to /login, preserving where they were headed."""
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        if not session.get('user_id'):
+            return redirect(url_for('login', next=request.path))
+        return view_func(*args, **kwargs)
+    return wrapped
+
+
+def roles_required(*allowed_roles):
+    """Restrict a view to specific roles; anonymous users go to /login first."""
+    def decorator(view_func):
+        @wraps(view_func)
+        def wrapped(*args, **kwargs):
+            if not session.get('user_id'):
+                return redirect(url_for('login', next=request.path))
+            if session.get('role') not in allowed_roles:
+                return render_page(
+                    f"""<div class="alert alert-danger mt-4">
+                        Your account role ({escape(session.get('role', ''))}) does not have
+                        permission to perform this action. This action is limited to:
+                        {escape(', '.join(allowed_roles))}.
+                    </div>""",
+                    403,
+                )
+            return view_func(*args, **kwargs)
+        return wrapped
+    return decorator
+
+
+@app.before_request
+def _require_login_globally():
+    """Gate every route except the login page and static assets."""
+    public_endpoints = {'login', 'static'}
+    if request.endpoint in public_endpoints or request.endpoint is None:
+        return None
+    if not session.get('user_id'):
+        return redirect(url_for('login', next=request.path))
+    return None
+
+
 def init_db():
     """Create operational tables if they don't exist. Called once at startup."""
     conn = get_db_connection()
@@ -53,6 +127,24 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
+
+    # Seed one login per role the first time the app runs. Passwords are
+    # hashed with werkzeug's default (PBKDF2) — never stored in plain text.
+    cursor.execute("SELECT COUNT(*) FROM users")
+    if cursor.fetchone()[0] == 0:
+        default_accounts = [
+            # (full_name, email, temporary password, role)
+            ("Citizen Portal Account",        "citizen@crms.gov.in",     "Citizen@123",     "Citizen"),
+            ("Police Station Account",        "police@crms.gov.in",      "Police@123",      "Police"),
+            ("District Court Account",        "court@crms.gov.in",       "Court@123",       "Court"),
+            ("District Magistrate Account",   "magistrate@crms.gov.in",  "Magistrate@123",  "District Magistrate"),
+        ]
+        for full_name, email, temp_password, role in default_accounts:
+            cursor.execute(
+                "INSERT INTO users (username, password, role, full_name, email) VALUES (?, ?, ?, ?, ?)",
+                (email, generate_password_hash(temp_password), role, full_name, email)
+            )
+        conn.commit()
 
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS police_stations (
@@ -362,12 +454,12 @@ def init_db():
 
 # Base Layout & Navigation Bar
 HTML_NAVBAR = """
-<nav class="navbar navbar-expand-lg sticky-top shadow-sm" style="background-color: #374151; border-bottom: 2px solid #D6cfc4;">
+<nav class="navbar navbar-expand-lg sticky-top shadow-sm" style="background-color: #8b5cf6; border-bottom: 2px solid #ec4899;">
   <div class="container-fluid px-4">
     <a class="navbar-brand d-flex align-items-center gap-2 fw-bold" href="/" style="color: #ffffff; font-family: 'Times New Roman', Times, serif; font-size: 1.2rem;">
-      CRIME MANAGEMENT PORTAL
+      <span class="fs-4">🛡️</span> CRIME MANAGEMENT PORTAL
     </a>
-    <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav" style="border-color: #D6cfc4;">
+    <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav" style="border-color: #ec4899;">
       <span class="navbar-toggler-icon"></span>
     </button>
     <div class="collapse navbar-collapse" id="navbarNav">
@@ -382,9 +474,14 @@ HTML_NAVBAR = """
         <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Management</a></li>
         <li class="nav-item"><a class="nav-link" href="/criminal-records" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Criminal Records</a></li>
         <li class="nav-item"><a class="nav-link" href="/case-files" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Case Files</a></li>
-        <li class="nav-item"><a class="nav-link" href="/crime-patterns" style="color: #D6cfc4; font-weight: bold; font-family: 'Times New Roman', Times, serif;">Pattern Detector</a></li>
+        <li class="nav-item"><a class="nav-link" href="/crime-patterns" style="color: #fce7f3; font-weight: bold; font-family: 'Times New Roman', Times, serif;">🔗 Pattern Detector</a></li>
       </ul>
-      <span class="badge p-2 fw-bold" style="background-color: #D6cfc4; color: #1f2937; font-family: 'Times New Roman', Times, serif;">NCRB / Kaggle Dataset</span>
+      {% if current_user_name %}
+      <span class="d-flex align-items-center gap-2" style="font-family: 'Times New Roman', Times, serif;">
+        <span class="small" style="color: #fce7f3;">{{ current_user_name }} &middot; <strong>{{ current_user_role }}</strong></span>
+        <a href="/logout" class="btn btn-sm btn-outline-light">Sign Out</a>
+      </span>
+      {% endif %}
     </div>
   </div>
 </nav>
@@ -402,56 +499,56 @@ HTML_LAYOUT = """
     <style>
         * { font-family: 'Times New Roman', Times, serif !important; }
         body { background-color: #ffffff; color: #1a1a1a; }
-        h1, h2, h3, h4, h5, h6 { color: #1f2937; }
+        h1, h2, h3, h4, h5, h6 { color: #5b21b6; }
         .card { background-color: #f8f9fa; border: 1px solid #dee2e6; color: #1a1a1a; border-radius: 10px; box-shadow: 0 2px 6px rgba(0,0,0,0.08); }
         .table { color: #1a1a1a; }
-        .table thead th { background-color: #f3f4f6; color: #1f2937; border-bottom: 2px solid #9ca3af; }
-        .table tbody tr:hover { background-color: #f7f6f4; }
+        .table thead th { background-color: #ede9fe; color: #4c1d95; border-bottom: 2px solid #8b5cf6; }
+        .table tbody tr:hover { background-color: #fdf2f8; }
         .table-dark { background-color: #f8f9fa !important; color: #1a1a1a !important; border-color: #dee2e6 !important; }
         .table-dark td, .table-dark th { background-color: transparent !important; color: #1a1a1a !important; }
-        .nav-link:hover { color: #D6cfc4 !important; }
-        .stats-card { background: linear-gradient(135deg, #f9fafb 0%, #f3f4f6 100%); border-left: 4px solid #4b5563; }
-        .source-badge { font-size: 0.8rem; background: #4b5563; color: #ffffff; border-radius: 20px; padding: 4px 12px; }
+        .nav-link:hover { color: #fce7f3 !important; }
+        .stats-card { background: linear-gradient(135deg, #faf5ff 0%, #f3e8ff 100%); border-left: 4px solid #8b5cf6; }
+        .source-badge { font-size: 0.8rem; background: #8b5cf6; color: #ffffff; border-radius: 20px; padding: 4px 12px; }
         .form-select, .form-control { background-color: #ffffff; color: #1a1a1a; border: 1px solid #adb5bd; }
-        .form-select:focus, .form-control:focus { background-color: #ffffff; color: #1a1a1a; border-color: #4b5563; box-shadow: 0 0 0 2px rgba(75,85,99,0.2); }
-        .btn-outline-warning { border-color: #b8b0a5; color: #4b5563; }
-        .btn-outline-warning:hover { background-color: #D6cfc4; color: #1f2937; }
+        .form-select:focus, .form-control:focus { background-color: #ffffff; color: #1a1a1a; border-color: #8b5cf6; box-shadow: 0 0 0 2px rgba(139,92,246,0.2); }
+        .btn-outline-warning { border-color: #ec4899; color: #ec4899; }
+        .btn-outline-warning:hover { background-color: #ec4899; color: #ffffff; }
         .badge.bg-secondary { background-color: #6c757d !important; color: #ffffff !important; }
-        .badge.bg-info { background-color: #4b5563 !important; color: #ffffff !important; }
+        .badge.bg-info { background-color: #8b5cf6 !important; color: #ffffff !important; }
         .badge.bg-success { background-color: #2d6a4f !important; color: #ffffff !important; }
-        .badge.bg-danger { background-color: #b8860b !important; color: #ffffff !important; }
+        .badge.bg-danger { background-color: #ec4899 !important; color: #ffffff !important; }
         .badge.bg-warning { background-color: #f59e0b !important; color: #ffffff !important; }
-        .badge.bg-primary { background-color: #4b5563 !important; color: #ffffff !important; }
-        .text-warning { color: #857d72 !important; }
-        .text-info { color: #4b5563 !important; }
-        .text-danger { color: #b8860b !important; }
+        .badge.bg-primary { background-color: #8b5cf6 !important; color: #ffffff !important; }
+        .text-warning { color: #ec4899 !important; }
+        .text-info { color: #8b5cf6 !important; }
+        .text-danger { color: #ec4899 !important; }
         .text-success { color: #2d6a4f !important; }
         .text-secondary { color: #555555 !important; }
         .text-muted { color: #777777 !important; }
         .text-light { color: #1a1a1a !important; }
-        .btn-warning { background-color: #D6cfc4; border-color: #b8b0a5; color: #1f2937; font-weight: bold; }
-        .btn-warning:hover { background-color: #c5beb3; border-color: #a8a095; color: #1f2937; }
-        .btn-primary { background-color: #4b5563; border-color: #4b5563; color: #ffffff; }
-        .btn-primary:hover { background-color: #374151; border-color: #374151; color: #ffffff; }
-        .btn-outline-light { border-color: #6b7280; color: #374151; }
-        .btn-outline-light:hover { background-color: #f3f4f6; color: #1f2937; }
-        .btn-outline-info { border-color: #6b7280; color: #4b5563; }
-        .btn-outline-info:hover { background-color: #f3f4f6; color: #1f2937; }
-        .btn-outline-danger { border-color: #b8b0a5; color: #4b5563; }
-        .btn-outline-danger:hover { background-color: #D6cfc4; color: #1f2937; }
+        .btn-warning { background-color: #ec4899; border-color: #ec4899; color: #ffffff; }
+        .btn-warning:hover { background-color: #db2777; border-color: #db2777; color: #ffffff; }
+        .btn-primary { background-color: #8b5cf6; border-color: #8b5cf6; color: #ffffff; }
+        .btn-primary:hover { background-color: #7c3aed; border-color: #7c3aed; color: #ffffff; }
+        .btn-outline-light { border-color: #8b5cf6; color: #6d28d9; }
+        .btn-outline-light:hover { background-color: #ede9fe; color: #4c1d95; }
+        .btn-outline-info { border-color: #8b5cf6; color: #8b5cf6; }
+        .btn-outline-info:hover { background-color: #ede9fe; color: #4c1d95; }
+        .btn-outline-danger { border-color: #ec4899; color: #ec4899; }
+        .btn-outline-danger:hover { background-color: #fce7f3; color: #db2777; }
         .btn-outline-success { border-color: #2d6a4f; color: #2d6a4f; }
         .btn-outline-success:hover { background-color: #d4edda; color: #000000; }
         .btn-outline-secondary { border-color: #6c757d; color: #6c757d; }
         .btn-outline-secondary:hover { background-color: #e2e3e5; color: #000000; }
-        .btn-outline-primary { border-color: #6b7280; color: #374151; }
-        .btn-outline-primary:hover { background-color: #f3f4f6; color: #1f2937; }
+        .btn-outline-primary { border-color: #8b5cf6; color: #7c3aed; }
+        .btn-outline-primary:hover { background-color: #ede9fe; color: #4c1d95; }
         .list-group-item { background-color: #f8f9fa; color: #1a1a1a; border-color: #dee2e6; }
         .border-secondary { border-color: #dee2e6 !important; }
-        a { color: #374151; }
-        a:hover { color: #857d72; }
+        a { color: #7c3aed; }
+        a:hover { color: #ec4899; }
         footer { background-color: #f8f9fa; color: #555555; border-top: 1px solid #dee2e6 !important; }
-        .pagination .page-link { background-color: #f8f9fa; color: #374151; border-color: #dee2e6; }
-        .pagination .page-link:hover { background-color: #f3f4f6; color: #1f2937; }
+        .pagination .page-link { background-color: #f8f9fa; color: #7c3aed; border-color: #dee2e6; }
+        .pagination .page-link:hover { background-color: #ede9fe; color: #4c1d95; }
     </style>
 </head>
 <body style="background-color: #ffffff;">
@@ -466,6 +563,65 @@ HTML_LAYOUT = """
 </body>
 </html>
 """
+
+
+# AUTHENTICATION
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    error = None
+    if request.method == 'POST':
+        email = request.form.get('email', '').strip().lower()
+        password = request.form.get('password', '')
+        conn = get_db_connection()
+        user = conn.execute("SELECT * FROM users WHERE lower(email) = ?", (email,)).fetchone()
+        conn.close()
+        if user and check_password_hash(user['password'], password):
+            session.clear()
+            session['user_id'] = user['user_id']
+            session['role'] = user['role']
+            session['full_name'] = user['full_name']
+            session['email'] = user['email']
+            return redirect(request.args.get('next') or url_for('dashboard'))
+        error = "No account matches that email and password."
+
+    error_html = f'<div class="alert alert-danger py-2">{escape(error)}</div>' if error else ''
+    content = f"""
+    <div class="row justify-content-center">
+      <div class="col-md-5 col-lg-4">
+        <div class="card p-4 shadow-sm mt-5">
+          <h3 class="text-center mb-1" style="color:#5b21b6;">Crime Management Portal</h3>
+          <p class="text-center text-muted mb-4">Sign in with your registered email</p>
+          {error_html}
+          <form method="POST">
+            <div class="mb-3">
+              <label class="form-label">Email address</label>
+              <input type="email" name="email" class="form-control" placeholder="name@crms.gov.in" required autofocus>
+            </div>
+            <div class="mb-3">
+              <label class="form-label">Password</label>
+              <input type="password" name="password" class="form-control" placeholder="Password" required>
+            </div>
+            <button type="submit" class="btn btn-primary w-100">Sign In</button>
+          </form>
+          <hr>
+          <p class="small text-muted mb-1">The portal issues four account types, one email each:</p>
+          <ul class="small text-muted mb-0 ps-3">
+            <li><strong>Citizen</strong> — file and track complaints</li>
+            <li><strong>Police</strong> — FIRs, criminal records, stations</li>
+            <li><strong>Court</strong> — case files and hearings</li>
+            <li><strong>District Magistrate</strong> — oversight across all modules</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+    """
+    return render_template_string(HTML_LAYOUT, content=content, current_user_name=None, current_user_role=None)
+
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
 
 
 # DASHBOARD ROUTE
@@ -522,17 +678,17 @@ def dashboard():
     body = f"""
     <div class="row g-4 mb-4">
         <div class="col-md-12">
-            <div class="p-4 rounded-3 card shadow-sm text-center" style="background: linear-gradient(135deg, #f9fafb 0%, #f4f2ee 100%); border: 2px solid #D6cfc4;">
+            <div class="p-4 rounded-3 card shadow-sm text-center" style="background: linear-gradient(135deg, #ede9fe 0%, #fdf2f8 100%); border: 2px solid #ec4899;">
                 <div class="d-flex justify-content-between align-items-center mb-2">
                     <span class="source-badge">Official NCRB / Kaggle Crime Dataset</span>
-                    <span class="small fw-semibold" style="color: #4b5563;">Years Covered: {min_yr} – {max_yr}</span>
+                    <span class="small fw-semibold" style="color: #6d28d9;">Years Covered: {min_yr} – {max_yr}</span>
                 </div>
-                <h1 class="display-6 fw-bold" style="color: #1f2937;">National Crime Management Portal</h1>
-                <p class="lead mb-3" style="color: #374151;">Live Dynamic Insights from 35+ Million Real NCRB Recorded Crime Cases</p>
+                <h1 class="display-6 fw-bold" style="color: #ec4899;">National Crime Management Portal</h1>
+                <p class="lead mb-3" style="color: #4c1d95;">Live Dynamic Insights from 35+ Million Real NCRB Recorded Crime Cases</p>
                 <div class="d-flex justify-content-center gap-3">
-                    <a href="/crime-statistics" class="btn btn-warning fw-bold px-4 shadow-sm">Search Crime Records</a>
-                    <a href="/analytics" class="btn btn-primary fw-bold px-4 shadow-sm">Interactive Visual Analytics</a>
-                    <a href="/women-children-analytics" class="btn btn-outline-primary fw-bold px-4 shadow-sm" style="background-color: #ffffff;">Women & Children Reports</a>
+                    <a href="/crime-statistics" class="btn btn-warning fw-bold px-4 shadow-sm">🔍 Search Crime Records</a>
+                    <a href="/analytics" class="btn btn-primary fw-bold px-4 shadow-sm">📊 Interactive Visual Analytics</a>
+                    <a href="/women-children-analytics" class="btn btn-outline-primary fw-bold px-4 shadow-sm" style="background-color: #ffffff;">👧 Women & Children Reports</a>
                 </div>
             </div>
         </div>
@@ -547,7 +703,7 @@ def dashboard():
             </div>
         </div>
         <div class="col-md-3">
-            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #D6cfc4;">
+            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #ec4899;">
                 <h6 class="text-uppercase text-secondary small">States & UTs</h6>
                 <span class="fs-2 fw-bold text-danger">{states_count}</span>
                 <small class="text-muted">{districts_count} Districts Covered</small>
@@ -572,7 +728,7 @@ def dashboard():
     <div class="row g-4">
         <div class="col-12">
             <div class="card p-4">
-                <h5 class="text-warning mb-3">Key Dataset Highlights</h5>
+                <h5 class="text-warning mb-3">📌 Key Dataset Highlights</h5>
                 <ul class="list-group list-group-flush bg-transparent">
                     <li class="list-group-item bg-transparent border-secondary d-flex justify-content-between" style="color: #1a1a1a;">
                         <span>Most Common Crime Category:</span>
@@ -595,7 +751,7 @@ def dashboard():
         </div>
     </div>
     """
-    return render_template_string(HTML_LAYOUT, content=body)
+    return render_page(body)
 
 
 # CRIME STATISTICS & FILTER ROUTE
@@ -618,10 +774,10 @@ def crime_statistics():
     years = [r[0] for r in conn.execute("SELECT DISTINCT year FROM crime_statistics ORDER BY year DESC").fetchall()]
     crimes = [r[0] for r in conn.execute("SELECT DISTINCT crime_type FROM crime_statistics ORDER BY crime_type").fetchall()]
 
+    districts_query = "SELECT DISTINCT district FROM crime_statistics"
     if selected_state:
-        districts = [r[0] for r in conn.execute("SELECT DISTINCT district FROM crime_statistics WHERE state = ? ORDER BY district", (selected_state,)).fetchall()]
-    else:
-        districts = [r[0] for r in conn.execute("SELECT DISTINCT district FROM crime_statistics ORDER BY district").fetchall()]
+        districts_query += f" WHERE state = '{selected_state}'"
+    districts = [r[0] for r in conn.execute(districts_query + " ORDER BY district").fetchall()]
 
     # Build filtered query
     where_clauses = []
@@ -648,7 +804,7 @@ def crime_statistics():
 
     # Fetch page items
     data_sql = f"""
-        SELECT state, district, year, crime_type, case_count, 'NCRB / Kaggle' AS source 
+        SELECT state, district, year, crime_type, case_count, source 
         FROM crime_statistics
         {where_sql}
         ORDER BY case_count DESC, year DESC, state, district
@@ -664,19 +820,19 @@ def crime_statistics():
     if rows:
         rows_html = "".join([f"""
         <tr>
-            <td class="fw-bold" style="color: #1f2937;">{r['state']}</td>
+            <td class="fw-bold text-warning">{r['state']}</td>
             <td>{r['district']}</td>
-            <td><span class="badge" style="background-color: #f3f4f6; color: #374151;">{r['year']}</span></td>
-            <td><span class="badge" style="background-color: #4b5563; color: #ffffff;">{r['crime_type']}</span></td>
-            <td class="fw-bold fs-6" style="color: #1f2937;">{r['case_count']:,}</td>
-            <td><span class="badge fw-bold" style="background-color: #D6cfc4; color: #1f2937;">{r['source']}</span></td>
+            <td><span class="badge bg-secondary">{r['year']}</span></td>
+            <td><span class="badge bg-info text-dark">{r['crime_type']}</span></td>
+            <td class="fw-bold text-danger fs-6">{r['case_count']:,}</td>
+            <td><span class="source-badge">{r['source']}</span></td>
         </tr>
         """ for r in rows])
     else:
         rows_html = """
         <tr>
             <td colspan="6" class="text-center py-5 text-muted fs-5">
-                No records found for the selected filters. Please adjust your search criteria.
+                ⚠️ No records found for the selected filters. Please adjust your search criteria.
             </td>
         </tr>
         """
@@ -691,11 +847,11 @@ def crime_statistics():
 
     body = f"""
     <div class="d-flex justify-content-between align-items-center mb-4">
-        <h2 class="m-0" style="color: #1f2937;">Kaggle/NCRB Crime Statistics Explorer</h2>
-        <span class="badge p-2 fw-bold" style="background-color: #D6cfc4; color: #1f2937;">Data Source: Kaggle / NCRB Dataset</span>
+        <h2 class="text-warning m-0">🔍 Kaggle/NCRB Crime Statistics Explorer</h2>
+        <span class="source-badge">Data Source: Kaggle / NCRB Dataset</span>
     </div>
 
-    <div class="card p-4 mb-4" style="border-left: 4px solid #4b5563;">
+    <div class="card p-4 mb-4">
         <form method="GET" action="/crime-statistics" class="row g-3">
             <div class="col-md-3">
                 <label class="form-label text-secondary small fw-bold">State / UT</label>
@@ -726,21 +882,21 @@ def crime_statistics():
                 </select>
             </div>
             <div class="col-md-1 d-flex align-items-end">
-                <button type="submit" class="btn w-100 fw-bold" style="background-color: #4b5563; color: #ffffff;">Filter</button>
+                <button type="submit" class="btn btn-warning w-100 fw-bold">Filter</button>
             </div>
         </form>
     </div>
 
     <div class="card p-4">
         <div class="d-flex justify-content-between align-items-center mb-3">
-            <h5 class="m-0" style="color: #1f2937;">
+            <h5 class="text-info m-0">
                 Matching Statistics: <span class="fw-bold" style="color: #1a1a1a;">{total_matches:,} Entries</span> 
-                (<span class="fw-bold" style="color: #1f2937;">{sum_cases:,} Total Cases</span>)
+                (<span class="text-danger fw-bold">{sum_cases:,} Total Cases</span>)
             </h5>
             <a href="/crime-statistics" class="btn btn-outline-secondary btn-sm">Reset Filters</a>
         </div>
         <div class="table-responsive">
-            <table class="table table-hover align-middle">
+            <table class="table table-dark table-hover align-middle">
                 <thead>
                     <tr>
                         <th>State / UT</th>
@@ -771,7 +927,7 @@ def crime_statistics():
         </div>
     </div>
     """
-    return render_template_string(HTML_LAYOUT, content=body)
+    return render_page(body)
 
 
 # INTERACTIVE ANALYTICS & CHARTS ROUTE
@@ -812,20 +968,20 @@ def analytics():
 
     body = f"""
     <div class="d-flex justify-content-between align-items-center mb-4">
-        <h2 class="text-info m-0">Interactive Crime Analytics & Trends</h2>
+        <h2 class="text-info m-0">📊 Interactive Crime Analytics & Trends</h2>
         <span class="source-badge">Data Source: Kaggle / NCRB Dataset</span>
     </div>
 
     <div class="row g-4 mb-4">
         <div class="col-md-8">
             <div class="card p-4">
-                <h5 class="text-warning mb-3">National Crime Trend Over Years (2001 - 2014)</h5>
+                <h5 class="text-warning mb-3">📈 National Crime Trend Over Years (2001 - 2014)</h5>
                 <canvas id="yearlyTrendChart" height="140"></canvas>
             </div>
         </div>
         <div class="col-md-4">
             <div class="card p-4">
-                <h5 class="text-danger mb-3">Top Crime Categories</h5>
+                <h5 class="text-danger mb-3">🧩 Top Crime Categories</h5>
                 <canvas id="categoryPieChart" height="280"></canvas>
             </div>
         </div>
@@ -834,7 +990,7 @@ def analytics():
     <div class="row g-4">
         <div class="col-md-12">
             <div class="card p-4">
-                <h5 class="text-success mb-3">Top 10 States by Total Recorded Crimes</h5>
+                <h5 class="text-success mb-3">🏛️ Top 10 States by Total Recorded Crimes</h5>
                 <canvas id="stateBarChart" height="100"></canvas>
             </div>
         </div>
@@ -849,8 +1005,8 @@ def analytics():
                 datasets: [{{
                     label: 'Total Recorded Crimes',
                     data: {year_vals},
-                    borderColor: '#4b5563',
-                    backgroundColor: 'rgba(75, 85, 99, 0.12)',
+                    borderColor: '#8b5cf6',
+                    backgroundColor: 'rgba(139, 92, 246, 0.12)',
                     fill: true,
                     tension: 0.3
                 }}]
@@ -872,7 +1028,7 @@ def analytics():
                 labels: {cat_labels},
                 datasets: [{{
                     data: {cat_vals},
-                    backgroundColor: ['#D6cfc4', '#4b5563', '#10b981', '#f59e0b', '#6b7280', '#06b6d4', '#84cc16', '#374151', '#14b8a6', '#9ca3af']
+                    backgroundColor: ['#ec4899', '#8b5cf6', '#10b981', '#f59e0b', '#a855f7', '#06b6d4', '#84cc16', '#6366f1', '#14b8a6', '#f43f5e']
                 }}]
             }},
             options: {{
@@ -889,7 +1045,7 @@ def analytics():
                 datasets: [{{
                     label: 'Total Crime Cases',
                     data: {state_vals},
-                    backgroundColor: '#4b5563'
+                    backgroundColor: '#8b5cf6'
                 }}]
             }},
             options: {{
@@ -903,7 +1059,7 @@ def analytics():
         }});
     </script>
     """
-    return render_template_string(HTML_LAYOUT, content=body)
+    return render_page(body)
 
 
 # WOMEN & CHILDREN ANALYTICS ROUTE
@@ -931,11 +1087,11 @@ def women_children_analytics():
     child_rows = "".join([f"<tr><td>{c['crime_type']}</td><td class='fw-bold text-warning'>{c['total']:,}</td></tr>" for c in child_cats])
 
     body = f"""
-    <h2 class="text-danger mb-4">Crimes Against Women & Children Statistics</h2>
+    <h2 class="text-danger mb-4">👧 Crimes Against Women & Children Statistics</h2>
     <div class="row g-4">
         <div class="col-md-6">
             <div class="card p-4">
-                <h4 class="text-danger mb-3">Crimes Against Women (Category Breakdown)</h4>
+                <h4 class="text-danger mb-3">👩 Crimes Against Women (Category Breakdown)</h4>
                 <div class="table-responsive">
                     <table class="table table-dark table-hover align-middle">
                         <thead><tr><th>Category</th><th>Total Reported Cases</th></tr></thead>
@@ -946,7 +1102,7 @@ def women_children_analytics():
         </div>
         <div class="col-md-6">
             <div class="card p-4">
-                <h4 class="text-warning mb-3">Crimes Against Children (Category Breakdown)</h4>
+                <h4 class="text-warning mb-3">👶 Crimes Against Children (Category Breakdown)</h4>
                 <div class="table-responsive">
                     <table class="table table-dark table-hover align-middle">
                         <thead><tr><th>Category</th><th>Total Reported Cases</th></tr></thead>
@@ -957,7 +1113,7 @@ def women_children_analytics():
         </div>
     </div>
     """
-    return render_template_string(HTML_LAYOUT, content=body)
+    return render_page(body)
 
 
 # PROPERTY & ARREST ANALYTICS ROUTE
@@ -992,13 +1148,13 @@ def property_arrest_analytics():
 
     body = f"""
     <div class="d-flex justify-content-between align-items-center mb-4">
-        <h2 class="text-info m-0">Property Crimes & Police Arrest Statistics</h2>
+        <h2 class="text-info m-0">💰 Property Crimes & Police Arrest Statistics</h2>
         <span class="source-badge">Data Source: Kaggle / NCRB Dataset</span>
     </div>
     <div class="row g-4 mb-4">
         <div class="col-md-6">
             <div class="card p-4 h-100">
-                <h4 class="text-warning mb-3">Stolen vs Recovered Property (Top States)</h4>
+                <h4 class="text-warning mb-3">🏡 Stolen vs Recovered Property (Top States)</h4>
                 <div class="table-responsive">
                     <table class="table table-hover align-middle">
                         <thead><tr><th>State / UT</th><th>Stolen Cases</th><th>Recovered Cases</th></tr></thead>
@@ -1009,7 +1165,7 @@ def property_arrest_analytics():
         </div>
         <div class="col-md-6">
             <div class="card p-4 h-100">
-                <h4 class="text-info mb-3">Top States by Recovered Property</h4>
+                <h4 class="text-info mb-3">🏆 Top States by Recovered Property</h4>
                 <div class="table-responsive">
                     <table class="table table-hover align-middle">
                         <thead><tr><th>State / UT</th><th>Recovered Cases</th></tr></thead>
@@ -1022,7 +1178,7 @@ def property_arrest_analytics():
     <div class="row g-4">
         <div class="col-12">
             <div class="card p-4">
-                <h4 class="text-info mb-3">Arrests, Convictions & Acquittals</h4>
+                <h4 class="text-info mb-3">⚖️ Arrests, Convictions & Acquittals</h4>
                 <div class="table-responsive">
                     <table class="table table-hover align-middle">
                         <thead><tr><th>Crime Head</th><th>Arrested</th><th>Convicted</th><th>Acquitted</th></tr></thead>
@@ -1033,7 +1189,7 @@ def property_arrest_analytics():
         </div>
     </div>
     """
-    return render_template_string(HTML_LAYOUT, content=body)
+    return render_page(body)
 
 
 # --- Status option sets shared by the operational modules ---
@@ -1120,7 +1276,7 @@ def api_police_stations():
 def police_station_map():
         if not os.path.exists(POLICE_STATIONS_GEOJSON):
                 content = "<h2 class='text-info'>Police Station Map</h2><p>The station GeoJSON file is not available.</p>"
-                return render_template_string(HTML_LAYOUT, content=content), 404
+                return render_page(content), 404
 
         body = """
         <div class="d-flex justify-content-between align-items-center mb-3">
@@ -1145,7 +1301,7 @@ def police_station_map():
                     document.getElementById('station-count').textContent = `${features.length.toLocaleString()} stations`;
                     const layer = L.geoJSON(data, {
                         pointToLayer: (feature, latlng) => L.circleMarker(latlng, {
-                            radius: 4, color: '#4b5563', fillColor: '#D6cfc4', fillOpacity: 0.8
+                            radius: 4, color: '#ec4899', fillColor: '#8b5cf6', fillOpacity: 0.8
                         }),
                         onEachFeature: (feature, layer) => {
                             const properties = feature.properties || {};
@@ -1157,7 +1313,7 @@ def police_station_map():
                 .catch(() => { document.getElementById('station-count').textContent = 'Unable to load stations'; });
         </script>
         """
-        return render_template_string(HTML_LAYOUT, content=body)
+        return render_page(body)
 
 
 # OPERATIONAL MODULES
@@ -1216,7 +1372,7 @@ def police_stations():
     """ for station in geojson_stations[:100]]) or "<tr><td colspan='4' class='text-center text-muted py-4'>Police station GeoJSON not available.</td></tr>"
 
     body = f"""
-    <h2 class="text-warning mb-3">Police Stations & Officer Directory</h2>
+    <h2 class="text-warning mb-3">🏢 Police Stations & Officer Directory</h2>
     <div class="card p-4 mb-4">
         <div class="d-flex justify-content-between align-items-center mb-3">
             <div><h4 class="text-info m-0">Police Station Reference Data</h4>
@@ -1282,10 +1438,11 @@ def police_stations():
         </form>
     </div>
     """
-    return render_template_string(HTML_LAYOUT, content=body)
+    return render_page(body)
 
 
 @app.route('/police-stations/add', methods=['POST'])
+@roles_required(*ROLE_PERMISSIONS['add_police_station'])
 def add_police_station():
     conn = get_db_connection()
     conn.execute("INSERT INTO police_stations (station_name, address, city, state, contact_number) VALUES (?, ?, ?, ?, ?)",
@@ -1296,6 +1453,7 @@ def add_police_station():
 
 
 @app.route('/police-stations/add-officer', methods=['POST'])
+@roles_required(*ROLE_PERMISSIONS['add_police_officer'])
 def add_police_officer():
     conn = get_db_connection()
     station_id = _resolve_station_id(conn, request.form['station_id'])
@@ -1339,7 +1497,7 @@ def fir_management():
     category_options = "".join(f'<option value="{c["crime_type"]}">' for c in crime_categories)
 
     body = f"""
-    <h2 class="text-warning mb-3">FIR (First Information Report) Registry</h2>
+    <h2 class="text-warning mb-3">📄 FIR (First Information Report) Registry</h2>
     <div class="card p-4 mb-4">
         <div class="table-responsive">
             <table class="table table-dark table-hover align-middle">
@@ -1373,10 +1531,11 @@ def fir_management():
         </div></div>
     </div>
     """
-    return render_template_string(HTML_LAYOUT, content=body)
+    return render_page(body)
 
 
 @app.route('/fir-management/add', methods=['POST'])
+@roles_required(*ROLE_PERMISSIONS['add_fir'])
 def add_fir():
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1396,6 +1555,7 @@ def add_fir():
 
 
 @app.route('/fir-management/<int:fir_id>/status', methods=['POST'])
+@roles_required(*ROLE_PERMISSIONS['update_fir_status'])
 def update_fir_status(fir_id):
     conn = get_db_connection()
     conn.execute("UPDATE FIR SET status = ? WHERE fir_id = ?", (request.form['status'], fir_id))
@@ -1427,7 +1587,7 @@ def criminal_records():
     arrest_rows = "".join(f"<tr><td>{a['crime_head']}</td><td>{a['arrested']:,}</td><td>{a['convicted']:,}</td></tr>" for a in arrest_context) or "<tr><td colspan='3' class='text-center text-muted'>Run the dataset import to show arrest context.</td></tr>"
 
     body = f"""
-    <h2 class="text-danger mb-3">Criminal Record Dossiers</h2>
+    <h2 class="text-danger mb-3">👤 Criminal Record Dossiers</h2>
     <div class="card p-4 mb-4">
         <div class="table-responsive">
             <table class="table table-dark table-hover align-middle">
@@ -1439,10 +1599,11 @@ def criminal_records():
     <div class="row g-4"><div class="col-lg-7"><div class="card p-4"><h4 class="text-info mb-3">NCRB Arrest Context</h4><div class="table-responsive"><table class="table table-dark table-hover"><thead><tr><th>Crime Head</th><th>Arrested</th><th>Convicted</th></tr></thead><tbody>{arrest_rows}</tbody></table></div></div></div>
     <div class="col-lg-5"><div class="card p-4"><h4 class="text-info mb-3">Add Criminal Record</h4><form method="POST" action="/criminal-records/add"><input class="form-control mb-2" name="name" placeholder="Full name" required><input class="form-control mb-2" name="alias" placeholder="Alias"><div class="row g-2 mb-2"><div class="col"><input type="date" class="form-control" name="date_of_birth"></div><div class="col"><select class="form-select" name="gender"><option>Male</option><option>Female</option><option>Other</option></select></div></div><input class="form-control mb-2" name="address" placeholder="Address"><input class="form-control mb-2" name="phone" placeholder="Phone"><input class="form-control mb-2" name="identification_details" placeholder="Identification details"><select class="form-select mb-3" name="status">{_options_html(CRIMINAL_STATUSES, 'Wanted')}</select><button type="submit" class="btn btn-warning w-100">Add Criminal Record</button></form></div></div></div>
     """
-    return render_template_string(HTML_LAYOUT, content=body)
+    return render_page(body)
 
 
 @app.route('/criminal-records/add', methods=['POST'])
+@roles_required(*ROLE_PERMISSIONS['add_criminal'])
 def add_criminal():
     conn = get_db_connection()
     conn.execute("INSERT INTO criminals (name, alias, date_of_birth, gender, address, phone, identification_details, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1453,6 +1614,7 @@ def add_criminal():
 
 
 @app.route('/criminal-records/<int:criminal_id>/status', methods=['POST'])
+@roles_required(*ROLE_PERMISSIONS['update_criminal_status'])
 def update_criminal_status(criminal_id):
     conn = get_db_connection()
     conn.execute("UPDATE criminals SET status = ? WHERE criminal_id = ?", (request.form['status'], criminal_id))
@@ -1492,7 +1654,7 @@ def case_files():
     officer_options = "".join(f'<option value="{o["officer_id"]}">{o["name"]} ({o["rank"]})</option>' for o in officers) or '<option value="">Unassigned</option>'
 
     body = f"""
-    <h2 class="text-info mb-3">Active & Closed Case Files</h2>
+    <h2 class="text-info mb-3">⚖️ Active & Closed Case Files</h2>
     <div class="card p-4 mb-4">
         <div class="table-responsive">
             <table class="table table-dark table-hover align-middle">
@@ -1504,10 +1666,11 @@ def case_files():
     <div class="row g-4"><div class="col-lg-7"><div class="card p-4"><h4 class="text-info mb-3">NCRB Yearly Reference</h4><div class="table-responsive"><table class="table table-dark table-hover"><thead><tr><th>Year</th><th>Reported Cases</th></tr></thead><tbody>{year_rows}</tbody></table></div></div></div>
     <div class="col-lg-5"><div class="card p-4"><h4 class="text-info mb-3">Open New Case File</h4><form method="POST" action="/case-files/add"><input class="form-control mb-2" name="case_number" placeholder="Case number" required><select class="form-select mb-2" name="fir_id" required>{fir_options}</select><select class="form-select mb-2" name="investigating_officer_id">{officer_options}</select><div class="row g-2 mb-2"><div class="col"><select class="form-select" name="priority"><option>Low</option><option selected>Medium</option><option>High</option></select></div><div class="col"><input type="date" class="form-control" name="start_date" required></div></div><textarea class="form-control mb-3" name="remarks" placeholder="Remarks" rows="2"></textarea><button type="submit" class="btn btn-warning w-100">Open Case</button></form></div></div></div>
     """
-    return render_template_string(HTML_LAYOUT, content=body)
+    return render_page(body)
 
 
 @app.route('/case-files/add', methods=['POST'])
+@roles_required(*ROLE_PERMISSIONS['add_case'])
 def add_case():
     conn = get_db_connection()
     conn.execute("INSERT INTO cases (case_number, fir_id, investigating_officer_id, priority, start_date, remarks) VALUES (?, ?, ?, ?, ?, ?)",
@@ -1518,6 +1681,7 @@ def add_case():
 
 
 @app.route('/case-files/<int:case_id>/status', methods=['POST'])
+@roles_required(*ROLE_PERMISSIONS['update_case_status'])
 def update_case_status(case_id):
     conn = get_db_connection()
     status = request.form['case_status']
@@ -1571,7 +1735,7 @@ def crime_patterns():
     except Exception as e:
         conn.close()
         body = f'<div class="alert alert-danger">Error loading filters: {escape(str(e))}</div>'
-        return render_template_string(HTML_LAYOUT, content=body)
+        return render_page(body)
 
     crimes  = filter_opts.get('crimes', [])
     states  = filter_opts.get('states', [])
@@ -1625,13 +1789,13 @@ def crime_patterns():
 <div class="container-fluid py-4">
   <div class="row mb-4">
     <div class="col-12">
-      <h2 style="color:#1f2937;">AI-Powered Crime Pattern &amp; Similarity Detector</h2>
+      <h2 style="color:#5b21b6;">🔗 AI-Powered Crime Pattern &amp; Similarity Detector</h2>
       <p class="text-muted">Analyze historical crime trends, detect anomalies, find similar crime patterns across regions, and identify clusters — powered by real NCRB/Kaggle data (2001–2013).</p>
     </div>
   </div>
 
   <!-- Filter Form -->
-  <div class="card mb-4 p-4" style="border-left:4px solid #4b5563;">
+  <div class="card mb-4 p-4" style="border-left:4px solid #8b5cf6;">
     <form method="GET" action="/crime-patterns" id="patternForm">
       <div class="row g-3 align-items-end">
         <div class="col-md-3">
@@ -1655,7 +1819,7 @@ def crime_patterns():
           <select class="form-select" name="end_year">{year_opts_e}</select>
         </div>
         <div class="col-md-2">
-          <button type="submit" class="btn w-100 fw-bold" style="background:#4b5563;color:#fff;">Analyze</button>
+          <button type="submit" class="btn w-100" style="background:#8b5cf6;color:#fff;">🔍 Analyze</button>
         </div>
       </div>
     </form>
@@ -1683,21 +1847,21 @@ function loadDistricts() {{
 }}
 </script>
 """
-    return render_template_string(HTML_LAYOUT, content=body)
+    return render_page(body)
 
 
 def _build_pattern_results(data, crime_type, state, district):
     """Build the HTML results section from run_full_analysis() output."""
     if data.get('error'):
-        return f'<div class="alert alert-warning mt-3">{escape(data["error"])}</div>'
+        return f'<div class="alert alert-warning mt-3">⚠️ {escape(data["error"])}</div>'
 
     trend    = data.get('trend', {})
     spikes   = data.get('spikes', [])
-    similar  = data.get('similarities', []) or data.get('similarity_rankings', [])
+    similar  = data.get('similarity_rankings', [])
     clusters = data.get('clusters', {})
-    insights = data.get('insights', []) or data.get('ai_insights', [])
-    years_sorted = data.get('years', [])
-    counts_target = data.get('counts', [])
+    insights = data.get('ai_insights', [])
+    series   = data.get('target_series', {})
+    comp_ser = data.get('comparison_series', {})
 
     location_label = f"{state}" + (f" / {district}" if district else " (State-level)")
 
@@ -1708,54 +1872,58 @@ def _build_pattern_results(data, crime_type, state, district):
     low_yr    = trend.get('lowest_year', 'N/A')
     slope     = trend.get('slope', 0)
 
-    dir_color  = '#2d6a4f' if direction == 'Increasing' else ('#4b5563' if direction == 'Decreasing' else '#6b7280')
+    dir_color  = '#2d6a4f' if direction == 'Increasing' else ('#ec4899' if direction == 'Decreasing' else '#8b5cf6')
     trend_badge = f'<span class="badge" style="background:{dir_color};font-size:1rem;">{direction}</span>'
 
     trend_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#1f2937;">Trend Analysis — {escape(crime_type)} in {escape(location_label)}</h5>
+  <h5 style="color:#5b21b6;">📈 Trend Analysis — {escape(crime_type)} in {escape(location_label)}</h5>
   <div class="row text-center mt-3">
-    <div class="col-md-3"><div class="p-3 rounded" style="background:#f9fafb;border:1px solid #e5e7eb;">
+    <div class="col-md-3"><div class="p-3 rounded" style="background:#faf5ff;">
       <div style="font-size:1.8rem;">{trend_badge}</div><small class="text-muted">Overall Trend</small></div></div>
-    <div class="col-md-3"><div class="p-3 rounded" style="background:#f9fafb;border:1px solid #e5e7eb;">
-      <div style="font-size:1.8rem;font-weight:bold;color:#1f2937;">{net_pct:+.1f}%</div><small class="text-muted">Net Change</small></div></div>
-    <div class="col-md-3"><div class="p-3 rounded" style="background:#f9fafb;border:1px solid #e5e7eb;">
-      <div style="font-size:1.8rem;font-weight:bold;color:#1f2937;">{peak_yr}</div><small class="text-muted">Peak Year</small></div></div>
-    <div class="col-md-3"><div class="p-3 rounded" style="background:#f9fafb;border:1px solid #e5e7eb;">
-      <div style="font-size:1.8rem;font-weight:bold;color:#1f2937;">{low_yr}</div><small class="text-muted">Lowest Year</small></div></div>
+    <div class="col-md-3"><div class="p-3 rounded" style="background:#faf5ff;">
+      <div style="font-size:1.8rem;font-weight:bold;color:#5b21b6;">{net_pct:+.1f}%</div><small class="text-muted">Net Change</small></div></div>
+    <div class="col-md-3"><div class="p-3 rounded" style="background:#faf5ff;">
+      <div style="font-size:1.8rem;font-weight:bold;color:#5b21b6;">{peak_yr}</div><small class="text-muted">Peak Year</small></div></div>
+    <div class="col-md-3"><div class="p-3 rounded" style="background:#faf5ff;">
+      <div style="font-size:1.8rem;font-weight:bold;color:#5b21b6;">{low_yr}</div><small class="text-muted">Lowest Year</small></div></div>
   </div>
 </div>"""
 
     # ── Spikes / Drops ──────────────────────────────────────────────────────
     spike_items = ''
     for sp in spikes:
-        headline = sp.get('headline', '')
-        detail   = sp.get('detail', '')
-        ev_type  = sp.get('type', 'Spike')
-        col      = '#b8860b' if 'Spike' in ev_type or 'Unusual' in headline else '#4b5563'
-        spike_items += f'<div class="d-flex align-items-center mb-2 p-2 rounded" style="background:#f7f6f4;border-left:4px solid {col};"><b class="me-2" style="color:#1f2937;">{escape(headline)}:</b> <span class="text-muted">{escape(detail)}</span></div>'
+        ev_type  = sp.get('event', 'spike')
+        yr       = sp.get('year', '')
+        pct      = sp.get('change_pct', 0)
+        prev_val = sp.get('prev_value', 0)
+        cur_val  = sp.get('value', 0)
+        icon = '🔺' if ev_type == 'spike' else '🔻'
+        col  = '#ec4899' if ev_type == 'spike' else '#8b5cf6'
+        spike_items += f'<div class="d-flex align-items-center mb-2 p-2 rounded" style="background:#fff0f6;border-left:4px solid {col};">{icon} <b class="ms-2">{yr}</b>: {ev_type.capitalize()} of <b>{pct:+.1f}%</b> &nbsp;<span class="text-muted">({int(prev_val):,} → {int(cur_val):,} cases)</span></div>'
 
     spikes_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#1f2937;">Anomaly &amp; Spike Detection</h5>
-  {''.join([spike_items]) if spikes else '<p class="text-muted">No significant volatility spikes detected across the selected period.</p>'}
+  <h5 style="color:#5b21b6;">⚡ Anomaly & Spike Detection</h5>
+  {''.join([spike_items]) if spikes else '<p class="text-muted">No significant anomalies detected in the selected range.</p>'}
 </div>"""
 
     # ── Yearly trend chart + top similar overlay ────────────────────────────
+    years_sorted = sorted(series.keys())
     labels_js = str(years_sorted)
-    target_js = str(counts_target)
+    target_js  = str([series.get(y, 0) for y in years_sorted])
 
     # Pick top 3 similar for overlay
     top3_datasets = ''
-    palette = ['#b8860b', '#4b5563', '#10b981']
+    palette = ['#ec4899', '#f59e0b', '#10b981']
     for idx, sim in enumerate(similar[:3]):
-        loc_name  = sim.get('name') or sim.get('location', '')
-        vals      = sim.get('series', [])
-        score_val = sim.get('score', 0)
-        color     = palette[idx]
+        loc_name = sim.get('location', '')
+        s_data   = comp_ser.get(loc_name, {})
+        vals     = [s_data.get(y, 0) for y in years_sorted]
+        color    = palette[idx]
         top3_datasets += f""",
       {{
-        label: '{escape(loc_name)} ({score_val:.1f}%)',
+        label: '{escape(loc_name)} ({sim.get("score_pct", 0):.1f}%)',
         data: {vals},
         borderColor: '{color}',
         backgroundColor: 'transparent',
@@ -1766,7 +1934,7 @@ def _build_pattern_results(data, crime_type, state, district):
 
     trend_chart_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#1f2937;">Yearly Crime Trend Chart</h5>
+  <h5 style="color:#5b21b6;">📊 Yearly Crime Trend Chart</h5>
   <canvas id="trendChart" height="100"></canvas>
 </div>
 <script>
@@ -1778,8 +1946,8 @@ new Chart(document.getElementById('trendChart'), {{
       {{
         label: '{escape(location_label)}',
         data: {target_js},
-        borderColor: '#1f2937',
-        backgroundColor: 'rgba(31,41,55,0.08)',
+        borderColor: '#8b5cf6',
+        backgroundColor: 'rgba(139,92,246,0.08)',
         borderWidth: 2.5,
         fill: true,
         pointRadius: 4
@@ -1803,32 +1971,32 @@ new Chart(document.getElementById('trendChart'), {{
     # ── Similarity Table ────────────────────────────────────────────────────
     sim_rows = ''
     for rank, sim in enumerate(similar[:15], 1):
-        loc      = sim.get('name') or sim.get('location', '')
-        score    = sim.get('score', 0)
+        loc      = sim.get('location', '')
+        score    = sim.get('score_pct', 0)
         pattern  = sim.get('pattern', 'N/A')
-        bar_w    = min(100, max(0, int(score)))
-        bar_col  = '#2d6a4f' if score >= 85 else ('#b8860b' if score >= 70 else '#6b7280')
-        medal    = str(rank)
+        bar_w    = int(score)
+        bar_col  = '#2d6a4f' if score >= 75 else ('#f59e0b' if score >= 50 else '#ec4899')
+        medal    = ['🥇', '🥈', '🥉'][rank - 1] if rank <= 3 else str(rank)
         sim_rows += f"""
 <tr>
   <td class="text-center">{medal}</td>
   <td><b>{escape(loc)}</b></td>
   <td>
-    <div style="background:#f3f4f6;border-radius:4px;height:14px;width:100%;">
+    <div style="background:#ede9fe;border-radius:4px;height:14px;width:100%;">
       <div style="background:{bar_col};width:{bar_w}%;height:14px;border-radius:4px;"></div>
     </div>
-    <small class="fw-bold">{score:.1f}%</small>
+    <small>{score:.1f}%</small>
   </td>
-  <td><span class="badge" style="background:#4b5563;">{escape(pattern)}</span></td>
+  <td><span class="badge" style="background:#8b5cf6;">{escape(pattern)}</span></td>
 </tr>"""
 
     # Similarity bar chart (top 8)
-    sim_labels = str([s.get('name') or s.get('location','') for s in similar[:8]])
-    sim_scores = str([round(s.get('score', 0), 1) for s in similar[:8]])
-    sim_colors_js = str(['#2d6a4f' if s.get('score',0)>=85 else ('#b8860b' if s.get('score',0)>=70 else '#6b7280') for s in similar[:8]])
+    sim_labels = str([s.get('location','') for s in similar[:8]])
+    sim_scores = str([round(s.get('score_pct', 0), 1) for s in similar[:8]])
+    sim_colors_js = str(['#2d6a4f' if s.get('score_pct',0)>=75 else ('#f59e0b' if s.get('score_pct',0)>=50 else '#ec4899') for s in similar[:8]])
 
     if sim_rows:
-        sim_table_content = f'''<table class="table table-hover"><thead><tr><th>#</th><th>Region</th><th style="width:30%">Similarity Score</th><th>Pattern Description</th></tr></thead><tbody>{sim_rows}</tbody></table>'''
+        sim_table_content = f'''<table class="table table-hover"><thead><tr><th>#</th><th>Region</th><th style="width:30%">Similarity Score</th><th>Pattern</th></tr></thead><tbody>{sim_rows}</tbody></table>'''
         sim_chart_content = f'''<canvas id="simBarChart" height="80"></canvas>'''
         sim_script_content = f'''<script>new Chart(document.getElementById("simBarChart"), {{ type:"bar", data:{{ labels:{sim_labels}, datasets:[{{ label:"Similarity %", data:{sim_scores}, backgroundColor:{sim_colors_js} }}] }}, options:{{ indexAxis:"y", responsive:true, plugins:{{ legend:{{ display:false }} }}, scales:{{ x:{{ max:100, ticks:{{ color:"#1a1a1a" }} }}, y:{{ ticks:{{ color:"#1a1a1a" }} }} }} }} }});</script>'''
     else:
@@ -1838,7 +2006,7 @@ new Chart(document.getElementById('trendChart'), {{
 
     similarity_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#1f2937;">Similarity Rankings (Pearson Correlation)</h5>
+  <h5 style="color:#5b21b6;">🔁 Similarity Rankings (Pearson Correlation)</h5>
   <p class="text-muted small">Regions with the most similar crime trend <i>shapes</i> to {escape(location_label)}. Score = correlation mapped 0–100%.</p>
   {sim_table_content}
   {sim_chart_content}
@@ -1847,44 +2015,49 @@ new Chart(document.getElementById('trendChart'), {{
 
     # ── Cluster Cards ───────────────────────────────────────────────────────
     cluster_cards = ''
-    cluster_theme = {
-        'Cluster 1: High Volume & Surging Growth': ('#fee2e2', '#dc2626'),
-        'Cluster 2: High Volume & Stabilized / Declining': ('#f0fdf4', '#16a34a'),
-        'Cluster 3: Moderate Volume & Stable Pattern': ('#f3f4f6', '#4b5563'),
-        'Cluster 4: Low Volume with Volatile Spikes': ('#fff7ed', '#ea580c'),
-    }
-    for c_title, c_info in clusters.items():
-        bg, border = cluster_theme.get(c_title, ('#f3f4f6', '#4b5563'))
-        members = c_info.get('members', [])
-        desc    = c_info.get('description', '')
-        badges  = ' '.join(f'<span class="badge me-1 mb-1" style="background:{border};font-size:0.75rem;">{escape(m)}</span>' for m in members)
+    cluster_meta = [
+        ('high_volume_high_growth',   'High Volume + High Growth',   '🔴', '#fee2e2', '#dc2626'),
+        ('high_volume_low_growth',    'High Volume + Stable/Slow',   '🟠', '#fff7ed', '#ea580c'),
+        ('low_volume_high_growth',    'Low Volume + High Growth',    '🟡', '#fefce8', '#ca8a04'),
+        ('low_volume_low_growth',     'Low Volume + Low Activity',   '🟢', '#f0fdf4', '#16a34a'),
+    ]
+    for key, label, icon, bg, border in cluster_meta:
+        members = clusters.get(key, [])
+        badges  = ' '.join(f'<span class="badge me-1" style="background:{border};font-size:0.75rem;">{escape(m)}</span>' for m in members)
         cluster_cards += f"""
 <div class="col-md-6 mb-3">
   <div class="card h-100 p-3" style="border-left:4px solid {border};background:{bg};">
-    <h6 style="color:{border};font-weight:bold;">{escape(c_title)}</h6>
-    <p class="text-muted small mb-2">{escape(desc)} — <b>{len(members)} region(s)</b></p>
+    <h6 style="color:{border};">{icon} {label}</h6>
+    <p class="text-muted small mb-2">{len(members)} region(s)</p>
     <div>{badges if badges else '<span class="text-muted small">No regions in this cluster</span>'}</div>
   </div>
 </div>"""
 
-    cluster_display = cluster_cards if cluster_cards else '<p class="text-muted">No cluster data available.</p>'
     clusters_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#1f2937;">Crime Clusters — {escape(crime_type)}</h5>
+  <h5 style="color:#5b21b6;">🗺️ Crime Clusters — {escape(crime_type)}</h5>
   <p class="text-muted small">Regions grouped by crime volume &amp; growth trend across the selected period.</p>
-  <div class="row">{cluster_display}</div>
+  <div class="row">{cluster_cards}</div>
 </div>"""
 
     # ── AI Insights ─────────────────────────────────────────────────────────
+    insight_type_style = {
+        'warning':  ('⚠️', '#fef9c3', '#ca8a04'),
+        'danger':   ('🚨', '#fee2e2', '#dc2626'),
+        'success':  ('✅', '#f0fdf4', '#16a34a'),
+        'info':     ('💡', '#eff6ff', '#2563eb'),
+        'primary':  ('📌', '#f5f3ff', '#7c3aed'),
+    }
     insight_items = ''
     for ins in insights:
-        itype  = ins.get('type', 'Insight')
-        itext  = ins.get('text', '')
-        insight_items += f'<div class="d-flex align-items-start mb-3 p-3 rounded" style="background:#f9fafb;border-left:4px solid #4b5563;"><div class="ms-1"><b style="color:#1f2937;">{escape(itype)}:</b> <span class="text-secondary">{escape(itext)}</span></div></div>'
+        itype = ins.get('type', 'info')
+        itext = ins.get('text', '')
+        icon_d, bg_d, col_d = insight_type_style.get(itype, ('💡', '#eff6ff', '#2563eb'))
+        insight_items += f'<div class="d-flex align-items-start mb-3 p-3 rounded" style="background:{bg_d};border-left:4px solid {col_d};">{icon_d}<span class="ms-2">{escape(itext)}</span></div>'
 
     insights_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#1f2937;">AI Insights</h5>
+  <h5 style="color:#5b21b6;">🤖 AI Insights</h5>
   {insight_items if insight_items else '<p class="text-muted">No insights generated.</p>'}
 </div>"""
 
