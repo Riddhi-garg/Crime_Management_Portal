@@ -362,12 +362,12 @@ def init_db():
 
 # Base Layout & Navigation Bar
 HTML_NAVBAR = """
-<nav class="navbar navbar-expand-lg sticky-top shadow-sm" style="background-color: #374151; border-bottom: 2px solid #ec4899;">
+<nav class="navbar navbar-expand-lg sticky-top shadow-sm" style="background-color: #374151; border-bottom: 2px solid #D6cfc4;">
   <div class="container-fluid px-4">
     <a class="navbar-brand d-flex align-items-center gap-2 fw-bold" href="/" style="color: #ffffff; font-family: 'Times New Roman', Times, serif; font-size: 1.2rem;">
       <span class="fs-4">🛡️</span> CRIME MANAGEMENT PORTAL
     </a>
-    <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav" style="border-color: #ec4899;">
+    <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav" style="border-color: #D6cfc4;">
       <span class="navbar-toggler-icon"></span>
     </button>
     <div class="collapse navbar-collapse" id="navbarNav">
@@ -382,9 +382,9 @@ HTML_NAVBAR = """
         <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Management</a></li>
         <li class="nav-item"><a class="nav-link" href="/criminal-records" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Criminal Records</a></li>
         <li class="nav-item"><a class="nav-link" href="/case-files" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Case Files</a></li>
-        <li class="nav-item"><a class="nav-link" href="/crime-patterns" style="color: #fce7f3; font-weight: bold; font-family: 'Times New Roman', Times, serif;">🔗 Pattern Detector</a></li>
+        <li class="nav-item"><a class="nav-link" href="/crime-patterns" style="color: #D6cfc4; font-weight: bold; font-family: 'Times New Roman', Times, serif;">🔗 Pattern Detector</a></li>
       </ul>
-      <span class="badge p-2" style="background-color: #ec4899; color: #ffffff; font-family: 'Times New Roman', Times, serif;">NCRB / Kaggle Dataset</span>
+      <span class="badge p-2 fw-bold" style="background-color: #D6cfc4; color: #1f2937; font-family: 'Times New Roman', Times, serif;">NCRB / Kaggle Dataset</span>
     </div>
   </div>
 </nav>
@@ -406,39 +406,39 @@ HTML_LAYOUT = """
         .card { background-color: #f8f9fa; border: 1px solid #dee2e6; color: #1a1a1a; border-radius: 10px; box-shadow: 0 2px 6px rgba(0,0,0,0.08); }
         .table { color: #1a1a1a; }
         .table thead th { background-color: #f3f4f6; color: #1f2937; border-bottom: 2px solid #9ca3af; }
-        .table tbody tr:hover { background-color: #fdf2f8; }
+        .table tbody tr:hover { background-color: #f7f6f4; }
         .table-dark { background-color: #f8f9fa !important; color: #1a1a1a !important; border-color: #dee2e6 !important; }
         .table-dark td, .table-dark th { background-color: transparent !important; color: #1a1a1a !important; }
-        .nav-link:hover { color: #fce7f3 !important; }
+        .nav-link:hover { color: #D6cfc4 !important; }
         .stats-card { background: linear-gradient(135deg, #f9fafb 0%, #f3f4f6 100%); border-left: 4px solid #4b5563; }
         .source-badge { font-size: 0.8rem; background: #4b5563; color: #ffffff; border-radius: 20px; padding: 4px 12px; }
         .form-select, .form-control { background-color: #ffffff; color: #1a1a1a; border: 1px solid #adb5bd; }
         .form-select:focus, .form-control:focus { background-color: #ffffff; color: #1a1a1a; border-color: #4b5563; box-shadow: 0 0 0 2px rgba(75,85,99,0.2); }
-        .btn-outline-warning { border-color: #ec4899; color: #ec4899; }
-        .btn-outline-warning:hover { background-color: #ec4899; color: #ffffff; }
+        .btn-outline-warning { border-color: #b8b0a5; color: #4b5563; }
+        .btn-outline-warning:hover { background-color: #D6cfc4; color: #1f2937; }
         .badge.bg-secondary { background-color: #6c757d !important; color: #ffffff !important; }
         .badge.bg-info { background-color: #4b5563 !important; color: #ffffff !important; }
         .badge.bg-success { background-color: #2d6a4f !important; color: #ffffff !important; }
-        .badge.bg-danger { background-color: #ec4899 !important; color: #ffffff !important; }
+        .badge.bg-danger { background-color: #b8860b !important; color: #ffffff !important; }
         .badge.bg-warning { background-color: #f59e0b !important; color: #ffffff !important; }
         .badge.bg-primary { background-color: #4b5563 !important; color: #ffffff !important; }
-        .text-warning { color: #ec4899 !important; }
+        .text-warning { color: #857d72 !important; }
         .text-info { color: #4b5563 !important; }
-        .text-danger { color: #ec4899 !important; }
+        .text-danger { color: #b8860b !important; }
         .text-success { color: #2d6a4f !important; }
         .text-secondary { color: #555555 !important; }
         .text-muted { color: #777777 !important; }
         .text-light { color: #1a1a1a !important; }
-        .btn-warning { background-color: #ec4899; border-color: #ec4899; color: #ffffff; }
-        .btn-warning:hover { background-color: #db2777; border-color: #db2777; color: #ffffff; }
+        .btn-warning { background-color: #D6cfc4; border-color: #b8b0a5; color: #1f2937; font-weight: bold; }
+        .btn-warning:hover { background-color: #c5beb3; border-color: #a8a095; color: #1f2937; }
         .btn-primary { background-color: #4b5563; border-color: #4b5563; color: #ffffff; }
         .btn-primary:hover { background-color: #374151; border-color: #374151; color: #ffffff; }
         .btn-outline-light { border-color: #6b7280; color: #374151; }
         .btn-outline-light:hover { background-color: #f3f4f6; color: #1f2937; }
         .btn-outline-info { border-color: #6b7280; color: #4b5563; }
         .btn-outline-info:hover { background-color: #f3f4f6; color: #1f2937; }
-        .btn-outline-danger { border-color: #ec4899; color: #ec4899; }
-        .btn-outline-danger:hover { background-color: #fce7f3; color: #db2777; }
+        .btn-outline-danger { border-color: #b8b0a5; color: #4b5563; }
+        .btn-outline-danger:hover { background-color: #D6cfc4; color: #1f2937; }
         .btn-outline-success { border-color: #2d6a4f; color: #2d6a4f; }
         .btn-outline-success:hover { background-color: #d4edda; color: #000000; }
         .btn-outline-secondary { border-color: #6c757d; color: #6c757d; }
@@ -448,7 +448,7 @@ HTML_LAYOUT = """
         .list-group-item { background-color: #f8f9fa; color: #1a1a1a; border-color: #dee2e6; }
         .border-secondary { border-color: #dee2e6 !important; }
         a { color: #374151; }
-        a:hover { color: #ec4899; }
+        a:hover { color: #857d72; }
         footer { background-color: #f8f9fa; color: #555555; border-top: 1px solid #dee2e6 !important; }
         .pagination .page-link { background-color: #f8f9fa; color: #374151; border-color: #dee2e6; }
         .pagination .page-link:hover { background-color: #f3f4f6; color: #1f2937; }
@@ -522,12 +522,12 @@ def dashboard():
     body = f"""
     <div class="row g-4 mb-4">
         <div class="col-md-12">
-            <div class="p-4 rounded-3 card shadow-sm text-center" style="background: linear-gradient(135deg, #f3f4f6 0%, #fdf2f8 100%); border: 2px solid #ec4899;">
+            <div class="p-4 rounded-3 card shadow-sm text-center" style="background: linear-gradient(135deg, #f9fafb 0%, #f4f2ee 100%); border: 2px solid #D6cfc4;">
                 <div class="d-flex justify-content-between align-items-center mb-2">
                     <span class="source-badge">Official NCRB / Kaggle Crime Dataset</span>
                     <span class="small fw-semibold" style="color: #4b5563;">Years Covered: {min_yr} – {max_yr}</span>
                 </div>
-                <h1 class="display-6 fw-bold" style="color: #ec4899;">National Crime Management Portal</h1>
+                <h1 class="display-6 fw-bold" style="color: #1f2937;">National Crime Management Portal</h1>
                 <p class="lead mb-3" style="color: #374151;">Live Dynamic Insights from 35+ Million Real NCRB Recorded Crime Cases</p>
                 <div class="d-flex justify-content-center gap-3">
                     <a href="/crime-statistics" class="btn btn-warning fw-bold px-4 shadow-sm">🔍 Search Crime Records</a>
@@ -547,7 +547,7 @@ def dashboard():
             </div>
         </div>
         <div class="col-md-3">
-            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #ec4899;">
+            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #D6cfc4;">
                 <h6 class="text-uppercase text-secondary small">States & UTs</h6>
                 <span class="fs-2 fw-bold text-danger">{states_count}</span>
                 <small class="text-muted">{districts_count} Districts Covered</small>
@@ -668,8 +668,8 @@ def crime_statistics():
             <td>{r['district']}</td>
             <td><span class="badge" style="background-color: #f3f4f6; color: #374151;">{r['year']}</span></td>
             <td><span class="badge" style="background-color: #4b5563; color: #ffffff;">{r['crime_type']}</span></td>
-            <td class="fw-bold fs-6" style="color: #ec4899;">{r['case_count']:,}</td>
-            <td><span class="badge" style="background-color: #ec4899; color: #ffffff;">{r['source']}</span></td>
+            <td class="fw-bold fs-6" style="color: #1f2937;">{r['case_count']:,}</td>
+            <td><span class="badge fw-bold" style="background-color: #D6cfc4; color: #1f2937;">{r['source']}</span></td>
         </tr>
         """ for r in rows])
     else:
@@ -692,7 +692,7 @@ def crime_statistics():
     body = f"""
     <div class="d-flex justify-content-between align-items-center mb-4">
         <h2 class="m-0" style="color: #1f2937;">🔍 Kaggle/NCRB Crime Statistics Explorer</h2>
-        <span class="badge p-2" style="background-color: #ec4899; color: #ffffff;">Data Source: Kaggle / NCRB Dataset</span>
+        <span class="badge p-2 fw-bold" style="background-color: #D6cfc4; color: #1f2937;">Data Source: Kaggle / NCRB Dataset</span>
     </div>
 
     <div class="card p-4 mb-4" style="border-left: 4px solid #4b5563;">
@@ -735,7 +735,7 @@ def crime_statistics():
         <div class="d-flex justify-content-between align-items-center mb-3">
             <h5 class="m-0" style="color: #1f2937;">
                 Matching Statistics: <span class="fw-bold" style="color: #1a1a1a;">{total_matches:,} Entries</span> 
-                (<span class="fw-bold" style="color: #ec4899;">{sum_cases:,} Total Cases</span>)
+                (<span class="fw-bold" style="color: #1f2937;">{sum_cases:,} Total Cases</span>)
             </h5>
             <a href="/crime-statistics" class="btn btn-outline-secondary btn-sm">Reset Filters</a>
         </div>
@@ -872,7 +872,7 @@ def analytics():
                 labels: {cat_labels},
                 datasets: [{{
                     data: {cat_vals},
-                    backgroundColor: ['#ec4899', '#4b5563', '#10b981', '#f59e0b', '#6b7280', '#06b6d4', '#84cc16', '#374151', '#14b8a6', '#f43f5e']
+                    backgroundColor: ['#D6cfc4', '#4b5563', '#10b981', '#f59e0b', '#6b7280', '#06b6d4', '#84cc16', '#374151', '#14b8a6', '#9ca3af']
                 }}]
             }},
             options: {{
@@ -1145,7 +1145,7 @@ def police_station_map():
                     document.getElementById('station-count').textContent = `${features.length.toLocaleString()} stations`;
                     const layer = L.geoJSON(data, {
                         pointToLayer: (feature, latlng) => L.circleMarker(latlng, {
-                            radius: 4, color: '#ec4899', fillColor: '#8b5cf6', fillOpacity: 0.8
+                            radius: 4, color: '#4b5563', fillColor: '#D6cfc4', fillOpacity: 0.8
                         }),
                         onEachFeature: (feature, layer) => {
                             const properties = feature.properties || {};
@@ -1708,7 +1708,7 @@ def _build_pattern_results(data, crime_type, state, district):
     low_yr    = trend.get('lowest_year', 'N/A')
     slope     = trend.get('slope', 0)
 
-    dir_color  = '#2d6a4f' if direction == 'Increasing' else ('#ec4899' if direction == 'Decreasing' else '#4b5563')
+    dir_color  = '#2d6a4f' if direction == 'Increasing' else ('#4b5563' if direction == 'Decreasing' else '#6b7280')
     trend_badge = f'<span class="badge" style="background:{dir_color};font-size:1rem;">{direction}</span>'
 
     trend_html = f"""
@@ -1732,8 +1732,8 @@ def _build_pattern_results(data, crime_type, state, district):
         headline = sp.get('headline', '')
         detail   = sp.get('detail', '')
         ev_type  = sp.get('type', 'Spike')
-        col      = '#ec4899' if 'Spike' in ev_type or 'Unusual' in headline else '#4b5563'
-        spike_items += f'<div class="d-flex align-items-center mb-2 p-2 rounded" style="background:#fdf2f8;border-left:4px solid {col};"><b class="me-2" style="color:#1f2937;">{escape(headline)}:</b> <span class="text-muted">{escape(detail)}</span></div>'
+        col      = '#b8860b' if 'Spike' in ev_type or 'Unusual' in headline else '#4b5563'
+        spike_items += f'<div class="d-flex align-items-center mb-2 p-2 rounded" style="background:#f7f6f4;border-left:4px solid {col};"><b class="me-2" style="color:#1f2937;">{escape(headline)}:</b> <span class="text-muted">{escape(detail)}</span></div>'
 
     spikes_html = f"""
 <div class="card mb-4 p-4">
@@ -1747,7 +1747,7 @@ def _build_pattern_results(data, crime_type, state, district):
 
     # Pick top 3 similar for overlay
     top3_datasets = ''
-    palette = ['#ec4899', '#f59e0b', '#10b981']
+    palette = ['#b8860b', '#4b5563', '#10b981']
     for idx, sim in enumerate(similar[:3]):
         loc_name  = sim.get('name') or sim.get('location', '')
         vals      = sim.get('series', [])
@@ -1807,7 +1807,7 @@ new Chart(document.getElementById('trendChart'), {{
         score    = sim.get('score', 0)
         pattern  = sim.get('pattern', 'N/A')
         bar_w    = min(100, max(0, int(score)))
-        bar_col  = '#2d6a4f' if score >= 85 else ('#f59e0b' if score >= 70 else '#ec4899')
+        bar_col  = '#2d6a4f' if score >= 85 else ('#b8860b' if score >= 70 else '#6b7280')
         medal    = ['🥇', '🥈', '🥉'][rank - 1] if rank <= 3 else str(rank)
         sim_rows += f"""
 <tr>
@@ -1825,7 +1825,7 @@ new Chart(document.getElementById('trendChart'), {{
     # Similarity bar chart (top 8)
     sim_labels = str([s.get('name') or s.get('location','') for s in similar[:8]])
     sim_scores = str([round(s.get('score', 0), 1) for s in similar[:8]])
-    sim_colors_js = str(['#2d6a4f' if s.get('score',0)>=85 else ('#f59e0b' if s.get('score',0)>=70 else '#ec4899') for s in similar[:8]])
+    sim_colors_js = str(['#2d6a4f' if s.get('score',0)>=85 else ('#b8860b' if s.get('score',0)>=70 else '#6b7280') for s in similar[:8]])
 
     if sim_rows:
         sim_table_content = f'''<table class="table table-hover"><thead><tr><th>#</th><th>Region</th><th style="width:30%">Similarity Score</th><th>Pattern Description</th></tr></thead><tbody>{sim_rows}</tbody></table>'''
