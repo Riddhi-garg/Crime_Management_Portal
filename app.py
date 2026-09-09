@@ -7,6 +7,10 @@ import os
 import json
 import sqlite3
 import datetime
+from datetime import timedelta
+import secrets
+import smtplib
+from email.mime.text import MIMEText
 from functools import wraps
 from html import escape
 from flask import Flask, render_template_string, request, jsonify, redirect, flash, url_for, send_from_directory, session
@@ -56,14 +60,63 @@ def get_db_connection():
     return conn
 
 
+def get_role_dashboard_url(role):
+    """Return the dedicated landing dashboard route for a given user role."""
+    mapping = {
+        'Citizen': '/dashboard/citizen',
+        'Police': '/dashboard/police',
+        'Court': '/dashboard/court',
+        'District Magistrate': '/dashboard/district-magistrate'
+    }
+    return mapping.get(role, '/')
+
+
+def send_email(to_email, subject, body):
+    """
+    Send an email via SMTP if configured via environment variables.
+    Otherwise, log the complete email with verification link to console as a safe fallback.
+    """
+    smtp_host = os.environ.get('SMTP_HOST')
+    smtp_port = int(os.environ.get('SMTP_PORT', 587))
+    smtp_user = os.environ.get('SMTP_USER')
+    smtp_pass = os.environ.get('SMTP_PASSWORD') or os.environ.get('SMTP_PASS')
+
+    if smtp_host and smtp_user and smtp_pass:
+        try:
+            msg = MIMEText(body)
+            msg['Subject'] = subject
+            msg['From'] = smtp_user
+            msg['To'] = to_email
+            with smtplib.SMTP(smtp_host, smtp_port) as server:
+                server.starttls()
+                server.login(smtp_user, smtp_pass)
+                server.send_message(msg)
+            print(f"[EMAIL] Verification email sent to {to_email} via SMTP ({smtp_host}).")
+            return True
+        except Exception as e:
+            print(f"[EMAIL ERROR] SMTP delivery failed: {e}. Falling back to console dispatch.")
+
+    # Safe fallback: Print email details to console/log
+    print("\n" + "=" * 70)
+    print(f"[EMAIL NOTIFICATION - CONSOLE FALLBACK]")
+    print(f"To: {to_email}")
+    print(f"Subject: {subject}")
+    print("-" * 70)
+    print(body)
+    print("=" * 70 + "\n")
+    return True
+
+
 def render_page(content, status_code=200):
     """Render a page inside the shared layout, injecting the signed-in user
-    (if any) so the navbar can show who's logged in."""
+    (if any) so the navbar can show who's logged in and display role-specific links."""
+    role = session.get('role')
     html = render_template_string(
         HTML_LAYOUT,
         content=content,
         current_user_name=session.get('full_name'),
-        current_user_role=session.get('role'),
+        current_user_role=role,
+        role_dashboard_url=get_role_dashboard_url(role) if role else '/',
     )
     return (html, status_code) if status_code != 200 else html
 
@@ -101,8 +154,8 @@ def roles_required(*allowed_roles):
 
 @app.before_request
 def _require_login_globally():
-    """Gate every route except the login page and static assets."""
-    public_endpoints = {'login', 'static'}
+    """Gate every route except public authentication endpoints and static assets."""
+    public_endpoints = {'login', 'logout', 'signup', 'verify_email', 'resend_verification', 'static'}
     if request.endpoint in public_endpoints or request.endpoint is None:
         return None
     if not session.get('user_id'):
@@ -121,12 +174,25 @@ def init_db():
         user_id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT NOT NULL UNIQUE,
         password TEXT NOT NULL,
-        role TEXT NOT NULL DEFAULT 'Officer',
+        role TEXT NOT NULL DEFAULT 'Citizen',
         full_name TEXT NOT NULL,
         email TEXT UNIQUE,
+        email_verified INTEGER DEFAULT 0,
+        verification_token TEXT,
+        token_expiry TIMESTAMP,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
+
+    # Schema migration for existing users table
+    cursor.execute("PRAGMA table_info(users)")
+    existing_cols = [row[1] for row in cursor.fetchall()]
+    if 'email_verified' not in existing_cols:
+        cursor.execute("ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 0")
+    if 'verification_token' not in existing_cols:
+        cursor.execute("ALTER TABLE users ADD COLUMN verification_token TEXT")
+    if 'token_expiry' not in existing_cols:
+        cursor.execute("ALTER TABLE users ADD COLUMN token_expiry TIMESTAMP")
 
     # Seed one login per role the first time the app runs. Passwords are
     # hashed with werkzeug's default (PBKDF2) — never stored in plain text.
@@ -141,9 +207,15 @@ def init_db():
         ]
         for full_name, email, temp_password, role in default_accounts:
             cursor.execute(
-                "INSERT INTO users (username, password, role, full_name, email) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO users (username, password, role, full_name, email, email_verified) VALUES (?, ?, ?, ?, ?, 1)",
                 (email, generate_password_hash(temp_password), role, full_name, email)
             )
+        conn.commit()
+    else:
+        # Ensure seeded default accounts are marked email_verified = 1
+        default_emails = ["citizen@crms.gov.in", "police@crms.gov.in", "court@crms.gov.in", "magistrate@crms.gov.in"]
+        for email in default_emails:
+            cursor.execute("UPDATE users SET email_verified = 1 WHERE lower(email) = ?", (email.lower(),))
         conn.commit()
 
     cursor.execute("""
@@ -454,31 +526,68 @@ def init_db():
 
 # Base Layout & Navigation Bar
 HTML_NAVBAR = """
-<nav class="navbar navbar-expand-lg sticky-top shadow-sm" style="background-color: #8b5cf6; border-bottom: 2px solid #ec4899;">
+<nav class="navbar navbar-expand-lg sticky-top shadow-sm" style="background-color: #374151; border-bottom: 2px solid #D6cfc4;">
   <div class="container-fluid px-4">
-    <a class="navbar-brand d-flex align-items-center gap-2 fw-bold" href="/" style="color: #ffffff; font-family: 'Times New Roman', Times, serif; font-size: 1.2rem;">
-      <span class="fs-4">🛡️</span> CRIME MANAGEMENT PORTAL
+    <a class="navbar-brand d-flex align-items-center gap-2 fw-bold" href="{{ role_dashboard_url or '/' }}" style="color: #ffffff; font-family: 'Times New Roman', Times, serif; font-size: 1.2rem;">
+      CRIME MANAGEMENT PORTAL
     </a>
-    <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav" style="border-color: #ec4899;">
-      <span class="navbar-toggler-icon"></span>
+    <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav" style="border-color: #D6cfc4;">
+      <span class="navbar-toggler-icon" style="filter: invert(1);"></span>
     </button>
     <div class="collapse navbar-collapse" id="navbarNav">
       <ul class="navbar-nav me-auto mb-2 mb-lg-0">
-        <li class="nav-item"><a class="nav-link" href="/" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Dashboard</a></li>
+        <li class="nav-item"><a class="nav-link" href="{{ role_dashboard_url or '/' }}" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Dashboard</a></li>
 
-        <li class="nav-item"><a class="nav-link" href="/analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Analytics &amp; Charts</a></li>
-        <li class="nav-item"><a class="nav-link" href="/women-children-analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Women &amp; Children</a></li>
-        <li class="nav-item"><a class="nav-link" href="/property-arrest-analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Property &amp; Arrests</a></li>
-        <li class="nav-item"><a class="nav-link" href="/police-stations" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Police Stations</a></li>
-        <li class="nav-item"><a class="nav-link" href="/police-station-map" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Station Map</a></li>
-        <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Management</a></li>
-        <li class="nav-item"><a class="nav-link" href="/criminal-records" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Criminal Records</a></li>
-        <li class="nav-item"><a class="nav-link" href="/case-files" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Case Files</a></li>
-        <li class="nav-item"><a class="nav-link" href="/crime-patterns" style="color: #fce7f3; font-weight: bold; font-family: 'Times New Roman', Times, serif;">🔗 Pattern Detector</a></li>
+        {% if current_user_role == 'Citizen' %}
+          <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">File / Track FIR</a></li>
+          <li class="nav-item"><a class="nav-link" href="/police-stations" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Police Stations</a></li>
+          <li class="nav-item"><a class="nav-link" href="/police-station-map" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Station Map</a></li>
+          <li class="nav-item"><a class="nav-link" href="/crime-statistics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Crime Statistics</a></li>
+          <li class="nav-item"><a class="nav-link" href="/analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Analytics &amp; Charts</a></li>
+          <li class="nav-item"><a class="nav-link" href="/women-children-analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Women &amp; Children</a></li>
+
+        {% elif current_user_role == 'Police' %}
+          <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Management</a></li>
+          <li class="nav-item"><a class="nav-link" href="/criminal-records" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Criminal Records</a></li>
+          <li class="nav-item"><a class="nav-link" href="/case-files" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Case Files</a></li>
+          <li class="nav-item"><a class="nav-link" href="/police-stations" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Police Stations</a></li>
+          <li class="nav-item"><a class="nav-link" href="/police-station-map" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Station Map</a></li>
+          <li class="nav-item"><a class="nav-link" href="/crime-patterns" style="color: #D6cfc4; font-weight: bold; font-family: 'Times New Roman', Times, serif;">Pattern Detector</a></li>
+          <li class="nav-item"><a class="nav-link" href="/analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Analytics &amp; Charts</a></li>
+
+        {% elif current_user_role == 'Court' %}
+          <li class="nav-item"><a class="nav-link" href="/case-files" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Case Files</a></li>
+          <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Records</a></li>
+          <li class="nav-item"><a class="nav-link" href="/criminal-records" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Criminal Records</a></li>
+          <li class="nav-item"><a class="nav-link" href="/property-arrest-analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Property &amp; Arrests</a></li>
+          <li class="nav-item"><a class="nav-link" href="/crime-statistics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Crime Statistics</a></li>
+          <li class="nav-item"><a class="nav-link" href="/analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Analytics &amp; Charts</a></li>
+
+        {% elif current_user_role == 'District Magistrate' %}
+          <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Management</a></li>
+          <li class="nav-item"><a class="nav-link" href="/criminal-records" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Criminal Records</a></li>
+          <li class="nav-item"><a class="nav-link" href="/case-files" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Case Files</a></li>
+          <li class="nav-item"><a class="nav-link" href="/police-stations" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Police Stations</a></li>
+          <li class="nav-item"><a class="nav-link" href="/crime-patterns" style="color: #D6cfc4; font-weight: bold; font-family: 'Times New Roman', Times, serif;">Pattern Detector</a></li>
+          <li class="nav-item"><a class="nav-link" href="/analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Analytics &amp; Charts</a></li>
+          <li class="nav-item"><a class="nav-link" href="/women-children-analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Women &amp; Children</a></li>
+          <li class="nav-item"><a class="nav-link" href="/property-arrest-analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Property &amp; Arrests</a></li>
+
+        {% else %}
+          <li class="nav-item"><a class="nav-link" href="/analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Analytics &amp; Charts</a></li>
+          <li class="nav-item"><a class="nav-link" href="/women-children-analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Women &amp; Children</a></li>
+          <li class="nav-item"><a class="nav-link" href="/property-arrest-analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Property &amp; Arrests</a></li>
+          <li class="nav-item"><a class="nav-link" href="/police-stations" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Police Stations</a></li>
+          <li class="nav-item"><a class="nav-link" href="/police-station-map" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Station Map</a></li>
+          <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Management</a></li>
+          <li class="nav-item"><a class="nav-link" href="/criminal-records" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Criminal Records</a></li>
+          <li class="nav-item"><a class="nav-link" href="/case-files" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Case Files</a></li>
+          <li class="nav-item"><a class="nav-link" href="/crime-patterns" style="color: #D6cfc4; font-weight: bold; font-family: 'Times New Roman', Times, serif;">Pattern Detector</a></li>
+        {% endif %}
       </ul>
       {% if current_user_name %}
       <span class="d-flex align-items-center gap-2" style="font-family: 'Times New Roman', Times, serif;">
-        <span class="small" style="color: #fce7f3;">{{ current_user_name }} &middot; <strong>{{ current_user_role }}</strong></span>
+        <span class="small" style="color: #D6cfc4;">{{ current_user_name }} &middot; <strong>{{ current_user_role }}</strong></span>
         <a href="/logout" class="btn btn-sm btn-outline-light">Sign Out</a>
       </span>
       {% endif %}
@@ -499,61 +608,71 @@ HTML_LAYOUT = """
     <style>
         * { font-family: 'Times New Roman', Times, serif !important; }
         body { background-color: #ffffff; color: #1a1a1a; }
-        h1, h2, h3, h4, h5, h6 { color: #5b21b6; }
+        h1, h2, h3, h4, h5, h6 { color: #1f2937; }
         .card { background-color: #f8f9fa; border: 1px solid #dee2e6; color: #1a1a1a; border-radius: 10px; box-shadow: 0 2px 6px rgba(0,0,0,0.08); }
         .table { color: #1a1a1a; }
-        .table thead th { background-color: #ede9fe; color: #4c1d95; border-bottom: 2px solid #8b5cf6; }
-        .table tbody tr:hover { background-color: #fdf2f8; }
+        .table thead th { background-color: #e5e7eb; color: #1f2937; border-bottom: 2px solid #9ca3af; }
+        .table tbody tr:hover { background-color: #f3f4f6; }
         .table-dark { background-color: #f8f9fa !important; color: #1a1a1a !important; border-color: #dee2e6 !important; }
         .table-dark td, .table-dark th { background-color: transparent !important; color: #1a1a1a !important; }
-        .nav-link:hover { color: #fce7f3 !important; }
-        .stats-card { background: linear-gradient(135deg, #faf5ff 0%, #f3e8ff 100%); border-left: 4px solid #8b5cf6; }
-        .source-badge { font-size: 0.8rem; background: #8b5cf6; color: #ffffff; border-radius: 20px; padding: 4px 12px; }
+        .nav-link:hover { color: #D6cfc4 !important; }
+        .stats-card { background: linear-gradient(135deg, #f9fafb 0%, #f3f4f6 100%); border-left: 4px solid #4b5563; }
+        .source-badge { font-size: 0.8rem; background: #4b5563; color: #ffffff; border-radius: 20px; padding: 4px 12px; }
         .form-select, .form-control { background-color: #ffffff; color: #1a1a1a; border: 1px solid #adb5bd; }
-        .form-select:focus, .form-control:focus { background-color: #ffffff; color: #1a1a1a; border-color: #8b5cf6; box-shadow: 0 0 0 2px rgba(139,92,246,0.2); }
-        .btn-outline-warning { border-color: #ec4899; color: #ec4899; }
-        .btn-outline-warning:hover { background-color: #ec4899; color: #ffffff; }
+        .form-select:focus, .form-control:focus { background-color: #ffffff; color: #1a1a1a; border-color: #4b5563; box-shadow: 0 0 0 2px rgba(75,85,99,0.2); }
+        .btn-outline-warning { border-color: #4b5563; color: #1f2937; }
+        .btn-outline-warning:hover { background-color: #4b5563; color: #ffffff; }
         .badge.bg-secondary { background-color: #6c757d !important; color: #ffffff !important; }
-        .badge.bg-info { background-color: #8b5cf6 !important; color: #ffffff !important; }
+        .badge.bg-info { background-color: #4b5563 !important; color: #ffffff !important; }
         .badge.bg-success { background-color: #2d6a4f !important; color: #ffffff !important; }
-        .badge.bg-danger { background-color: #ec4899 !important; color: #ffffff !important; }
-        .badge.bg-warning { background-color: #f59e0b !important; color: #ffffff !important; }
-        .badge.bg-primary { background-color: #8b5cf6 !important; color: #ffffff !important; }
-        .text-warning { color: #ec4899 !important; }
-        .text-info { color: #8b5cf6 !important; }
-        .text-danger { color: #ec4899 !important; }
+        .badge.bg-danger { background-color: #991b1b !important; color: #ffffff !important; }
+        .badge.bg-warning { background-color: #d97706 !important; color: #ffffff !important; }
+        .badge.bg-primary { background-color: #374151 !important; color: #ffffff !important; }
+        .text-warning { color: #854d0e !important; }
+        .text-info { color: #374151 !important; }
+        .text-danger { color: #991b1b !important; }
         .text-success { color: #2d6a4f !important; }
         .text-secondary { color: #555555 !important; }
         .text-muted { color: #777777 !important; }
         .text-light { color: #1a1a1a !important; }
-        .btn-warning { background-color: #ec4899; border-color: #ec4899; color: #ffffff; }
-        .btn-warning:hover { background-color: #db2777; border-color: #db2777; color: #ffffff; }
-        .btn-primary { background-color: #8b5cf6; border-color: #8b5cf6; color: #ffffff; }
-        .btn-primary:hover { background-color: #7c3aed; border-color: #7c3aed; color: #ffffff; }
-        .btn-outline-light { border-color: #8b5cf6; color: #6d28d9; }
-        .btn-outline-light:hover { background-color: #ede9fe; color: #4c1d95; }
-        .btn-outline-info { border-color: #8b5cf6; color: #8b5cf6; }
-        .btn-outline-info:hover { background-color: #ede9fe; color: #4c1d95; }
-        .btn-outline-danger { border-color: #ec4899; color: #ec4899; }
-        .btn-outline-danger:hover { background-color: #fce7f3; color: #db2777; }
+        .btn-warning { background-color: #D6cfc4; border-color: #b8b1a5; color: #1f2937; }
+        .btn-warning:hover { background-color: #c5bdae; border-color: #a8a094; color: #111827; }
+        .btn-primary { background-color: #374151; border-color: #374151; color: #ffffff; }
+        .btn-primary:hover { background-color: #1f2937; border-color: #1f2937; color: #ffffff; }
+        .btn-outline-light { border-color: #D6cfc4; color: #D6cfc4; }
+        .btn-outline-light:hover { background-color: #D6cfc4; color: #1f2937; }
+        .btn-outline-info { border-color: #4b5563; color: #4b5563; }
+        .btn-outline-info:hover { background-color: #e5e7eb; color: #1f2937; }
+        .btn-outline-danger { border-color: #991b1b; color: #991b1b; }
+        .btn-outline-danger:hover { background-color: #fee2e2; color: #7f1d1d; }
         .btn-outline-success { border-color: #2d6a4f; color: #2d6a4f; }
         .btn-outline-success:hover { background-color: #d4edda; color: #000000; }
         .btn-outline-secondary { border-color: #6c757d; color: #6c757d; }
         .btn-outline-secondary:hover { background-color: #e2e3e5; color: #000000; }
-        .btn-outline-primary { border-color: #8b5cf6; color: #7c3aed; }
-        .btn-outline-primary:hover { background-color: #ede9fe; color: #4c1d95; }
+        .btn-outline-primary { border-color: #4b5563; color: #374151; }
+        .btn-outline-primary:hover { background-color: #e5e7eb; color: #111827; }
         .list-group-item { background-color: #f8f9fa; color: #1a1a1a; border-color: #dee2e6; }
         .border-secondary { border-color: #dee2e6 !important; }
-        a { color: #7c3aed; }
-        a:hover { color: #ec4899; }
+        a { color: #374151; }
+        a:hover { color: #111827; }
         footer { background-color: #f8f9fa; color: #555555; border-top: 1px solid #dee2e6 !important; }
-        .pagination .page-link { background-color: #f8f9fa; color: #7c3aed; border-color: #dee2e6; }
-        .pagination .page-link:hover { background-color: #ede9fe; color: #4c1d95; }
+        .pagination .page-link { background-color: #f8f9fa; color: #374151; border-color: #dee2e6; }
+        .pagination .page-link:hover { background-color: #e5e7eb; color: #111827; }
     </style>
 </head>
 <body style="background-color: #ffffff;">
     """ + HTML_NAVBAR + """
     <div class="container-fluid px-4 py-4">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            {% for category, message in messages %}
+              <div class="alert alert-{{ category if category != 'message' else 'info' }} alert-dismissible fade show" role="alert">
+                {{ message | safe }}
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+              </div>
+            {% endfor %}
+          {% endif %}
+        {% endwith %}
         {{ content | safe }}
     </div>
     <footer class="text-center py-3 mt-5" style="background-color: #f8f9fa; border-top: 1px solid #dee2e6;">
@@ -568,6 +687,8 @@ HTML_LAYOUT = """
 # AUTHENTICATION
 @app.route('/login', methods=['GET', 'POST'])
 def login():
+    if request.method == 'GET' and session.get('user_id'):
+        return redirect(get_role_dashboard_url(session.get('role')))
     error = None
     if request.method == 'POST':
         email = request.form.get('email', '').strip().lower()
@@ -576,41 +697,282 @@ def login():
         user = conn.execute("SELECT * FROM users WHERE lower(email) = ?", (email,)).fetchone()
         conn.close()
         if user and check_password_hash(user['password'], password):
-            session.clear()
-            session['user_id'] = user['user_id']
-            session['role'] = user['role']
-            session['full_name'] = user['full_name']
-            session['email'] = user['email']
-            return redirect(request.args.get('next') or url_for('dashboard'))
-        error = "No account matches that email and password."
+            if not user['email_verified']:
+                error = 'Your email address is not verified yet. Please check your inbox or <a href="/resend-verification" class="alert-link text-decoration-underline">click here to resend the verification email</a>.'
+            else:
+                session.clear()
+                session['user_id'] = user['user_id']
+                session['role'] = user['role']
+                session['full_name'] = user['full_name']
+                session['email'] = user['email']
+                next_url = request.args.get('next')
+                if next_url and next_url.startswith('/') and not next_url.startswith('//'):
+                    return redirect(next_url)
+                return redirect(get_role_dashboard_url(user['role']))
+        else:
+            error = "No account matches that email address and password."
+
+    error_html = f'<div class="alert alert-danger py-2">{error}</div>' if error else ''
+    content = f"""
+    <div class="row justify-content-center">
+      <div class="col-md-5 col-lg-4">
+        <div class="card p-4 shadow-sm mt-5">
+          <h3 class="text-center mb-1" style="color: #1f2937;">Crime Management Portal</h3>
+          <p class="text-center text-muted mb-4">Sign in with your registered account</p>
+          {error_html}
+          <form method="POST">
+            <div class="mb-3">
+              <label class="form-label fw-semibold">Email address</label>
+              <input type="email" name="email" class="form-control" placeholder="name@example.com" required autofocus>
+            </div>
+            <div class="mb-3">
+              <label class="form-label fw-semibold">Password</label>
+              <input type="password" name="password" class="form-control" placeholder="Password" required>
+            </div>
+            <button type="submit" class="btn btn-primary w-100 py-2">Sign In</button>
+          </form>
+
+          <div class="text-center mt-3 pt-2 border-top">
+            <p class="mb-1 small text-muted">Don't have an account yet?</p>
+            <a href="/signup" class="btn btn-sm btn-outline-primary fw-semibold w-100 mb-2">Create New Account</a>
+            <a href="/resend-verification" class="small text-muted text-decoration-none">Resend Email Verification</a>
+          </div>
+
+          <hr class="my-3">
+          <p class="small text-muted mb-1 fw-semibold">Portal Account Types:</p>
+          <ul class="small text-muted mb-0 ps-3">
+            <li><strong>Citizen</strong> — file and track personal FIRs</li>
+            <li><strong>Police</strong> — FIRs, criminal records, stations</li>
+            <li><strong>Court</strong> — case files, hearings, judicial oversight</li>
+            <li><strong>District Magistrate</strong> — executive law & order oversight</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+    """
+    return render_template_string(HTML_LAYOUT, content=content, current_user_name=None, current_user_role=None)
+
+
+@app.route('/signup', methods=['GET', 'POST'])
+def signup():
+    if request.method == 'GET' and session.get('user_id'):
+        return redirect(get_role_dashboard_url(session.get('role')))
+    error = None
+    form_data = {'full_name': '', 'email': '', 'role': 'Citizen'}
+    if request.method == 'POST':
+        full_name = request.form.get('full_name', '').strip()
+        email = request.form.get('email', '').strip().lower()
+        role = request.form.get('role', '').strip()
+        password = request.form.get('password', '')
+        confirm_password = request.form.get('confirm_password', '')
+        form_data = {'full_name': full_name, 'email': email, 'role': role}
+
+        if not full_name or not email or not password or not confirm_password or not role:
+            error = "All fields are required."
+        elif role not in ROLES:
+            error = f"Invalid role selected. Must be one of: {', '.join(ROLES)}."
+        elif '@' not in email or '.' not in email.split('@')[-1]:
+            error = "Please enter a valid email address."
+        elif len(password) < 6:
+            error = "Password must be at least 6 characters long."
+        elif password != confirm_password:
+            error = "Passwords do not match."
+        else:
+            conn = get_db_connection()
+            existing = conn.execute("SELECT user_id FROM users WHERE lower(email) = ?", (email,)).fetchone()
+            if existing:
+                conn.close()
+                error = "An account with that email address already exists. Please sign in or use another email."
+            else:
+                verification_token = secrets.token_urlsafe(32)
+                token_expiry = (datetime.datetime.now() + timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
+                pwd_hash = generate_password_hash(password)
+                conn.execute(
+                    """
+                    INSERT INTO users (username, password, role, full_name, email, email_verified, verification_token, token_expiry)
+                    VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+                    """,
+                    (email, pwd_hash, role, full_name, email, verification_token, token_expiry)
+                )
+                conn.commit()
+                conn.close()
+
+                verify_url = request.url_root.rstrip('/') + url_for('verify_email', token=verification_token)
+                email_body = f"""Hello {full_name},
+
+Thank you for registering on the Crime Management Portal.
+
+Please verify your email address to activate your {role} account by clicking the link below (valid for 24 hours):
+
+{verify_url}
+
+If you did not register for an account, you can safely ignore this message.
+
+Crime Management Portal
+National Crime Records System
+"""
+                send_email(to_email=email, subject="Verify your Crime Management Portal account", body=email_body)
+                flash("Registration successful! A verification link has been sent to your email. Please verify before signing in.", "success")
+                return redirect(url_for('login'))
+
+    error_html = f'<div class="alert alert-danger py-2">{escape(error)}</div>' if error else ''
+    role_options = "".join([
+        f'<option value="{r}" {"selected" if r == form_data.get("role") else ""}>{r}</option>'
+        for r in ROLES
+    ])
+
+    content = f"""
+    <div class="row justify-content-center">
+      <div class="col-md-6 col-lg-5">
+        <div class="card p-4 shadow-sm mt-4">
+          <h3 class="text-center mb-1" style="color: #1f2937;">Create an Account</h3>
+          <p class="text-center text-muted mb-4">Register for Crime Management Portal Access</p>
+          {error_html}
+          <form method="POST">
+            <div class="mb-3">
+              <label class="form-label fw-semibold">Full Name</label>
+              <input type="text" name="full_name" class="form-control" placeholder="e.g. Rajesh Sharma" value="{escape(form_data.get('full_name', ''))}" required autofocus>
+            </div>
+            <div class="mb-3">
+              <label class="form-label fw-semibold">Email Address</label>
+              <input type="email" name="email" class="form-control" placeholder="name@example.com" value="{escape(form_data.get('email', ''))}" required>
+            </div>
+            <div class="mb-3">
+              <label class="form-label fw-semibold">Account Role</label>
+              <select name="role" class="form-select" required>
+                {role_options}
+              </select>
+              <div class="form-text text-muted">Select role: Citizen, Police, Court, or District Magistrate.</div>
+            </div>
+            <div class="row">
+              <div class="col-md-6 mb-3">
+                <label class="form-label fw-semibold">Password</label>
+                <input type="password" name="password" class="form-control" placeholder="At least 6 chars" required>
+              </div>
+              <div class="col-md-6 mb-3">
+                <label class="form-label fw-semibold">Confirm Password</label>
+                <input type="password" name="confirm_password" class="form-control" placeholder="Confirm password" required>
+              </div>
+            </div>
+            <button type="submit" class="btn btn-primary w-100 py-2 mt-2">Create Account</button>
+          </form>
+          <hr class="my-3">
+          <div class="text-center">
+            <span class="text-muted small">Already have an account?</span>
+            <a href="/login" class="fw-semibold small ms-1">Sign In</a>
+          </div>
+        </div>
+      </div>
+    </div>
+    """
+    return render_template_string(HTML_LAYOUT, content=content, current_user_name=None, current_user_role=None)
+
+
+@app.route('/verify-email/<token>')
+def verify_email(token):
+    token = (token or '').strip()
+    if not token:
+        flash("Invalid verification link.", "danger")
+        return redirect(url_for('login'))
+
+    conn = get_db_connection()
+    user = conn.execute("SELECT * FROM users WHERE verification_token = ?", (token,)).fetchone()
+    if not user:
+        conn.close()
+        flash("Invalid or already used verification link. If you need a new link, please request one below.", "danger")
+        return redirect(url_for('resend_verification'))
+
+    # Check token expiry if set
+    if user['token_expiry']:
+        try:
+            expiry = datetime.datetime.strptime(user['token_expiry'], '%Y-%m-%d %H:%M:%S')
+            if datetime.datetime.now() > expiry:
+                conn.close()
+                flash("This verification link has expired (24-hour validity). Please enter your email below to request a new link.", "warning")
+                return redirect(url_for('resend_verification'))
+        except Exception:
+            pass
+
+    conn.execute(
+        "UPDATE users SET email_verified = 1, verification_token = NULL, token_expiry = NULL WHERE user_id = ?",
+        (user['user_id'],)
+    )
+    conn.commit()
+    conn.close()
+
+    flash("Your email address has been successfully verified! You may now sign in.", "success")
+    return redirect(url_for('login'))
+
+
+@app.route('/resend-verification', methods=['GET', 'POST'])
+def resend_verification():
+    if request.method == 'GET' and session.get('user_id'):
+        return redirect(get_role_dashboard_url(session.get('role')))
+    error = None
+    if request.method == 'POST':
+        email = request.form.get('email', '').strip().lower()
+        if not email:
+            error = "Please provide your registered email address."
+        else:
+            conn = get_db_connection()
+            user = conn.execute("SELECT * FROM users WHERE lower(email) = ?", (email,)).fetchone()
+            if not user:
+                conn.close()
+                flash("If an account exists with that email address, a verification link has been dispatched.", "info")
+                return redirect(url_for('login'))
+
+            if user['email_verified']:
+                conn.close()
+                flash("This account is already verified. Please sign in with your credentials.", "info")
+                return redirect(url_for('login'))
+
+            new_token = secrets.token_urlsafe(32)
+            token_expiry = (datetime.datetime.now() + timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
+            conn.execute(
+                "UPDATE users SET verification_token = ?, token_expiry = ? WHERE user_id = ?",
+                (new_token, token_expiry, user['user_id'])
+            )
+            conn.commit()
+            conn.close()
+
+            verify_url = request.url_root.rstrip('/') + url_for('verify_email', token=new_token)
+            email_body = f"""Hello {user['full_name']},
+
+A request was received to resend your Crime Management Portal verification link.
+
+Please click the link below to verify your email and activate your {user['role']} account (valid for 24 hours):
+
+{verify_url}
+
+If you did not request this, you can safely ignore this email.
+
+Crime Management Portal
+National Crime Records System
+"""
+            send_email(to_email=user['email'], subject="Verify your Crime Management Portal account", body=email_body)
+            flash("A fresh verification link has been sent to your email address.", "success")
+            return redirect(url_for('login'))
 
     error_html = f'<div class="alert alert-danger py-2">{escape(error)}</div>' if error else ''
     content = f"""
     <div class="row justify-content-center">
       <div class="col-md-5 col-lg-4">
         <div class="card p-4 shadow-sm mt-5">
-          <h3 class="text-center mb-1" style="color:#5b21b6;">Crime Management Portal</h3>
-          <p class="text-center text-muted mb-4">Sign in with your registered email</p>
+          <h3 class="text-center mb-1" style="color: #1f2937;">Resend Verification</h3>
+          <p class="text-center text-muted mb-4">Enter your email to receive a new verification link</p>
           {error_html}
           <form method="POST">
             <div class="mb-3">
-              <label class="form-label">Email address</label>
-              <input type="email" name="email" class="form-control" placeholder="name@crms.gov.in" required autofocus>
+              <label class="form-label fw-semibold">Email address</label>
+              <input type="email" name="email" class="form-control" placeholder="name@example.com" required autofocus>
             </div>
-            <div class="mb-3">
-              <label class="form-label">Password</label>
-              <input type="password" name="password" class="form-control" placeholder="Password" required>
-            </div>
-            <button type="submit" class="btn btn-primary w-100">Sign In</button>
+            <button type="submit" class="btn btn-primary w-100 py-2">Send Verification Link</button>
           </form>
-          <hr>
-          <p class="small text-muted mb-1">The portal issues four account types, one email each:</p>
-          <ul class="small text-muted mb-0 ps-3">
-            <li><strong>Citizen</strong> — file and track complaints</li>
-            <li><strong>Police</strong> — FIRs, criminal records, stations</li>
-            <li><strong>Court</strong> — case files and hearings</li>
-            <li><strong>District Magistrate</strong> — oversight across all modules</li>
-          </ul>
+          <hr class="my-3">
+          <div class="d-flex justify-content-between small">
+            <a href="/login" class="fw-semibold">Back to Sign In</a>
+            <a href="/signup" class="text-muted">Create Account</a>
+          </div>
         </div>
       </div>
     </div>
@@ -624,9 +986,16 @@ def logout():
     return redirect(url_for('login'))
 
 
-# DASHBOARD ROUTE
+# DASHBOARD ROUTE (Redirects to role-specific landing page)
 @app.route('/')
 def dashboard():
+    role = session.get('role')
+    return redirect(get_role_dashboard_url(role))
+
+
+# NATIONAL DATASET OVERVIEW
+@app.route('/dataset-overview')
+def dataset_overview():
     conn = get_db_connection()
     try:
         total_cases = conn.execute("SELECT SUM(case_count) FROM crime_statistics").fetchone()[0] or 0
@@ -674,21 +1043,23 @@ def dashboard():
         min_yr, max_yr = 2001, 2014
         top_cat = top_state = top_yr = "N/A"
         top_cat_val = top_state_val = top_yr_val = 0
+    finally:
+        conn.close()
 
     body = f"""
     <div class="row g-4 mb-4">
         <div class="col-md-12">
-            <div class="p-4 rounded-3 card shadow-sm text-center" style="background: linear-gradient(135deg, #ede9fe 0%, #fdf2f8 100%); border: 2px solid #ec4899;">
+            <div class="p-4 rounded-3 card shadow-sm text-center" style="background: #f9fafb; border: 2px solid #D6cfc4;">
                 <div class="d-flex justify-content-between align-items-center mb-2">
                     <span class="source-badge">Official NCRB / Kaggle Crime Dataset</span>
-                    <span class="small fw-semibold" style="color: #6d28d9;">Years Covered: {min_yr} – {max_yr}</span>
+                    <span class="small fw-semibold" style="color: #374151;">Years Covered: {min_yr} – {max_yr}</span>
                 </div>
-                <h1 class="display-6 fw-bold" style="color: #ec4899;">National Crime Management Portal</h1>
-                <p class="lead mb-3" style="color: #4c1d95;">Live Dynamic Insights from 35+ Million Real NCRB Recorded Crime Cases</p>
+                <h1 class="display-6 fw-bold" style="color: #1f2937;">National Crime Management Portal</h1>
+                <p class="lead mb-3" style="color: #4b5563;">Live Dynamic Insights from 35+ Million Real NCRB Recorded Crime Cases</p>
                 <div class="d-flex justify-content-center gap-3">
-                    <a href="/crime-statistics" class="btn btn-warning fw-bold px-4 shadow-sm">🔍 Search Crime Records</a>
-                    <a href="/analytics" class="btn btn-primary fw-bold px-4 shadow-sm">📊 Interactive Visual Analytics</a>
-                    <a href="/women-children-analytics" class="btn btn-outline-primary fw-bold px-4 shadow-sm" style="background-color: #ffffff;">👧 Women & Children Reports</a>
+                    <a href="/crime-statistics" class="btn btn-warning fw-bold px-4 shadow-sm">Search Crime Records</a>
+                    <a href="/analytics" class="btn btn-primary fw-bold px-4 shadow-sm">Interactive Visual Analytics</a>
+                    <a href="/women-children-analytics" class="btn btn-outline-primary fw-bold px-4 shadow-sm" style="background-color: #ffffff;">Women &amp; Children Reports</a>
                 </div>
             </div>
         </div>
@@ -703,21 +1074,21 @@ def dashboard():
             </div>
         </div>
         <div class="col-md-3">
-            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #ec4899;">
-                <h6 class="text-uppercase text-secondary small">States & UTs</h6>
+            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #4b5563;">
+                <h6 class="text-uppercase text-secondary small">States &amp; UTs</h6>
                 <span class="fs-2 fw-bold text-danger">{states_count}</span>
                 <small class="text-muted">{districts_count} Districts Covered</small>
             </div>
         </div>
         <div class="col-md-3">
-            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #f59e0b;">
+            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #6b7280;">
                 <h6 class="text-uppercase text-secondary small">Crime Categories</h6>
                 <span class="fs-2 fw-bold text-warning">{categories_count}</span>
                 <small class="text-muted">Normalized IPC Categories</small>
             </div>
         </div>
         <div class="col-md-3">
-            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #10b981;">
+            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #2d6a4f;">
                 <h6 class="text-uppercase text-secondary small">Highest Crime State</h6>
                 <span class="fs-4 fw-bold text-success">{top_state}</span>
                 <small class="text-muted">{top_state_val:,} Total Cases</small>
@@ -728,7 +1099,7 @@ def dashboard():
     <div class="row g-4">
         <div class="col-12">
             <div class="card p-4">
-                <h5 class="text-warning mb-3">📌 Key Dataset Highlights</h5>
+                <h5 class="text-secondary mb-3">Key Dataset Highlights</h5>
                 <ul class="list-group list-group-flush bg-transparent">
                     <li class="list-group-item bg-transparent border-secondary d-flex justify-content-between" style="color: #1a1a1a;">
                         <span>Most Common Crime Category:</span>
@@ -747,6 +1118,721 @@ def dashboard():
                         <span>Women, Children, Property, Arrests</span>
                     </li>
                 </ul>
+            </div>
+        </div>
+    </div>
+    """
+    return render_page(body)
+
+
+# ROLE DASHBOARD: CITIZEN
+@app.route('/dashboard/citizen')
+@login_required
+def citizen_dashboard():
+    full_name = session.get('full_name', 'Citizen')
+    conn = get_db_connection()
+
+    # Query FIRs filed by or associated with this citizen
+    firs = conn.execute("""
+        SELECT f.fir_id, f.fir_number, f.filing_date, f.status, f.description,
+               c.crime_type, c.location, ps.station_name, ps.contact_number
+        FROM FIR f
+        LEFT JOIN victims v ON f.victim_id = v.victim_id
+        LEFT JOIN crimes c ON f.crime_id = c.crime_id
+        LEFT JOIN police_stations ps ON f.station_id = ps.station_id
+        WHERE lower(v.name) = lower(?)
+        ORDER BY f.filing_date DESC
+    """, (full_name,)).fetchall()
+
+    total_firs = len(firs)
+    pending_firs = sum(1 for f in firs if f['status'] in ('Pending', 'Investigating', 'Active', 'Reported'))
+    resolved_firs = sum(1 for f in firs if f['status'] in ('Resolved', 'Closed', 'Disposed'))
+
+    # Nearby police stations for emergency contact
+    stations = conn.execute("SELECT station_name, city, state, contact_number FROM police_stations LIMIT 5").fetchall()
+    conn.close()
+
+    fir_rows = ""
+    if firs:
+        for f in firs:
+            status_badge = "bg-warning text-dark" if f['status'] == 'Pending' else ("bg-success" if f['status'] in ('Closed', 'Resolved') else "bg-secondary")
+            fir_rows += f"""
+            <tr>
+                <td class="fw-bold">{escape(f['fir_number'] or '')}</td>
+                <td>{escape(f['filing_date'] or '')}</td>
+                <td>{escape(f['crime_type'] or 'General Complaint')}</td>
+                <td>{escape(f['station_name'] or 'Central Station')}</td>
+                <td><span class="badge {status_badge}">{escape(f['status'] or 'Pending')}</span></td>
+                <td><small class="text-muted">{escape((f['description'] or '')[:60])}{'...' if len(f['description'] or '') > 60 else ''}</small></td>
+            </tr>
+            """
+    else:
+        fir_rows = """
+        <tr>
+            <td colspan="6" class="text-center text-muted py-4">
+                You have not filed any complaints or FIRs under this name yet.<br>
+                <a href="/fir-management" class="btn btn-sm btn-primary mt-2">File an Official FIR Complaint</a>
+            </td>
+        </tr>
+        """
+
+    station_rows = ""
+    for s in stations:
+        station_rows += f"""
+        <li class="list-group-item d-flex justify-content-between align-items-center bg-transparent">
+            <div>
+                <strong>{escape(s['station_name'])}</strong><br>
+                <small class="text-muted">{escape(s['city'])}, {escape(s['state'])}</small>
+            </div>
+            <a href="tel:{escape(s['contact_number'])}" class="btn btn-sm btn-outline-primary">{escape(s['contact_number'])}</a>
+        </li>
+        """
+
+    body = f"""
+    <div class="row g-4 mb-4">
+        <div class="col-12">
+            <div class="p-4 rounded-3 card shadow-sm" style="background: #f9fafb; border: 2px solid #D6cfc4;">
+                <div class="d-flex flex-wrap justify-content-between align-items-center gap-3">
+                    <div>
+                        <span class="badge bg-secondary mb-2">Citizen Services Portal</span>
+                        <h2 class="fw-bold mb-1" style="color: #1f2937;">Welcome, {escape(full_name)}</h2>
+                        <p class="text-muted mb-0">Track filed FIRs, submit new complaints, access police station contacts and explore public safety analytics.</p>
+                    </div>
+                    <div class="d-flex flex-wrap gap-2">
+                        <a href="/fir-management" class="btn btn-primary fw-semibold">File a New FIR</a>
+                        <a href="/police-station-map" class="btn btn-outline-primary fw-semibold">Station Map</a>
+                        <a href="/crime-statistics" class="btn btn-outline-secondary fw-semibold">Safety Trends</a>
+                        <a href="/dataset-overview" class="btn btn-warning fw-semibold">National Overview</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row g-4 mb-4">
+        <div class="col-md-4">
+            <div class="card stats-card p-3 shadow-sm text-center">
+                <h6 class="text-uppercase text-secondary small">My Registered FIRs</h6>
+                <span class="fs-2 fw-bold text-info">{total_firs}</span>
+                <small class="text-muted">Total recorded under your profile</small>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #d97706;">
+                <h6 class="text-uppercase text-secondary small">Pending / Active</h6>
+                <span class="fs-2 fw-bold text-warning">{pending_firs}</span>
+                <small class="text-muted">Currently undergoing investigation</small>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #2d6a4f;">
+                <h6 class="text-uppercase text-secondary small">Resolved / Closed</h6>
+                <span class="fs-2 fw-bold text-success">{resolved_firs}</span>
+                <small class="text-muted">Completed case proceedings</small>
+            </div>
+        </div>
+    </div>
+
+    <div class="row g-4">
+        <div class="col-lg-8">
+            <div class="card shadow-sm p-3">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h5 class="fw-bold mb-0" style="color: #1f2937;">My Filed Complaints &amp; FIR Records</h5>
+                    <a href="/fir-management" class="btn btn-sm btn-outline-primary">View All Records</a>
+                </div>
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle mb-0">
+                        <thead>
+                            <tr>
+                                <th>FIR Number</th>
+                                <th>Filing Date</th>
+                                <th>Crime Type</th>
+                                <th>Police Station</th>
+                                <th>Status</th>
+                                <th>Description</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {fir_rows}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-lg-4">
+            <div class="card shadow-sm p-3 mb-4">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h5 class="fw-bold mb-0" style="color: #1f2937;">Station Directory</h5>
+                    <a href="/police-stations" class="small">All Stations</a>
+                </div>
+                <ul class="list-group list-group-flush">
+                    {station_rows if station_rows else '<li class="list-group-item text-muted">No station records found.</li>'}
+                </ul>
+            </div>
+
+            <div class="card shadow-sm p-3" style="background-color: #f8f9fa;">
+                <h6 class="fw-bold mb-2" style="color: #1f2937;">Citizen Legal Protections</h6>
+                <ul class="small text-muted ps-3 mb-0">
+                    <li>Every citizen is entitled to a free, signed copy of their registered FIR.</li>
+                    <li>Zero FIRs may be registered at any station regardless of territorial jurisdiction.</li>
+                    <li>All sensitive complaints concerning women and children receive priority processing.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+    """
+    return render_page(body)
+
+
+# ROLE DASHBOARD: POLICE
+@app.route('/dashboard/police')
+@roles_required('Police', 'District Magistrate')
+def police_dashboard():
+    conn = get_db_connection()
+    total_firs = conn.execute("SELECT COUNT(*) FROM FIR").fetchone()[0]
+    pending_firs = conn.execute("SELECT COUNT(*) FROM FIR WHERE status != 'Closed'").fetchone()[0]
+    active_cases = conn.execute("SELECT COUNT(*) FROM cases WHERE case_status = 'Active'").fetchone()[0]
+    wanted_criminals = conn.execute("SELECT COUNT(*) FROM criminals WHERE status = 'Wanted'").fetchone()[0]
+    total_stations = conn.execute("SELECT COUNT(*) FROM police_stations").fetchone()[0]
+
+    recent_firs = conn.execute("""
+        SELECT f.fir_id, f.fir_number, f.filing_date, f.status, f.description,
+               c.crime_type, ps.station_name
+        FROM FIR f
+        LEFT JOIN crimes c ON f.crime_id = c.crime_id
+        LEFT JOIN police_stations ps ON f.station_id = ps.station_id
+        ORDER BY f.filing_date DESC LIMIT 5
+    """).fetchall()
+
+    active_cases_list = conn.execute("""
+        SELECT c.case_id, c.case_number, c.priority, c.case_status, c.start_date,
+               po.name as officer_name, po.badge_number
+        FROM cases c
+        LEFT JOIN police_officers po ON c.investigating_officer_id = po.officer_id
+        WHERE c.case_status = 'Active'
+        ORDER BY c.start_date DESC LIMIT 5
+    """).fetchall()
+
+    wanted_suspects = conn.execute("""
+        SELECT criminal_id, name, alias, status, identification_details
+        FROM criminals
+        WHERE status = 'Wanted'
+        LIMIT 5
+    """).fetchall()
+    conn.close()
+
+    fir_rows = ""
+    for f in recent_firs:
+        status_badge = "bg-warning text-dark" if f['status'] == 'Pending' else ("bg-success" if f['status'] == 'Closed' else "bg-secondary")
+        fir_rows += f"""
+        <tr>
+            <td class="fw-bold"><a href="/fir-management">{escape(f['fir_number'] or '')}</a></td>
+            <td>{escape(f['filing_date'] or '')}</td>
+            <td>{escape(f['crime_type'] or 'N/A')}</td>
+            <td>{escape(f['station_name'] or 'Station')}</td>
+            <td><span class="badge {status_badge}">{escape(f['status'] or 'Pending')}</span></td>
+        </tr>
+        """
+
+    case_rows = ""
+    for c in active_cases_list:
+        p_badge = "bg-danger" if c['priority'] == 'High' else ("bg-warning text-dark" if c['priority'] == 'Medium' else "bg-secondary")
+        case_rows += f"""
+        <tr>
+            <td class="fw-bold"><a href="/case-files">{escape(c['case_number'] or '')}</a></td>
+            <td><span class="badge {p_badge}">{escape(c['priority'] or 'Normal')}</span></td>
+            <td>{escape(c['officer_name'] or 'Unassigned')}</td>
+            <td>{escape(c['start_date'] or '')}</td>
+        </tr>
+        """
+
+    wanted_rows = ""
+    for w in wanted_suspects:
+        wanted_rows += f"""
+        <li class="list-group-item d-flex justify-content-between align-items-center bg-transparent">
+            <div>
+                <strong>{escape(w['name'])}</strong>
+                {f'<span class="text-muted small"> (Alias: {escape(w["alias"])})</span>' if w['alias'] else ''}<br>
+                <small class="text-muted">{escape(w['identification_details'] or 'No details on record')}</small>
+            </div>
+            <span class="badge bg-danger">Wanted</span>
+        </li>
+        """
+
+    body = f"""
+    <div class="row g-4 mb-4">
+        <div class="col-12">
+            <div class="p-4 rounded-3 card shadow-sm" style="background: #f9fafb; border: 2px solid #D6cfc4;">
+                <div class="d-flex flex-wrap justify-content-between align-items-center gap-3">
+                    <div>
+                        <span class="badge bg-secondary mb-2">Law Enforcement Command</span>
+                        <h2 class="fw-bold mb-1" style="color: #1f2937;">Police Operations Dashboard</h2>
+                        <p class="text-muted mb-0">Operational control for FIR registration, investigative case tracking, suspect identification, and station management.</p>
+                    </div>
+                    <div class="d-flex flex-wrap gap-2">
+                        <a href="/fir-management" class="btn btn-primary fw-semibold">Register FIR</a>
+                        <a href="/criminal-records" class="btn btn-outline-primary fw-semibold">Criminal Records</a>
+                        <a href="/case-files" class="btn btn-outline-primary fw-semibold">Case Files</a>
+                        <a href="/crime-patterns" class="btn btn-warning fw-semibold">Pattern Detector</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row g-4 mb-4">
+        <div class="col-md-3">
+            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #d97706;">
+                <h6 class="text-uppercase text-secondary small">Open / Pending FIRs</h6>
+                <span class="fs-2 fw-bold text-warning">{pending_firs}</span>
+                <small class="text-muted">Out of {total_firs} total registered</small>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card stats-card p-3 shadow-sm text-center">
+                <h6 class="text-uppercase text-secondary small">Active Cases</h6>
+                <span class="fs-2 fw-bold text-info">{active_cases}</span>
+                <small class="text-muted">Under investigation</small>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #991b1b;">
+                <h6 class="text-uppercase text-secondary small">Wanted Suspects</h6>
+                <span class="fs-2 fw-bold text-danger">{wanted_criminals}</span>
+                <small class="text-muted">Active warrants logged</small>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #2d6a4f;">
+                <h6 class="text-uppercase text-secondary small">Police Stations</h6>
+                <span class="fs-2 fw-bold text-success">{total_stations}</span>
+                <small class="text-muted"><a href="/police-station-map" class="text-success text-decoration-none">Open Map View</a></small>
+            </div>
+        </div>
+    </div>
+
+    <div class="row g-4">
+        <div class="col-lg-6">
+            <div class="card shadow-sm p-3">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h5 class="fw-bold mb-0" style="color: #1f2937;">Recent FIR Activity</h5>
+                    <a href="/fir-management" class="btn btn-sm btn-outline-primary">Manage All FIRs</a>
+                </div>
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle mb-0">
+                        <thead>
+                            <tr>
+                                <th>FIR Number</th>
+                                <th>Date</th>
+                                <th>Crime Head</th>
+                                <th>Station</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {fir_rows if fir_rows else '<tr><td colspan="5" class="text-center text-muted">No FIRs logged yet.</td></tr>'}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-lg-6">
+            <div class="card shadow-sm p-3">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h5 class="fw-bold mb-0" style="color: #1f2937;">Active Investigative Cases</h5>
+                    <a href="/case-files" class="btn btn-sm btn-outline-primary">Manage Cases</a>
+                </div>
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle mb-0">
+                        <thead>
+                            <tr>
+                                <th>Case Number</th>
+                                <th>Priority</th>
+                                <th>Investigator</th>
+                                <th>Initiated</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {case_rows if case_rows else '<tr><td colspan="4" class="text-center text-muted">No active cases logged.</td></tr>'}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-12">
+            <div class="card shadow-sm p-3">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h5 class="fw-bold mb-0" style="color: #1f2937;">Most Wanted Suspects</h5>
+                    <a href="/criminal-records" class="btn btn-sm btn-outline-primary">Criminal Database</a>
+                </div>
+                <ul class="list-group list-group-flush">
+                    {wanted_rows if wanted_rows else '<li class="list-group-item text-muted">No active wanted notices.</li>'}
+                </ul>
+            </div>
+        </div>
+    </div>
+    """
+    return render_page(body)
+
+
+# ROLE DASHBOARD: COURT
+@app.route('/dashboard/court')
+@roles_required('Court', 'District Magistrate')
+def court_dashboard():
+    conn = get_db_connection()
+    total_cases = conn.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
+    active_trials = conn.execute("SELECT COUNT(*) FROM cases WHERE case_status = 'Active'").fetchone()[0]
+    closed_cases = conn.execute("SELECT COUNT(*) FROM cases WHERE case_status = 'Closed'").fetchone()[0]
+
+    arrest_summary = conn.execute("""
+        SELECT SUM(persons_arrested) as arrested,
+               SUM(persons_convicted) as convicted,
+               SUM(persons_acquitted) as acquitted
+        FROM arrest_statistics
+    """).fetchone()
+
+    total_convicted = arrest_summary['convicted'] or 0
+    total_acquitted = arrest_summary['acquitted'] or 0
+    total_disposed = total_convicted + total_acquitted
+    conviction_pct = round((total_convicted / total_disposed * 100), 1) if total_disposed > 0 else 0.0
+
+    pending_cases = conn.execute("""
+        SELECT c.case_id, c.case_number, c.case_status, c.priority, c.start_date, c.remarks,
+               f.fir_number, po.name as officer_name
+        FROM cases c
+        LEFT JOIN FIR f ON c.fir_id = f.fir_id
+        LEFT JOIN police_officers po ON c.investigating_officer_id = po.officer_id
+        ORDER BY c.start_date DESC LIMIT 8
+    """).fetchall()
+
+    top_charges = conn.execute("""
+        SELECT crime_head, persons_arrested, persons_convicted, persons_acquitted
+        FROM arrest_statistics
+        ORDER BY (persons_convicted + persons_acquitted) DESC LIMIT 5
+    """).fetchall()
+    conn.close()
+
+    case_rows = ""
+    for c in pending_cases:
+        p_badge = "bg-danger" if c['priority'] == 'High' else ("bg-warning text-dark" if c['priority'] == 'Medium' else "bg-secondary")
+        status_badge = "bg-info" if c['case_status'] == 'Active' else ("bg-success" if c['case_status'] == 'Closed' else "bg-secondary")
+        case_rows += f"""
+        <tr>
+            <td class="fw-bold"><a href="/case-files">{escape(c['case_number'] or '')}</a></td>
+            <td><a href="/fir-management">{escape(c['fir_number'] or 'N/A')}</a></td>
+            <td><span class="badge {p_badge}">{escape(c['priority'] or 'Normal')}</span></td>
+            <td><span class="badge {status_badge}">{escape(c['case_status'] or 'Active')}</span></td>
+            <td>{escape(c['officer_name'] or 'Unassigned')}</td>
+            <td>{escape(c['start_date'] or '')}</td>
+            <td><small class="text-muted">{escape(c['remarks'] or 'Under Judicial Review')}</small></td>
+        </tr>
+        """
+
+    disposition_rows = ""
+    for ch in top_charges:
+        tot = (ch['persons_convicted'] or 0) + (ch['persons_acquitted'] or 0)
+        c_rate = round((ch['persons_convicted'] / tot * 100), 1) if tot > 0 else 0.0
+        disposition_rows += f"""
+        <tr>
+            <td class="fw-semibold">{escape(ch['crime_head'])}</td>
+            <td class="text-end">{ch['persons_arrested']:,}</td>
+            <td class="text-end text-success fw-bold">{ch['persons_convicted']:,}</td>
+            <td class="text-end text-secondary">{ch['persons_acquitted']:,}</td>
+            <td class="text-end"><span class="badge bg-secondary">{c_rate}%</span></td>
+        </tr>
+        """
+
+    body = f"""
+    <div class="row g-4 mb-4">
+        <div class="col-12">
+            <div class="p-4 rounded-3 card shadow-sm" style="background: #f9fafb; border: 2px solid #D6cfc4;">
+                <div class="d-flex flex-wrap justify-content-between align-items-center gap-3">
+                    <div>
+                        <span class="badge bg-secondary mb-2">Judicial Administration</span>
+                        <h2 class="fw-bold mb-1" style="color: #1f2937;">District Court Case Proceedings Dashboard</h2>
+                        <p class="text-muted mb-0">Court docket tracking, hearing status management, prosecution evidence review, and judicial disposition metrics.</p>
+                    </div>
+                    <div class="d-flex flex-wrap gap-2">
+                        <a href="/case-files" class="btn btn-primary fw-semibold">Case File Proceedings</a>
+                        <a href="/fir-management" class="btn btn-outline-primary fw-semibold">FIR Evidence</a>
+                        <a href="/criminal-records" class="btn btn-outline-primary fw-semibold">Criminal Records</a>
+                        <a href="/property-arrest-analytics" class="btn btn-warning fw-semibold">Arrests &amp; Convictions</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row g-4 mb-4">
+        <div class="col-md-3">
+            <div class="card stats-card p-3 shadow-sm text-center">
+                <h6 class="text-uppercase text-secondary small">Cases Pending Hearing / Trial</h6>
+                <span class="fs-2 fw-bold text-info">{active_trials}</span>
+                <small class="text-muted">Active in court proceedings</small>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #2d6a4f;">
+                <h6 class="text-uppercase text-secondary small">Disposed / Closed Cases</h6>
+                <span class="fs-2 fw-bold text-success">{closed_cases}</span>
+                <small class="text-muted">Final judgements rendered</small>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #4b5563;">
+                <h6 class="text-uppercase text-secondary small">Total Docketed Cases</h6>
+                <span class="fs-2 fw-bold text-secondary">{total_cases}</span>
+                <small class="text-muted">Total judicial registry</small>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #d97706;">
+                <h6 class="text-uppercase text-secondary small">National Conviction Rate</h6>
+                <span class="fs-2 fw-bold text-warning">{conviction_pct}%</span>
+                <small class="text-muted">Based on official trial records</small>
+            </div>
+        </div>
+    </div>
+
+    <div class="row g-4 mb-4">
+        <div class="col-12">
+            <div class="card shadow-sm p-3">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h5 class="fw-bold mb-0" style="color: #1f2937;">Active Judicial Case Files</h5>
+                    <a href="/case-files" class="btn btn-sm btn-outline-primary">Manage Case Dockets</a>
+                </div>
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle mb-0">
+                        <thead>
+                            <tr>
+                                <th>Case Number</th>
+                                <th>Associated FIR</th>
+                                <th>Priority</th>
+                                <th>Status</th>
+                                <th>Investigator</th>
+                                <th>Initiated</th>
+                                <th>Remarks / Notes</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {case_rows if case_rows else '<tr><td colspan="7" class="text-center text-muted">No judicial cases on docket.</td></tr>'}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row g-4">
+        <div class="col-12">
+            <div class="card shadow-sm p-3">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h5 class="fw-bold mb-0" style="color: #1f2937;">Trial &amp; Disposition Trends by Crime Category</h5>
+                    <a href="/property-arrest-analytics" class="small">Full Analytics</a>
+                </div>
+                <div class="table-responsive">
+                    <table class="table table-sm table-hover align-middle mb-0">
+                        <thead>
+                            <tr>
+                                <th>Crime Category</th>
+                                <th class="text-end">Arrested</th>
+                                <th class="text-end">Convicted</th>
+                                <th class="text-end">Acquitted</th>
+                                <th class="text-end">Conviction Rate</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {disposition_rows}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+    """
+    return render_page(body)
+
+
+# ROLE DASHBOARD: DISTRICT MAGISTRATE
+@app.route('/dashboard/district-magistrate')
+@roles_required('District Magistrate')
+def magistrate_dashboard():
+    conn = get_db_connection()
+    total_firs = conn.execute("SELECT COUNT(*) FROM FIR").fetchone()[0]
+    total_cases = conn.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
+    total_criminals = conn.execute("SELECT COUNT(*) FROM criminals").fetchone()[0]
+    total_stations = conn.execute("SELECT COUNT(*) FROM police_stations").fetchone()[0]
+    active_cases = conn.execute("SELECT COUNT(*) FROM cases WHERE case_status = 'Active'").fetchone()[0]
+    pending_firs = conn.execute("SELECT COUNT(*) FROM FIR WHERE status != 'Closed'").fetchone()[0]
+
+    arrest_summary = conn.execute("""
+        SELECT SUM(persons_arrested) as arrested,
+               SUM(persons_convicted) as convicted,
+               SUM(persons_acquitted) as acquitted
+        FROM arrest_statistics
+    """).fetchone()
+
+    total_convicted = arrest_summary['convicted'] or 0
+    total_acquitted = arrest_summary['acquitted'] or 0
+    total_disposed = total_convicted + total_acquitted
+    conviction_pct = round((total_convicted / total_disposed * 100), 1) if total_disposed > 0 else 0.0
+
+    recent_firs = conn.execute("""
+        SELECT f.fir_id, f.fir_number, f.filing_date, f.status, f.description,
+               c.crime_type, ps.station_name
+        FROM FIR f
+        LEFT JOIN crimes c ON f.crime_id = c.crime_id
+        LEFT JOIN police_stations ps ON f.station_id = ps.station_id
+        ORDER BY f.filing_date DESC LIMIT 5
+    """).fetchall()
+
+    recent_cases = conn.execute("""
+        SELECT c.case_number, c.case_status, c.priority, c.start_date,
+               po.name as officer_name
+        FROM cases c
+        LEFT JOIN police_officers po ON c.investigating_officer_id = po.officer_id
+        ORDER BY c.start_date DESC LIMIT 5
+    """).fetchall()
+
+    conn.close()
+
+    fir_rows = ""
+    for f in recent_firs:
+        status_badge = "bg-warning text-dark" if f['status'] == 'Pending' else ("bg-success" if f['status'] == 'Closed' else "bg-secondary")
+        fir_rows += f"""
+        <tr>
+            <td class="fw-bold"><a href="/fir-management">{escape(f['fir_number'] or '')}</a></td>
+            <td>{escape(f['filing_date'] or '')}</td>
+            <td>{escape(f['crime_type'] or 'N/A')}</td>
+            <td>{escape(f['station_name'] or 'Station')}</td>
+            <td><span class="badge {status_badge}">{escape(f['status'] or 'Pending')}</span></td>
+        </tr>
+        """
+
+    case_rows = ""
+    for c in recent_cases:
+        p_badge = "bg-danger" if c['priority'] == 'High' else ("bg-warning text-dark" if c['priority'] == 'Medium' else "bg-secondary")
+        case_rows += f"""
+        <tr>
+            <td class="fw-bold"><a href="/case-files">{escape(c['case_number'] or '')}</a></td>
+            <td><span class="badge {p_badge}">{escape(c['priority'] or 'Normal')}</span></td>
+            <td>{escape(c['case_status'] or 'Active')}</td>
+            <td>{escape(c['officer_name'] or 'Unassigned')}</td>
+            <td>{escape(c['start_date'] or '')}</td>
+        </tr>
+        """
+
+    body = f"""
+    <div class="row g-4 mb-4">
+        <div class="col-12">
+            <div class="p-4 rounded-3 card shadow-sm" style="background: #f9fafb; border: 2px solid #D6cfc4;">
+                <div class="d-flex flex-wrap justify-content-between align-items-center gap-3">
+                    <div>
+                        <span class="badge bg-secondary mb-2">Executive Law &amp; Order Oversight</span>
+                        <h2 class="fw-bold mb-1" style="color: #1f2937;">District Magistrate Command Console</h2>
+                        <p class="text-muted mb-0">District administrative authority: cross-departmental supervision across Police Stations, FIR Registrations, Criminal Surveillance, and Court Proceedings.</p>
+                    </div>
+                    <div class="d-flex flex-wrap gap-2">
+                        <a href="/fir-management" class="btn btn-primary fw-semibold">FIR Control</a>
+                        <a href="/case-files" class="btn btn-outline-primary fw-semibold">Case Dockets</a>
+                        <a href="/criminal-records" class="btn btn-outline-primary fw-semibold">Criminal Profiles</a>
+                        <a href="/crime-patterns" class="btn btn-outline-primary fw-semibold">Pattern Detector</a>
+                        <a href="/dataset-overview" class="btn btn-warning fw-semibold">National Overview</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row g-4 mb-4">
+        <div class="col-md">
+            <div class="card stats-card p-3 shadow-sm text-center">
+                <h6 class="text-uppercase text-secondary small">Police Stations</h6>
+                <span class="fs-2 fw-bold text-info">{total_stations}</span>
+                <small class="text-muted">In district jurisdiction</small>
+            </div>
+        </div>
+        <div class="col-md">
+            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #d97706;">
+                <h6 class="text-uppercase text-secondary small">Total Registered FIRs</h6>
+                <span class="fs-2 fw-bold text-warning">{total_firs}</span>
+                <small class="text-muted">{pending_firs} pending resolution</small>
+            </div>
+        </div>
+        <div class="col-md">
+            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #4b5563;">
+                <h6 class="text-uppercase text-secondary small">Active Cases</h6>
+                <span class="fs-2 fw-bold text-secondary">{active_cases}</span>
+                <small class="text-muted">Under active inquiry</small>
+            </div>
+        </div>
+        <div class="col-md">
+            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #991b1b;">
+                <h6 class="text-uppercase text-secondary small">Known Criminals</h6>
+                <span class="fs-2 fw-bold text-danger">{total_criminals}</span>
+                <small class="text-muted">On judicial watch</small>
+            </div>
+        </div>
+        <div class="col-md">
+            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #2d6a4f;">
+                <h6 class="text-uppercase text-secondary small">Conviction Rate</h6>
+                <span class="fs-2 fw-bold text-success">{conviction_pct}%</span>
+                <small class="text-muted">Judicial conviction metric</small>
+            </div>
+        </div>
+    </div>
+
+    <div class="row g-4">
+        <div class="col-lg-6">
+            <div class="card shadow-sm p-3">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h5 class="fw-bold mb-0" style="color: #1f2937;">Jurisdictional FIR Registrations</h5>
+                    <a href="/fir-management" class="btn btn-sm btn-outline-primary">All FIRs</a>
+                </div>
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle mb-0">
+                        <thead>
+                            <tr>
+                                <th>FIR Number</th>
+                                <th>Filing Date</th>
+                                <th>Crime Head</th>
+                                <th>Station</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {fir_rows if fir_rows else '<tr><td colspan="5" class="text-center text-muted">No FIRs logged yet.</td></tr>'}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-lg-6">
+            <div class="card shadow-sm p-3">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h5 class="fw-bold mb-0" style="color: #1f2937;">Case Investigation Oversight</h5>
+                    <a href="/case-files" class="btn btn-sm btn-outline-primary">All Cases</a>
+                </div>
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle mb-0">
+                        <thead>
+                            <tr>
+                                <th>Case Number</th>
+                                <th>Priority</th>
+                                <th>Status</th>
+                                <th>Investigator</th>
+                                <th>Initiated</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {case_rows if case_rows else '<tr><td colspan="5" class="text-center text-muted">No active cases.</td></tr>'}
+                        </tbody>
+                    </table>
+                </div>
             </div>
         </div>
     </div>
@@ -804,7 +1890,7 @@ def crime_statistics():
 
     # Fetch page items
     data_sql = f"""
-        SELECT state, district, year, crime_type, case_count, source 
+        SELECT state, district, year, crime_type, case_count 
         FROM crime_statistics
         {where_sql}
         ORDER BY case_count DESC, year DESC, state, district
@@ -820,19 +1906,19 @@ def crime_statistics():
     if rows:
         rows_html = "".join([f"""
         <tr>
-            <td class="fw-bold text-warning">{r['state']}</td>
+            <td class="fw-bold text-secondary">{r['state']}</td>
             <td>{r['district']}</td>
             <td><span class="badge bg-secondary">{r['year']}</span></td>
             <td><span class="badge bg-info text-dark">{r['crime_type']}</span></td>
             <td class="fw-bold text-danger fs-6">{r['case_count']:,}</td>
-            <td><span class="source-badge">{r['source']}</span></td>
+            <td><span class="source-badge">NCRB Record</span></td>
         </tr>
         """ for r in rows])
     else:
         rows_html = """
         <tr>
             <td colspan="6" class="text-center py-5 text-muted fs-5">
-                ⚠️ No records found for the selected filters. Please adjust your search criteria.
+                No records found for the selected filters. Please adjust your search criteria.
             </td>
         </tr>
         """
@@ -847,7 +1933,7 @@ def crime_statistics():
 
     body = f"""
     <div class="d-flex justify-content-between align-items-center mb-4">
-        <h2 class="text-warning m-0">🔍 Kaggle/NCRB Crime Statistics Explorer</h2>
+        <h2 class="text-secondary m-0">Kaggle/NCRB Crime Statistics Explorer</h2>
         <span class="source-badge">Data Source: Kaggle / NCRB Dataset</span>
     </div>
 
@@ -968,20 +2054,20 @@ def analytics():
 
     body = f"""
     <div class="d-flex justify-content-between align-items-center mb-4">
-        <h2 class="text-info m-0">📊 Interactive Crime Analytics & Trends</h2>
+        <h2 class="text-secondary m-0">Interactive Crime Analytics &amp; Trends</h2>
         <span class="source-badge">Data Source: Kaggle / NCRB Dataset</span>
     </div>
 
     <div class="row g-4 mb-4">
         <div class="col-md-8">
             <div class="card p-4">
-                <h5 class="text-warning mb-3">📈 National Crime Trend Over Years (2001 - 2014)</h5>
+                <h5 class="text-secondary mb-3">National Crime Trend Over Years (2001 - 2014)</h5>
                 <canvas id="yearlyTrendChart" height="140"></canvas>
             </div>
         </div>
         <div class="col-md-4">
             <div class="card p-4">
-                <h5 class="text-danger mb-3">🧩 Top Crime Categories</h5>
+                <h5 class="text-secondary mb-3">Top Crime Categories</h5>
                 <canvas id="categoryPieChart" height="280"></canvas>
             </div>
         </div>
@@ -990,7 +2076,7 @@ def analytics():
     <div class="row g-4">
         <div class="col-md-12">
             <div class="card p-4">
-                <h5 class="text-success mb-3">🏛️ Top 10 States by Total Recorded Crimes</h5>
+                <h5 class="text-secondary mb-3">Top 10 States by Total Recorded Crimes</h5>
                 <canvas id="stateBarChart" height="100"></canvas>
             </div>
         </div>
@@ -1005,8 +2091,8 @@ def analytics():
                 datasets: [{{
                     label: 'Total Recorded Crimes',
                     data: {year_vals},
-                    borderColor: '#8b5cf6',
-                    backgroundColor: 'rgba(139, 92, 246, 0.12)',
+                    borderColor: '#374151',
+                    backgroundColor: 'rgba(55, 65, 81, 0.12)',
                     fill: true,
                     tension: 0.3
                 }}]
@@ -1028,7 +2114,7 @@ def analytics():
                 labels: {cat_labels},
                 datasets: [{{
                     data: {cat_vals},
-                    backgroundColor: ['#ec4899', '#8b5cf6', '#10b981', '#f59e0b', '#a855f7', '#06b6d4', '#84cc16', '#6366f1', '#14b8a6', '#f43f5e']
+                    backgroundColor: ['#374151', '#4b5563', '#6b7280', '#9ca3af', '#b8b1a5', '#1f2937', '#111827', '#2d6a4f', '#d97706', '#991b1b']
                 }}]
             }},
             options: {{
@@ -1045,7 +2131,7 @@ def analytics():
                 datasets: [{{
                     label: 'Total Crime Cases',
                     data: {state_vals},
-                    backgroundColor: '#8b5cf6'
+                    backgroundColor: '#4b5563'
                 }}]
             }},
             options: {{
@@ -1087,11 +2173,11 @@ def women_children_analytics():
     child_rows = "".join([f"<tr><td>{c['crime_type']}</td><td class='fw-bold text-warning'>{c['total']:,}</td></tr>" for c in child_cats])
 
     body = f"""
-    <h2 class="text-danger mb-4">👧 Crimes Against Women & Children Statistics</h2>
+    <h2 class="text-secondary mb-4">Crimes Against Women &amp; Children Statistics</h2>
     <div class="row g-4">
         <div class="col-md-6">
             <div class="card p-4">
-                <h4 class="text-danger mb-3">👩 Crimes Against Women (Category Breakdown)</h4>
+                <h4 class="text-secondary mb-3">Crimes Against Women (Category Breakdown)</h4>
                 <div class="table-responsive">
                     <table class="table table-dark table-hover align-middle">
                         <thead><tr><th>Category</th><th>Total Reported Cases</th></tr></thead>
@@ -1102,7 +2188,7 @@ def women_children_analytics():
         </div>
         <div class="col-md-6">
             <div class="card p-4">
-                <h4 class="text-warning mb-3">👶 Crimes Against Children (Category Breakdown)</h4>
+                <h4 class="text-secondary mb-3">Crimes Against Children (Category Breakdown)</h4>
                 <div class="table-responsive">
                     <table class="table table-dark table-hover align-middle">
                         <thead><tr><th>Category</th><th>Total Reported Cases</th></tr></thead>
@@ -1148,13 +2234,13 @@ def property_arrest_analytics():
 
     body = f"""
     <div class="d-flex justify-content-between align-items-center mb-4">
-        <h2 class="text-info m-0">💰 Property Crimes & Police Arrest Statistics</h2>
+        <h2 class="text-secondary m-0">Property Crimes &amp; Police Arrest Statistics</h2>
         <span class="source-badge">Data Source: Kaggle / NCRB Dataset</span>
     </div>
     <div class="row g-4 mb-4">
         <div class="col-md-6">
             <div class="card p-4 h-100">
-                <h4 class="text-warning mb-3">🏡 Stolen vs Recovered Property (Top States)</h4>
+                <h4 class="text-secondary mb-3">Stolen vs Recovered Property (Top States)</h4>
                 <div class="table-responsive">
                     <table class="table table-hover align-middle">
                         <thead><tr><th>State / UT</th><th>Stolen Cases</th><th>Recovered Cases</th></tr></thead>
@@ -1165,7 +2251,7 @@ def property_arrest_analytics():
         </div>
         <div class="col-md-6">
             <div class="card p-4 h-100">
-                <h4 class="text-info mb-3">🏆 Top States by Recovered Property</h4>
+                <h4 class="text-secondary mb-3">Top States by Recovered Property</h4>
                 <div class="table-responsive">
                     <table class="table table-hover align-middle">
                         <thead><tr><th>State / UT</th><th>Recovered Cases</th></tr></thead>
@@ -1178,7 +2264,7 @@ def property_arrest_analytics():
     <div class="row g-4">
         <div class="col-12">
             <div class="card p-4">
-                <h4 class="text-info mb-3">⚖️ Arrests, Convictions & Acquittals</h4>
+                <h4 class="text-secondary mb-3">Arrests, Convictions &amp; Acquittals</h4>
                 <div class="table-responsive">
                     <table class="table table-hover align-middle">
                         <thead><tr><th>Crime Head</th><th>Arrested</th><th>Convicted</th><th>Acquitted</th></tr></thead>
@@ -1301,7 +2387,7 @@ def police_station_map():
                     document.getElementById('station-count').textContent = `${features.length.toLocaleString()} stations`;
                     const layer = L.geoJSON(data, {
                         pointToLayer: (feature, latlng) => L.circleMarker(latlng, {
-                            radius: 4, color: '#ec4899', fillColor: '#8b5cf6', fillOpacity: 0.8
+                            radius: 4, color: '#D6cfc4', fillColor: '#374151', fillOpacity: 0.8
                         }),
                         onEachFeature: (feature, layer) => {
                             const properties = feature.properties || {};
@@ -1372,7 +2458,7 @@ def police_stations():
     """ for station in geojson_stations[:100]]) or "<tr><td colspan='4' class='text-center text-muted py-4'>Police station GeoJSON not available.</td></tr>"
 
     body = f"""
-    <h2 class="text-warning mb-3">🏢 Police Stations & Officer Directory</h2>
+    <h2 class="text-warning mb-3">Police Stations & Officer Directory</h2>
     <div class="card p-4 mb-4">
         <div class="d-flex justify-content-between align-items-center mb-3">
             <div><h4 class="text-info m-0">Police Station Reference Data</h4>
@@ -1497,7 +2583,7 @@ def fir_management():
     category_options = "".join(f'<option value="{c["crime_type"]}">' for c in crime_categories)
 
     body = f"""
-    <h2 class="text-warning mb-3">📄 FIR (First Information Report) Registry</h2>
+    <h2 class="text-secondary mb-3">FIR (First Information Report) Registry</h2>
     <div class="card p-4 mb-4">
         <div class="table-responsive">
             <table class="table table-dark table-hover align-middle">
@@ -1587,7 +2673,7 @@ def criminal_records():
     arrest_rows = "".join(f"<tr><td>{a['crime_head']}</td><td>{a['arrested']:,}</td><td>{a['convicted']:,}</td></tr>" for a in arrest_context) or "<tr><td colspan='3' class='text-center text-muted'>Run the dataset import to show arrest context.</td></tr>"
 
     body = f"""
-    <h2 class="text-danger mb-3">👤 Criminal Record Dossiers</h2>
+    <h2 class="text-secondary mb-3">Criminal Record Dossiers</h2>
     <div class="card p-4 mb-4">
         <div class="table-responsive">
             <table class="table table-dark table-hover align-middle">
@@ -1654,7 +2740,7 @@ def case_files():
     officer_options = "".join(f'<option value="{o["officer_id"]}">{o["name"]} ({o["rank"]})</option>' for o in officers) or '<option value="">Unassigned</option>'
 
     body = f"""
-    <h2 class="text-info mb-3">⚖️ Active & Closed Case Files</h2>
+    <h2 class="text-secondary mb-3">Active &amp; Closed Case Files</h2>
     <div class="card p-4 mb-4">
         <div class="table-responsive">
             <table class="table table-dark table-hover align-middle">
@@ -1789,13 +2875,13 @@ def crime_patterns():
 <div class="container-fluid py-4">
   <div class="row mb-4">
     <div class="col-12">
-      <h2 style="color:#5b21b6;">🔗 AI-Powered Crime Pattern &amp; Similarity Detector</h2>
+      <h2 style="color: #1f2937;">AI-Powered Crime Pattern &amp; Similarity Detector</h2>
       <p class="text-muted">Analyze historical crime trends, detect anomalies, find similar crime patterns across regions, and identify clusters — powered by real NCRB/Kaggle data (2001–2013).</p>
     </div>
   </div>
 
   <!-- Filter Form -->
-  <div class="card mb-4 p-4" style="border-left:4px solid #8b5cf6;">
+  <div class="card mb-4 p-4" style="border-left: 4px solid #374151;">
     <form method="GET" action="/crime-patterns" id="patternForm">
       <div class="row g-3 align-items-end">
         <div class="col-md-3">
@@ -1819,7 +2905,7 @@ def crime_patterns():
           <select class="form-select" name="end_year">{year_opts_e}</select>
         </div>
         <div class="col-md-2">
-          <button type="submit" class="btn w-100" style="background:#8b5cf6;color:#fff;">🔍 Analyze</button>
+          <button type="submit" class="btn btn-primary w-100">Analyze</button>
         </div>
       </div>
     </form>
@@ -1853,7 +2939,7 @@ function loadDistricts() {{
 def _build_pattern_results(data, crime_type, state, district):
     """Build the HTML results section from run_full_analysis() output."""
     if data.get('error'):
-        return f'<div class="alert alert-warning mt-3">⚠️ {escape(data["error"])}</div>'
+        return f'<div class="alert alert-warning mt-3">{escape(data["error"])}</div>'
 
     trend    = data.get('trend', {})
     spikes   = data.get('spikes', [])
@@ -1872,21 +2958,21 @@ def _build_pattern_results(data, crime_type, state, district):
     low_yr    = trend.get('lowest_year', 'N/A')
     slope     = trend.get('slope', 0)
 
-    dir_color  = '#2d6a4f' if direction == 'Increasing' else ('#ec4899' if direction == 'Decreasing' else '#8b5cf6')
+    dir_color  = '#2d6a4f' if direction == 'Increasing' else ('#991b1b' if direction == 'Decreasing' else '#374151')
     trend_badge = f'<span class="badge" style="background:{dir_color};font-size:1rem;">{direction}</span>'
 
     trend_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#5b21b6;">📈 Trend Analysis — {escape(crime_type)} in {escape(location_label)}</h5>
+  <h5 style="color: #1f2937;">Trend Analysis — {escape(crime_type)} in {escape(location_label)}</h5>
   <div class="row text-center mt-3">
-    <div class="col-md-3"><div class="p-3 rounded" style="background:#faf5ff;">
+    <div class="col-md-3"><div class="p-3 rounded" style="background: #f3f4f6;">
       <div style="font-size:1.8rem;">{trend_badge}</div><small class="text-muted">Overall Trend</small></div></div>
-    <div class="col-md-3"><div class="p-3 rounded" style="background:#faf5ff;">
-      <div style="font-size:1.8rem;font-weight:bold;color:#5b21b6;">{net_pct:+.1f}%</div><small class="text-muted">Net Change</small></div></div>
-    <div class="col-md-3"><div class="p-3 rounded" style="background:#faf5ff;">
-      <div style="font-size:1.8rem;font-weight:bold;color:#5b21b6;">{peak_yr}</div><small class="text-muted">Peak Year</small></div></div>
-    <div class="col-md-3"><div class="p-3 rounded" style="background:#faf5ff;">
-      <div style="font-size:1.8rem;font-weight:bold;color:#5b21b6;">{low_yr}</div><small class="text-muted">Lowest Year</small></div></div>
+    <div class="col-md-3"><div class="p-3 rounded" style="background: #f3f4f6;">
+      <div style="font-size:1.8rem;font-weight:bold;color: #1f2937;">{net_pct:+.1f}%</div><small class="text-muted">Net Change</small></div></div>
+    <div class="col-md-3"><div class="p-3 rounded" style="background: #f3f4f6;">
+      <div style="font-size:1.8rem;font-weight:bold;color: #1f2937;">{peak_yr}</div><small class="text-muted">Peak Year</small></div></div>
+    <div class="col-md-3"><div class="p-3 rounded" style="background: #f3f4f6;">
+      <div style="font-size:1.8rem;font-weight:bold;color: #1f2937;">{low_yr}</div><small class="text-muted">Lowest Year</small></div></div>
   </div>
 </div>"""
 
@@ -1898,13 +2984,13 @@ def _build_pattern_results(data, crime_type, state, district):
         pct      = sp.get('change_pct', 0)
         prev_val = sp.get('prev_value', 0)
         cur_val  = sp.get('value', 0)
-        icon = '🔺' if ev_type == 'spike' else '🔻'
-        col  = '#ec4899' if ev_type == 'spike' else '#8b5cf6'
-        spike_items += f'<div class="d-flex align-items-center mb-2 p-2 rounded" style="background:#fff0f6;border-left:4px solid {col};">{icon} <b class="ms-2">{yr}</b>: {ev_type.capitalize()} of <b>{pct:+.1f}%</b> &nbsp;<span class="text-muted">({int(prev_val):,} → {int(cur_val):,} cases)</span></div>'
+        tag  = '[Spike]' if ev_type == 'spike' else '[Drop]'
+        col  = '#991b1b' if ev_type == 'spike' else '#374151'
+        spike_items += f'<div class="d-flex align-items-center mb-2 p-2 rounded" style="background: #f9fafb; border-left: 4px solid {col};"><span class="badge bg-secondary me-2">{tag}</span> <b class="ms-1">{yr}</b>: {ev_type.capitalize()} of <b>{pct:+.1f}%</b> &nbsp;<span class="text-muted">({int(prev_val):,} → {int(cur_val):,} cases)</span></div>'
 
     spikes_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#5b21b6;">⚡ Anomaly & Spike Detection</h5>
+  <h5 style="color: #1f2937;">Anomaly &amp; Spike Detection</h5>
   {''.join([spike_items]) if spikes else '<p class="text-muted">No significant anomalies detected in the selected range.</p>'}
 </div>"""
 
@@ -1915,7 +3001,7 @@ def _build_pattern_results(data, crime_type, state, district):
 
     # Pick top 3 similar for overlay
     top3_datasets = ''
-    palette = ['#ec4899', '#f59e0b', '#10b981']
+    palette = ['#D6cfc4', '#d97706', '#2d6a4f']
     for idx, sim in enumerate(similar[:3]):
         loc_name = sim.get('location', '')
         s_data   = comp_ser.get(loc_name, {})
@@ -1934,7 +3020,7 @@ def _build_pattern_results(data, crime_type, state, district):
 
     trend_chart_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#5b21b6;">📊 Yearly Crime Trend Chart</h5>
+  <h5 style="color: #1f2937;">Yearly Crime Trend Chart</h5>
   <canvas id="trendChart" height="100"></canvas>
 </div>
 <script>
@@ -1946,8 +3032,8 @@ new Chart(document.getElementById('trendChart'), {{
       {{
         label: '{escape(location_label)}',
         data: {target_js},
-        borderColor: '#8b5cf6',
-        backgroundColor: 'rgba(139,92,246,0.08)',
+        borderColor: '#374151',
+        backgroundColor: 'rgba(55,65,81,0.08)',
         borderWidth: 2.5,
         fill: true,
         pointRadius: 4
@@ -1975,25 +3061,25 @@ new Chart(document.getElementById('trendChart'), {{
         score    = sim.get('score_pct', 0)
         pattern  = sim.get('pattern', 'N/A')
         bar_w    = int(score)
-        bar_col  = '#2d6a4f' if score >= 75 else ('#f59e0b' if score >= 50 else '#ec4899')
-        medal    = ['🥇', '🥈', '🥉'][rank - 1] if rank <= 3 else str(rank)
+        bar_col  = '#2d6a4f' if score >= 75 else ('#d97706' if score >= 50 else '#4b5563')
+        rank_badge = f'#{rank}'
         sim_rows += f"""
 <tr>
-  <td class="text-center">{medal}</td>
+  <td class="text-center fw-bold">{rank_badge}</td>
   <td><b>{escape(loc)}</b></td>
   <td>
-    <div style="background:#ede9fe;border-radius:4px;height:14px;width:100%;">
-      <div style="background:{bar_col};width:{bar_w}%;height:14px;border-radius:4px;"></div>
+    <div style="background: #e5e7eb; border-radius: 4px; height: 14px; width: 100%;">
+      <div style="background:{bar_col}; width:{bar_w}%; height: 14px; border-radius: 4px;"></div>
     </div>
     <small>{score:.1f}%</small>
   </td>
-  <td><span class="badge" style="background:#8b5cf6;">{escape(pattern)}</span></td>
+  <td><span class="badge bg-secondary">{escape(pattern)}</span></td>
 </tr>"""
 
     # Similarity bar chart (top 8)
     sim_labels = str([s.get('location','') for s in similar[:8]])
     sim_scores = str([round(s.get('score_pct', 0), 1) for s in similar[:8]])
-    sim_colors_js = str(['#2d6a4f' if s.get('score_pct',0)>=75 else ('#f59e0b' if s.get('score_pct',0)>=50 else '#ec4899') for s in similar[:8]])
+    sim_colors_js = str(['#2d6a4f' if s.get('score_pct',0)>=75 else ('#d97706' if s.get('score_pct',0)>=50 else '#4b5563') for s in similar[:8]])
 
     if sim_rows:
         sim_table_content = f'''<table class="table table-hover"><thead><tr><th>#</th><th>Region</th><th style="width:30%">Similarity Score</th><th>Pattern</th></tr></thead><tbody>{sim_rows}</tbody></table>'''
@@ -2006,7 +3092,7 @@ new Chart(document.getElementById('trendChart'), {{
 
     similarity_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#5b21b6;">🔁 Similarity Rankings (Pearson Correlation)</h5>
+  <h5 style="color: #1f2937;">Similarity Rankings (Pearson Correlation)</h5>
   <p class="text-muted small">Regions with the most similar crime trend <i>shapes</i> to {escape(location_label)}. Score = correlation mapped 0–100%.</p>
   {sim_table_content}
   {sim_chart_content}
@@ -2016,18 +3102,18 @@ new Chart(document.getElementById('trendChart'), {{
     # ── Cluster Cards ───────────────────────────────────────────────────────
     cluster_cards = ''
     cluster_meta = [
-        ('high_volume_high_growth',   'High Volume + High Growth',   '🔴', '#fee2e2', '#dc2626'),
-        ('high_volume_low_growth',    'High Volume + Stable/Slow',   '🟠', '#fff7ed', '#ea580c'),
-        ('low_volume_high_growth',    'Low Volume + High Growth',    '🟡', '#fefce8', '#ca8a04'),
-        ('low_volume_low_growth',     'Low Volume + Low Activity',   '🟢', '#f0fdf4', '#16a34a'),
+        ('high_volume_high_growth',   'High Volume + High Growth',   '#991b1b', '#fee2e2'),
+        ('high_volume_low_growth',    'High Volume + Stable/Slow',   '#ea580c', '#fff7ed'),
+        ('low_volume_high_growth',    'Low Volume + High Growth',    '#ca8a04', '#fefce8'),
+        ('low_volume_low_growth',     'Low Volume + Low Activity',   '#16a34a', '#f0fdf4'),
     ]
-    for key, label, icon, bg, border in cluster_meta:
+    for key, label, border, bg in cluster_meta:
         members = clusters.get(key, [])
         badges  = ' '.join(f'<span class="badge me-1" style="background:{border};font-size:0.75rem;">{escape(m)}</span>' for m in members)
         cluster_cards += f"""
 <div class="col-md-6 mb-3">
-  <div class="card h-100 p-3" style="border-left:4px solid {border};background:{bg};">
-    <h6 style="color:{border};">{icon} {label}</h6>
+  <div class="card h-100 p-3" style="border-left: 4px solid {border}; background: {bg};">
+    <h6 style="color:{border};">{label}</h6>
     <p class="text-muted small mb-2">{len(members)} region(s)</p>
     <div>{badges if badges else '<span class="text-muted small">No regions in this cluster</span>'}</div>
   </div>
@@ -2035,29 +3121,29 @@ new Chart(document.getElementById('trendChart'), {{
 
     clusters_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#5b21b6;">🗺️ Crime Clusters — {escape(crime_type)}</h5>
+  <h5 style="color: #1f2937;">Crime Clusters — {escape(crime_type)}</h5>
   <p class="text-muted small">Regions grouped by crime volume &amp; growth trend across the selected period.</p>
   <div class="row">{cluster_cards}</div>
 </div>"""
 
     # ── AI Insights ─────────────────────────────────────────────────────────
     insight_type_style = {
-        'warning':  ('⚠️', '#fef9c3', '#ca8a04'),
-        'danger':   ('🚨', '#fee2e2', '#dc2626'),
-        'success':  ('✅', '#f0fdf4', '#16a34a'),
-        'info':     ('💡', '#eff6ff', '#2563eb'),
-        'primary':  ('📌', '#f5f3ff', '#7c3aed'),
+        'warning':  ('#fef9c3', '#ca8a04', '[Warning]'),
+        'danger':   ('#fee2e2', '#dc2626', '[Alert]'),
+        'success':  ('#f0fdf4', '#16a34a', '[Resolved]'),
+        'info':     ('#eff6ff', '#2563eb', '[Insight]'),
+        'primary':  ('#f9fafb', '#374151', '[Key]'),
     }
     insight_items = ''
     for ins in insights:
         itype = ins.get('type', 'info')
         itext = ins.get('text', '')
-        icon_d, bg_d, col_d = insight_type_style.get(itype, ('💡', '#eff6ff', '#2563eb'))
-        insight_items += f'<div class="d-flex align-items-start mb-3 p-3 rounded" style="background:{bg_d};border-left:4px solid {col_d};">{icon_d}<span class="ms-2">{escape(itext)}</span></div>'
+        bg_d, col_d, tag = insight_type_style.get(itype, ('#eff6ff', '#2563eb', '[Insight]'))
+        insight_items += f'<div class="d-flex align-items-start mb-3 p-3 rounded" style="background:{bg_d};border-left:4px solid {col_d};"><span class="badge bg-secondary me-2">{tag}</span><span class="ms-1">{escape(itext)}</span></div>'
 
     insights_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#5b21b6;">🤖 AI Insights</h5>
+  <h5 style="color: #1f2937;">AI Insights</h5>
   {insight_items if insight_items else '<p class="text-muted">No insights generated.</p>'}
 </div>"""
 
