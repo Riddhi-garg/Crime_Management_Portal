@@ -153,17 +153,17 @@ def analyze_trend(series: Dict[int, int]) -> Dict[str, Any]:
     if rel_slope_pct > 2.0 or (net_change_pct >= 20.0 and rel_slope_pct > 0):
         direction = "Increasing"
         badge_color = "danger"
-        icon = "📈"
+        icon = ""
         description = f"Cases demonstrate an overall increasing trajectory with an annualized trend slope of +{rel_slope_pct:.1f}%."
     elif rel_slope_pct < -2.0 or (net_change_pct <= -20.0 and rel_slope_pct < 0):
         direction = "Decreasing"
         badge_color = "success"
-        icon = "📉"
+        icon = ""
         description = f"Cases demonstrate a clear downward trend with a reduction slope of {rel_slope_pct:.1f}% per year."
     else:
         direction = "Stable"
         badge_color = "info"
-        icon = "➡️"
+        icon = ""
         description = "Cases remained relatively stable over the selected period with minimal secular drift."
 
     return {
@@ -212,7 +212,7 @@ def detect_spikes(
                     "delta_cases": delta_cases,
                     "curr_val": curr_val,
                     "prev_val": prev_val,
-                    "headline": f"⚠️ Sudden Emergence in {curr_yr}",
+                    "headline": f"Sudden Emergence in {curr_yr}",
                     "detail": f"Jumped from 0 to {curr_val:,} cases (+{delta_cases:,} cases)."
                 })
             continue
@@ -229,7 +229,7 @@ def detect_spikes(
                 "delta_cases": delta_cases,
                 "curr_val": curr_val,
                 "prev_val": prev_val,
-                "headline": f"⚠️ Unusual Crime Spike in {curr_yr}",
+                "headline": f"Unusual Crime Spike in {curr_yr}",
                 "detail": f"Increased by +{pct_change:.1f}% compared to {prev_yr} (+{delta_cases:,} cases)."
             })
         elif pct_change <= -threshold_pct and abs(delta_cases) >= min_delta_cases:
@@ -242,7 +242,7 @@ def detect_spikes(
                 "delta_cases": delta_cases,
                 "curr_val": curr_val,
                 "prev_val": prev_val,
-                "headline": f"📉 Significant Crime Reduction in {curr_yr}",
+                "headline": f"Significant Crime Reduction in {curr_yr}",
                 "detail": f"Dropped by {abs(pct_change):.1f}% compared to {prev_yr} ({delta_cases:,} cases)."
             })
 
@@ -445,25 +445,25 @@ def detect_crime_clusters(
 
     return {
         "Cluster 1: High Volume & Surging Growth": {
-            "icon": "🔴",
+            "icon": "",
             "badge": "danger",
             "description": "High case volume experiencing rapid multi-year escalation.",
             "members": sorted(cluster_1)
         },
         "Cluster 2: High Volume & Stabilized / Declining": {
-            "icon": "🟢",
+            "icon": "",
             "badge": "success",
             "description": "High case volume areas that have achieved downward or controlled trends.",
             "members": sorted(cluster_2)
         },
         "Cluster 3: Moderate Volume & Stable Pattern": {
-            "icon": "🟣",
+            "icon": "",
             "badge": "primary",
             "description": "Moderate crime presence with predictable, low-volatility historical lines.",
             "members": sorted(cluster_3)
         },
         "Cluster 4: Low Volume with Volatile Spikes": {
-            "icon": "🟠",
+            "icon": "",
             "badge": "warning",
             "description": "Lower overall case numbers marked by sudden, sporadic surge spikes.",
             "members": sorted(cluster_4)
@@ -493,7 +493,7 @@ def generate_ai_insights(
     sign = "+" if net_pct > 0 else ""
     insights.append({
         "type": "Trend Overview",
-        "icon": trend.get("icon", "📈"),
+        "icon": "",
         "text": (
             f"Between {start_year} and {end_year}, {crime_type} in {location_name} exhibited an "
             f"overall {direction.lower()} pattern with a net shift of {sign}{net_pct}%."
@@ -508,7 +508,7 @@ def generate_ai_insights(
     if peak_yr and low_yr:
         insights.append({
             "type": "Historical Extremes",
-            "icon": "🎯",
+            "icon": "",
             "text": (
                 f"Peak incidence was recorded in {peak_yr} with {peak_val:,} cases, "
                 f"while the lowest registered mark was {low_val:,} cases in {low_yr}."
@@ -523,7 +523,7 @@ def generate_ai_insights(
         desc = top_twin["pattern"]
         insights.append({
             "type": "Pattern Similarity",
-            "icon": "🔗",
+            "icon": "",
             "text": (
                 f"{location_name} shares its closest mathematical crime pattern with {loc} "
                 f"({score}% similarity score) — {desc.lower()}."
@@ -533,7 +533,7 @@ def generate_ai_insights(
             runner_ups = f"{similarities[1]['location']} ({similarities[1]['score']}%) and {similarities[2]['location']} ({similarities[2]['score']}%)"
             insights.append({
                 "type": "Secondary Correlates",
-                "icon": "👥",
+                "icon": "",
                 "text": f"Secondary behavioral correlates also include {runner_ups}."
             })
 
@@ -542,7 +542,7 @@ def generate_ai_insights(
         top_spike = spikes[0]
         insights.append({
             "type": "Spike Alert",
-            "icon": "⚠️",
+            "icon": "",
             "text": (
                 f"Notable anomaly detected in {top_spike['year']}: "
                 f"Cases jumped by {top_spike['pct_change']}% compared to {top_spike['prev_year']} "
@@ -552,7 +552,7 @@ def generate_ai_insights(
     else:
         insights.append({
             "type": "Stability Indicator",
-            "icon": "🛡️",
+            "icon": "",
             "text": "No extreme single-year volatility spikes exceeding 20% were observed across the selected period."
         })
 
@@ -567,7 +567,7 @@ def generate_ai_insights(
     if matched_cluster:
         insights.append({
             "type": "Cluster Placement",
-            "icon": "🏷️",
+            "icon": "",
             "text": f"{location_name} is statistically classified into '{matched_cluster}' based on historical magnitude and growth trajectory."
         })
 

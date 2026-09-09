@@ -365,7 +365,7 @@ HTML_NAVBAR = """
 <nav class="navbar navbar-expand-lg sticky-top shadow-sm" style="background-color: #374151; border-bottom: 2px solid #D6cfc4;">
   <div class="container-fluid px-4">
     <a class="navbar-brand d-flex align-items-center gap-2 fw-bold" href="/" style="color: #ffffff; font-family: 'Times New Roman', Times, serif; font-size: 1.2rem;">
-      <span class="fs-4">🛡️</span> CRIME MANAGEMENT PORTAL
+      CRIME MANAGEMENT PORTAL
     </a>
     <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav" style="border-color: #D6cfc4;">
       <span class="navbar-toggler-icon"></span>
@@ -382,7 +382,7 @@ HTML_NAVBAR = """
         <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Management</a></li>
         <li class="nav-item"><a class="nav-link" href="/criminal-records" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Criminal Records</a></li>
         <li class="nav-item"><a class="nav-link" href="/case-files" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Case Files</a></li>
-        <li class="nav-item"><a class="nav-link" href="/crime-patterns" style="color: #D6cfc4; font-weight: bold; font-family: 'Times New Roman', Times, serif;">🔗 Pattern Detector</a></li>
+        <li class="nav-item"><a class="nav-link" href="/crime-patterns" style="color: #D6cfc4; font-weight: bold; font-family: 'Times New Roman', Times, serif;">Pattern Detector</a></li>
       </ul>
       <span class="badge p-2 fw-bold" style="background-color: #D6cfc4; color: #1f2937; font-family: 'Times New Roman', Times, serif;">NCRB / Kaggle Dataset</span>
     </div>
@@ -530,9 +530,9 @@ def dashboard():
                 <h1 class="display-6 fw-bold" style="color: #1f2937;">National Crime Management Portal</h1>
                 <p class="lead mb-3" style="color: #374151;">Live Dynamic Insights from 35+ Million Real NCRB Recorded Crime Cases</p>
                 <div class="d-flex justify-content-center gap-3">
-                    <a href="/crime-statistics" class="btn btn-warning fw-bold px-4 shadow-sm">🔍 Search Crime Records</a>
-                    <a href="/analytics" class="btn btn-primary fw-bold px-4 shadow-sm">📊 Interactive Visual Analytics</a>
-                    <a href="/women-children-analytics" class="btn btn-outline-primary fw-bold px-4 shadow-sm" style="background-color: #ffffff;">👧 Women & Children Reports</a>
+                    <a href="/crime-statistics" class="btn btn-warning fw-bold px-4 shadow-sm">Search Crime Records</a>
+                    <a href="/analytics" class="btn btn-primary fw-bold px-4 shadow-sm">Interactive Visual Analytics</a>
+                    <a href="/women-children-analytics" class="btn btn-outline-primary fw-bold px-4 shadow-sm" style="background-color: #ffffff;">Women & Children Reports</a>
                 </div>
             </div>
         </div>
@@ -572,7 +572,7 @@ def dashboard():
     <div class="row g-4">
         <div class="col-12">
             <div class="card p-4">
-                <h5 class="text-warning mb-3">📌 Key Dataset Highlights</h5>
+                <h5 class="text-warning mb-3">Key Dataset Highlights</h5>
                 <ul class="list-group list-group-flush bg-transparent">
                     <li class="list-group-item bg-transparent border-secondary d-flex justify-content-between" style="color: #1a1a1a;">
                         <span>Most Common Crime Category:</span>
@@ -676,7 +676,7 @@ def crime_statistics():
         rows_html = """
         <tr>
             <td colspan="6" class="text-center py-5 text-muted fs-5">
-                ⚠️ No records found for the selected filters. Please adjust your search criteria.
+                No records found for the selected filters. Please adjust your search criteria.
             </td>
         </tr>
         """
@@ -691,7 +691,7 @@ def crime_statistics():
 
     body = f"""
     <div class="d-flex justify-content-between align-items-center mb-4">
-        <h2 class="m-0" style="color: #1f2937;">🔍 Kaggle/NCRB Crime Statistics Explorer</h2>
+        <h2 class="m-0" style="color: #1f2937;">Kaggle/NCRB Crime Statistics Explorer</h2>
         <span class="badge p-2 fw-bold" style="background-color: #D6cfc4; color: #1f2937;">Data Source: Kaggle / NCRB Dataset</span>
     </div>
 
@@ -812,20 +812,20 @@ def analytics():
 
     body = f"""
     <div class="d-flex justify-content-between align-items-center mb-4">
-        <h2 class="text-info m-0">📊 Interactive Crime Analytics & Trends</h2>
+        <h2 class="text-info m-0">Interactive Crime Analytics & Trends</h2>
         <span class="source-badge">Data Source: Kaggle / NCRB Dataset</span>
     </div>
 
     <div class="row g-4 mb-4">
         <div class="col-md-8">
             <div class="card p-4">
-                <h5 class="text-warning mb-3">📈 National Crime Trend Over Years (2001 - 2014)</h5>
+                <h5 class="text-warning mb-3">National Crime Trend Over Years (2001 - 2014)</h5>
                 <canvas id="yearlyTrendChart" height="140"></canvas>
             </div>
         </div>
         <div class="col-md-4">
             <div class="card p-4">
-                <h5 class="text-danger mb-3">🧩 Top Crime Categories</h5>
+                <h5 class="text-danger mb-3">Top Crime Categories</h5>
                 <canvas id="categoryPieChart" height="280"></canvas>
             </div>
         </div>
@@ -834,7 +834,7 @@ def analytics():
     <div class="row g-4">
         <div class="col-md-12">
             <div class="card p-4">
-                <h5 class="text-success mb-3">🏛️ Top 10 States by Total Recorded Crimes</h5>
+                <h5 class="text-success mb-3">Top 10 States by Total Recorded Crimes</h5>
                 <canvas id="stateBarChart" height="100"></canvas>
             </div>
         </div>
@@ -931,11 +931,11 @@ def women_children_analytics():
     child_rows = "".join([f"<tr><td>{c['crime_type']}</td><td class='fw-bold text-warning'>{c['total']:,}</td></tr>" for c in child_cats])
 
     body = f"""
-    <h2 class="text-danger mb-4">👧 Crimes Against Women & Children Statistics</h2>
+    <h2 class="text-danger mb-4">Crimes Against Women & Children Statistics</h2>
     <div class="row g-4">
         <div class="col-md-6">
             <div class="card p-4">
-                <h4 class="text-danger mb-3">👩 Crimes Against Women (Category Breakdown)</h4>
+                <h4 class="text-danger mb-3">Crimes Against Women (Category Breakdown)</h4>
                 <div class="table-responsive">
                     <table class="table table-dark table-hover align-middle">
                         <thead><tr><th>Category</th><th>Total Reported Cases</th></tr></thead>
@@ -946,7 +946,7 @@ def women_children_analytics():
         </div>
         <div class="col-md-6">
             <div class="card p-4">
-                <h4 class="text-warning mb-3">👶 Crimes Against Children (Category Breakdown)</h4>
+                <h4 class="text-warning mb-3">Crimes Against Children (Category Breakdown)</h4>
                 <div class="table-responsive">
                     <table class="table table-dark table-hover align-middle">
                         <thead><tr><th>Category</th><th>Total Reported Cases</th></tr></thead>
@@ -992,13 +992,13 @@ def property_arrest_analytics():
 
     body = f"""
     <div class="d-flex justify-content-between align-items-center mb-4">
-        <h2 class="text-info m-0">💰 Property Crimes & Police Arrest Statistics</h2>
+        <h2 class="text-info m-0">Property Crimes & Police Arrest Statistics</h2>
         <span class="source-badge">Data Source: Kaggle / NCRB Dataset</span>
     </div>
     <div class="row g-4 mb-4">
         <div class="col-md-6">
             <div class="card p-4 h-100">
-                <h4 class="text-warning mb-3">🏡 Stolen vs Recovered Property (Top States)</h4>
+                <h4 class="text-warning mb-3">Stolen vs Recovered Property (Top States)</h4>
                 <div class="table-responsive">
                     <table class="table table-hover align-middle">
                         <thead><tr><th>State / UT</th><th>Stolen Cases</th><th>Recovered Cases</th></tr></thead>
@@ -1009,7 +1009,7 @@ def property_arrest_analytics():
         </div>
         <div class="col-md-6">
             <div class="card p-4 h-100">
-                <h4 class="text-info mb-3">🏆 Top States by Recovered Property</h4>
+                <h4 class="text-info mb-3">Top States by Recovered Property</h4>
                 <div class="table-responsive">
                     <table class="table table-hover align-middle">
                         <thead><tr><th>State / UT</th><th>Recovered Cases</th></tr></thead>
@@ -1022,7 +1022,7 @@ def property_arrest_analytics():
     <div class="row g-4">
         <div class="col-12">
             <div class="card p-4">
-                <h4 class="text-info mb-3">⚖️ Arrests, Convictions & Acquittals</h4>
+                <h4 class="text-info mb-3">Arrests, Convictions & Acquittals</h4>
                 <div class="table-responsive">
                     <table class="table table-hover align-middle">
                         <thead><tr><th>Crime Head</th><th>Arrested</th><th>Convicted</th><th>Acquitted</th></tr></thead>
@@ -1216,7 +1216,7 @@ def police_stations():
     """ for station in geojson_stations[:100]]) or "<tr><td colspan='4' class='text-center text-muted py-4'>Police station GeoJSON not available.</td></tr>"
 
     body = f"""
-    <h2 class="text-warning mb-3">🏢 Police Stations & Officer Directory</h2>
+    <h2 class="text-warning mb-3">Police Stations & Officer Directory</h2>
     <div class="card p-4 mb-4">
         <div class="d-flex justify-content-between align-items-center mb-3">
             <div><h4 class="text-info m-0">Police Station Reference Data</h4>
@@ -1339,7 +1339,7 @@ def fir_management():
     category_options = "".join(f'<option value="{c["crime_type"]}">' for c in crime_categories)
 
     body = f"""
-    <h2 class="text-warning mb-3">📄 FIR (First Information Report) Registry</h2>
+    <h2 class="text-warning mb-3">FIR (First Information Report) Registry</h2>
     <div class="card p-4 mb-4">
         <div class="table-responsive">
             <table class="table table-dark table-hover align-middle">
@@ -1427,7 +1427,7 @@ def criminal_records():
     arrest_rows = "".join(f"<tr><td>{a['crime_head']}</td><td>{a['arrested']:,}</td><td>{a['convicted']:,}</td></tr>" for a in arrest_context) or "<tr><td colspan='3' class='text-center text-muted'>Run the dataset import to show arrest context.</td></tr>"
 
     body = f"""
-    <h2 class="text-danger mb-3">👤 Criminal Record Dossiers</h2>
+    <h2 class="text-danger mb-3">Criminal Record Dossiers</h2>
     <div class="card p-4 mb-4">
         <div class="table-responsive">
             <table class="table table-dark table-hover align-middle">
@@ -1492,7 +1492,7 @@ def case_files():
     officer_options = "".join(f'<option value="{o["officer_id"]}">{o["name"]} ({o["rank"]})</option>' for o in officers) or '<option value="">Unassigned</option>'
 
     body = f"""
-    <h2 class="text-info mb-3">⚖️ Active & Closed Case Files</h2>
+    <h2 class="text-info mb-3">Active & Closed Case Files</h2>
     <div class="card p-4 mb-4">
         <div class="table-responsive">
             <table class="table table-dark table-hover align-middle">
@@ -1625,7 +1625,7 @@ def crime_patterns():
 <div class="container-fluid py-4">
   <div class="row mb-4">
     <div class="col-12">
-      <h2 style="color:#1f2937;">🔗 AI-Powered Crime Pattern &amp; Similarity Detector</h2>
+      <h2 style="color:#1f2937;">AI-Powered Crime Pattern &amp; Similarity Detector</h2>
       <p class="text-muted">Analyze historical crime trends, detect anomalies, find similar crime patterns across regions, and identify clusters — powered by real NCRB/Kaggle data (2001–2013).</p>
     </div>
   </div>
@@ -1655,7 +1655,7 @@ def crime_patterns():
           <select class="form-select" name="end_year">{year_opts_e}</select>
         </div>
         <div class="col-md-2">
-          <button type="submit" class="btn w-100 fw-bold" style="background:#4b5563;color:#fff;">🔍 Analyze</button>
+          <button type="submit" class="btn w-100 fw-bold" style="background:#4b5563;color:#fff;">Analyze</button>
         </div>
       </div>
     </form>
@@ -1689,7 +1689,7 @@ function loadDistricts() {{
 def _build_pattern_results(data, crime_type, state, district):
     """Build the HTML results section from run_full_analysis() output."""
     if data.get('error'):
-        return f'<div class="alert alert-warning mt-3">⚠️ {escape(data["error"])}</div>'
+        return f'<div class="alert alert-warning mt-3">{escape(data["error"])}</div>'
 
     trend    = data.get('trend', {})
     spikes   = data.get('spikes', [])
@@ -1713,7 +1713,7 @@ def _build_pattern_results(data, crime_type, state, district):
 
     trend_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#1f2937;">📈 Trend Analysis — {escape(crime_type)} in {escape(location_label)}</h5>
+  <h5 style="color:#1f2937;">Trend Analysis — {escape(crime_type)} in {escape(location_label)}</h5>
   <div class="row text-center mt-3">
     <div class="col-md-3"><div class="p-3 rounded" style="background:#f9fafb;border:1px solid #e5e7eb;">
       <div style="font-size:1.8rem;">{trend_badge}</div><small class="text-muted">Overall Trend</small></div></div>
@@ -1737,7 +1737,7 @@ def _build_pattern_results(data, crime_type, state, district):
 
     spikes_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#1f2937;">⚡ Anomaly &amp; Spike Detection</h5>
+  <h5 style="color:#1f2937;">Anomaly &amp; Spike Detection</h5>
   {''.join([spike_items]) if spikes else '<p class="text-muted">No significant volatility spikes detected across the selected period.</p>'}
 </div>"""
 
@@ -1766,7 +1766,7 @@ def _build_pattern_results(data, crime_type, state, district):
 
     trend_chart_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#1f2937;">📊 Yearly Crime Trend Chart</h5>
+  <h5 style="color:#1f2937;">Yearly Crime Trend Chart</h5>
   <canvas id="trendChart" height="100"></canvas>
 </div>
 <script>
@@ -1808,7 +1808,7 @@ new Chart(document.getElementById('trendChart'), {{
         pattern  = sim.get('pattern', 'N/A')
         bar_w    = min(100, max(0, int(score)))
         bar_col  = '#2d6a4f' if score >= 85 else ('#b8860b' if score >= 70 else '#6b7280')
-        medal    = ['🥇', '🥈', '🥉'][rank - 1] if rank <= 3 else str(rank)
+        medal    = str(rank)
         sim_rows += f"""
 <tr>
   <td class="text-center">{medal}</td>
@@ -1838,7 +1838,7 @@ new Chart(document.getElementById('trendChart'), {{
 
     similarity_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#1f2937;">🔁 Similarity Rankings (Pearson Correlation)</h5>
+  <h5 style="color:#1f2937;">Similarity Rankings (Pearson Correlation)</h5>
   <p class="text-muted small">Regions with the most similar crime trend <i>shapes</i> to {escape(location_label)}. Score = correlation mapped 0–100%.</p>
   {sim_table_content}
   {sim_chart_content}
@@ -1848,20 +1848,20 @@ new Chart(document.getElementById('trendChart'), {{
     # ── Cluster Cards ───────────────────────────────────────────────────────
     cluster_cards = ''
     cluster_theme = {
-        'Cluster 1: High Volume & Surging Growth': ('🔴', '#fee2e2', '#dc2626'),
-        'Cluster 2: High Volume & Stabilized / Declining': ('🟢', '#f0fdf4', '#16a34a'),
-        'Cluster 3: Moderate Volume & Stable Pattern': ('⚪', '#f3f4f6', '#4b5563'),
-        'Cluster 4: Low Volume with Volatile Spikes': ('🟠', '#fff7ed', '#ea580c'),
+        'Cluster 1: High Volume & Surging Growth': ('#fee2e2', '#dc2626'),
+        'Cluster 2: High Volume & Stabilized / Declining': ('#f0fdf4', '#16a34a'),
+        'Cluster 3: Moderate Volume & Stable Pattern': ('#f3f4f6', '#4b5563'),
+        'Cluster 4: Low Volume with Volatile Spikes': ('#fff7ed', '#ea580c'),
     }
     for c_title, c_info in clusters.items():
-        icon, bg, border = cluster_theme.get(c_title, (c_info.get('icon', '📌'), '#f3f4f6', '#4b5563'))
+        bg, border = cluster_theme.get(c_title, ('#f3f4f6', '#4b5563'))
         members = c_info.get('members', [])
         desc    = c_info.get('description', '')
         badges  = ' '.join(f'<span class="badge me-1 mb-1" style="background:{border};font-size:0.75rem;">{escape(m)}</span>' for m in members)
         cluster_cards += f"""
 <div class="col-md-6 mb-3">
   <div class="card h-100 p-3" style="border-left:4px solid {border};background:{bg};">
-    <h6 style="color:{border};">{icon} {escape(c_title)}</h6>
+    <h6 style="color:{border};font-weight:bold;">{escape(c_title)}</h6>
     <p class="text-muted small mb-2">{escape(desc)} — <b>{len(members)} region(s)</b></p>
     <div>{badges if badges else '<span class="text-muted small">No regions in this cluster</span>'}</div>
   </div>
@@ -1870,7 +1870,7 @@ new Chart(document.getElementById('trendChart'), {{
     cluster_display = cluster_cards if cluster_cards else '<p class="text-muted">No cluster data available.</p>'
     clusters_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#1f2937;">🗺️ Crime Clusters — {escape(crime_type)}</h5>
+  <h5 style="color:#1f2937;">Crime Clusters — {escape(crime_type)}</h5>
   <p class="text-muted small">Regions grouped by crime volume &amp; growth trend across the selected period.</p>
   <div class="row">{cluster_display}</div>
 </div>"""
@@ -1879,13 +1879,12 @@ new Chart(document.getElementById('trendChart'), {{
     insight_items = ''
     for ins in insights:
         itype  = ins.get('type', 'Insight')
-        icon_d = ins.get('icon', '💡')
         itext  = ins.get('text', '')
-        insight_items += f'<div class="d-flex align-items-start mb-3 p-3 rounded" style="background:#f9fafb;border-left:4px solid #4b5563;"><span class="fs-5">{icon_d}</span><div class="ms-3"><b style="color:#1f2937;">{escape(itype)}:</b> <span class="text-secondary">{escape(itext)}</span></div></div>'
+        insight_items += f'<div class="d-flex align-items-start mb-3 p-3 rounded" style="background:#f9fafb;border-left:4px solid #4b5563;"><div class="ms-1"><b style="color:#1f2937;">{escape(itype)}:</b> <span class="text-secondary">{escape(itext)}</span></div></div>'
 
     insights_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#1f2937;">🤖 AI Insights</h5>
+  <h5 style="color:#1f2937;">AI Insights</h5>
   {insight_items if insight_items else '<p class="text-muted">No insights generated.</p>'}
 </div>"""
 
