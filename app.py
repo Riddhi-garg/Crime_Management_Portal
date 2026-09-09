@@ -362,7 +362,7 @@ def init_db():
 
 # Base Layout & Navigation Bar
 HTML_NAVBAR = """
-<nav class="navbar navbar-expand-lg sticky-top shadow-sm" style="background-color: #8b5cf6; border-bottom: 2px solid #ec4899;">
+<nav class="navbar navbar-expand-lg sticky-top shadow-sm" style="background-color: #374151; border-bottom: 2px solid #ec4899;">
   <div class="container-fluid px-4">
     <a class="navbar-brand d-flex align-items-center gap-2 fw-bold" href="/" style="color: #ffffff; font-family: 'Times New Roman', Times, serif; font-size: 1.2rem;">
       <span class="fs-4">🛡️</span> CRIME MANAGEMENT PORTAL
@@ -402,28 +402,28 @@ HTML_LAYOUT = """
     <style>
         * { font-family: 'Times New Roman', Times, serif !important; }
         body { background-color: #ffffff; color: #1a1a1a; }
-        h1, h2, h3, h4, h5, h6 { color: #5b21b6; }
+        h1, h2, h3, h4, h5, h6 { color: #1f2937; }
         .card { background-color: #f8f9fa; border: 1px solid #dee2e6; color: #1a1a1a; border-radius: 10px; box-shadow: 0 2px 6px rgba(0,0,0,0.08); }
         .table { color: #1a1a1a; }
-        .table thead th { background-color: #ede9fe; color: #4c1d95; border-bottom: 2px solid #8b5cf6; }
+        .table thead th { background-color: #f3f4f6; color: #1f2937; border-bottom: 2px solid #9ca3af; }
         .table tbody tr:hover { background-color: #fdf2f8; }
         .table-dark { background-color: #f8f9fa !important; color: #1a1a1a !important; border-color: #dee2e6 !important; }
         .table-dark td, .table-dark th { background-color: transparent !important; color: #1a1a1a !important; }
         .nav-link:hover { color: #fce7f3 !important; }
-        .stats-card { background: linear-gradient(135deg, #faf5ff 0%, #f3e8ff 100%); border-left: 4px solid #8b5cf6; }
-        .source-badge { font-size: 0.8rem; background: #8b5cf6; color: #ffffff; border-radius: 20px; padding: 4px 12px; }
+        .stats-card { background: linear-gradient(135deg, #f9fafb 0%, #f3f4f6 100%); border-left: 4px solid #4b5563; }
+        .source-badge { font-size: 0.8rem; background: #4b5563; color: #ffffff; border-radius: 20px; padding: 4px 12px; }
         .form-select, .form-control { background-color: #ffffff; color: #1a1a1a; border: 1px solid #adb5bd; }
-        .form-select:focus, .form-control:focus { background-color: #ffffff; color: #1a1a1a; border-color: #8b5cf6; box-shadow: 0 0 0 2px rgba(139,92,246,0.2); }
+        .form-select:focus, .form-control:focus { background-color: #ffffff; color: #1a1a1a; border-color: #4b5563; box-shadow: 0 0 0 2px rgba(75,85,99,0.2); }
         .btn-outline-warning { border-color: #ec4899; color: #ec4899; }
         .btn-outline-warning:hover { background-color: #ec4899; color: #ffffff; }
         .badge.bg-secondary { background-color: #6c757d !important; color: #ffffff !important; }
-        .badge.bg-info { background-color: #8b5cf6 !important; color: #ffffff !important; }
+        .badge.bg-info { background-color: #4b5563 !important; color: #ffffff !important; }
         .badge.bg-success { background-color: #2d6a4f !important; color: #ffffff !important; }
         .badge.bg-danger { background-color: #ec4899 !important; color: #ffffff !important; }
         .badge.bg-warning { background-color: #f59e0b !important; color: #ffffff !important; }
-        .badge.bg-primary { background-color: #8b5cf6 !important; color: #ffffff !important; }
+        .badge.bg-primary { background-color: #4b5563 !important; color: #ffffff !important; }
         .text-warning { color: #ec4899 !important; }
-        .text-info { color: #8b5cf6 !important; }
+        .text-info { color: #4b5563 !important; }
         .text-danger { color: #ec4899 !important; }
         .text-success { color: #2d6a4f !important; }
         .text-secondary { color: #555555 !important; }
@@ -431,27 +431,27 @@ HTML_LAYOUT = """
         .text-light { color: #1a1a1a !important; }
         .btn-warning { background-color: #ec4899; border-color: #ec4899; color: #ffffff; }
         .btn-warning:hover { background-color: #db2777; border-color: #db2777; color: #ffffff; }
-        .btn-primary { background-color: #8b5cf6; border-color: #8b5cf6; color: #ffffff; }
-        .btn-primary:hover { background-color: #7c3aed; border-color: #7c3aed; color: #ffffff; }
-        .btn-outline-light { border-color: #8b5cf6; color: #6d28d9; }
-        .btn-outline-light:hover { background-color: #ede9fe; color: #4c1d95; }
-        .btn-outline-info { border-color: #8b5cf6; color: #8b5cf6; }
-        .btn-outline-info:hover { background-color: #ede9fe; color: #4c1d95; }
+        .btn-primary { background-color: #4b5563; border-color: #4b5563; color: #ffffff; }
+        .btn-primary:hover { background-color: #374151; border-color: #374151; color: #ffffff; }
+        .btn-outline-light { border-color: #6b7280; color: #374151; }
+        .btn-outline-light:hover { background-color: #f3f4f6; color: #1f2937; }
+        .btn-outline-info { border-color: #6b7280; color: #4b5563; }
+        .btn-outline-info:hover { background-color: #f3f4f6; color: #1f2937; }
         .btn-outline-danger { border-color: #ec4899; color: #ec4899; }
         .btn-outline-danger:hover { background-color: #fce7f3; color: #db2777; }
         .btn-outline-success { border-color: #2d6a4f; color: #2d6a4f; }
         .btn-outline-success:hover { background-color: #d4edda; color: #000000; }
         .btn-outline-secondary { border-color: #6c757d; color: #6c757d; }
         .btn-outline-secondary:hover { background-color: #e2e3e5; color: #000000; }
-        .btn-outline-primary { border-color: #8b5cf6; color: #7c3aed; }
-        .btn-outline-primary:hover { background-color: #ede9fe; color: #4c1d95; }
+        .btn-outline-primary { border-color: #6b7280; color: #374151; }
+        .btn-outline-primary:hover { background-color: #f3f4f6; color: #1f2937; }
         .list-group-item { background-color: #f8f9fa; color: #1a1a1a; border-color: #dee2e6; }
         .border-secondary { border-color: #dee2e6 !important; }
-        a { color: #7c3aed; }
+        a { color: #374151; }
         a:hover { color: #ec4899; }
         footer { background-color: #f8f9fa; color: #555555; border-top: 1px solid #dee2e6 !important; }
-        .pagination .page-link { background-color: #f8f9fa; color: #7c3aed; border-color: #dee2e6; }
-        .pagination .page-link:hover { background-color: #ede9fe; color: #4c1d95; }
+        .pagination .page-link { background-color: #f8f9fa; color: #374151; border-color: #dee2e6; }
+        .pagination .page-link:hover { background-color: #f3f4f6; color: #1f2937; }
     </style>
 </head>
 <body style="background-color: #ffffff;">
@@ -522,13 +522,13 @@ def dashboard():
     body = f"""
     <div class="row g-4 mb-4">
         <div class="col-md-12">
-            <div class="p-4 rounded-3 card shadow-sm text-center" style="background: linear-gradient(135deg, #ede9fe 0%, #fdf2f8 100%); border: 2px solid #ec4899;">
+            <div class="p-4 rounded-3 card shadow-sm text-center" style="background: linear-gradient(135deg, #f3f4f6 0%, #fdf2f8 100%); border: 2px solid #ec4899;">
                 <div class="d-flex justify-content-between align-items-center mb-2">
                     <span class="source-badge">Official NCRB / Kaggle Crime Dataset</span>
-                    <span class="small fw-semibold" style="color: #6d28d9;">Years Covered: {min_yr} – {max_yr}</span>
+                    <span class="small fw-semibold" style="color: #4b5563;">Years Covered: {min_yr} – {max_yr}</span>
                 </div>
                 <h1 class="display-6 fw-bold" style="color: #ec4899;">National Crime Management Portal</h1>
-                <p class="lead mb-3" style="color: #4c1d95;">Live Dynamic Insights from 35+ Million Real NCRB Recorded Crime Cases</p>
+                <p class="lead mb-3" style="color: #374151;">Live Dynamic Insights from 35+ Million Real NCRB Recorded Crime Cases</p>
                 <div class="d-flex justify-content-center gap-3">
                     <a href="/crime-statistics" class="btn btn-warning fw-bold px-4 shadow-sm">🔍 Search Crime Records</a>
                     <a href="/analytics" class="btn btn-primary fw-bold px-4 shadow-sm">📊 Interactive Visual Analytics</a>
@@ -664,10 +664,10 @@ def crime_statistics():
     if rows:
         rows_html = "".join([f"""
         <tr>
-            <td class="fw-bold" style="color: #4c1d95;">{r['state']}</td>
+            <td class="fw-bold" style="color: #1f2937;">{r['state']}</td>
             <td>{r['district']}</td>
-            <td><span class="badge" style="background-color: #ede9fe; color: #4c1d95;">{r['year']}</span></td>
-            <td><span class="badge" style="background-color: #8b5cf6; color: #ffffff;">{r['crime_type']}</span></td>
+            <td><span class="badge" style="background-color: #f3f4f6; color: #374151;">{r['year']}</span></td>
+            <td><span class="badge" style="background-color: #4b5563; color: #ffffff;">{r['crime_type']}</span></td>
             <td class="fw-bold fs-6" style="color: #ec4899;">{r['case_count']:,}</td>
             <td><span class="badge" style="background-color: #ec4899; color: #ffffff;">{r['source']}</span></td>
         </tr>
@@ -691,11 +691,11 @@ def crime_statistics():
 
     body = f"""
     <div class="d-flex justify-content-between align-items-center mb-4">
-        <h2 class="m-0" style="color: #5b21b6;">🔍 Kaggle/NCRB Crime Statistics Explorer</h2>
+        <h2 class="m-0" style="color: #1f2937;">🔍 Kaggle/NCRB Crime Statistics Explorer</h2>
         <span class="badge p-2" style="background-color: #ec4899; color: #ffffff;">Data Source: Kaggle / NCRB Dataset</span>
     </div>
 
-    <div class="card p-4 mb-4" style="border-left: 4px solid #8b5cf6;">
+    <div class="card p-4 mb-4" style="border-left: 4px solid #4b5563;">
         <form method="GET" action="/crime-statistics" class="row g-3">
             <div class="col-md-3">
                 <label class="form-label text-secondary small fw-bold">State / UT</label>
@@ -726,14 +726,14 @@ def crime_statistics():
                 </select>
             </div>
             <div class="col-md-1 d-flex align-items-end">
-                <button type="submit" class="btn w-100 fw-bold" style="background-color: #8b5cf6; color: #ffffff;">Filter</button>
+                <button type="submit" class="btn w-100 fw-bold" style="background-color: #4b5563; color: #ffffff;">Filter</button>
             </div>
         </form>
     </div>
 
     <div class="card p-4">
         <div class="d-flex justify-content-between align-items-center mb-3">
-            <h5 class="m-0" style="color: #5b21b6;">
+            <h5 class="m-0" style="color: #1f2937;">
                 Matching Statistics: <span class="fw-bold" style="color: #1a1a1a;">{total_matches:,} Entries</span> 
                 (<span class="fw-bold" style="color: #ec4899;">{sum_cases:,} Total Cases</span>)
             </h5>
@@ -849,8 +849,8 @@ def analytics():
                 datasets: [{{
                     label: 'Total Recorded Crimes',
                     data: {year_vals},
-                    borderColor: '#8b5cf6',
-                    backgroundColor: 'rgba(139, 92, 246, 0.12)',
+                    borderColor: '#4b5563',
+                    backgroundColor: 'rgba(75, 85, 99, 0.12)',
                     fill: true,
                     tension: 0.3
                 }}]
@@ -872,7 +872,7 @@ def analytics():
                 labels: {cat_labels},
                 datasets: [{{
                     data: {cat_vals},
-                    backgroundColor: ['#ec4899', '#8b5cf6', '#10b981', '#f59e0b', '#a855f7', '#06b6d4', '#84cc16', '#6366f1', '#14b8a6', '#f43f5e']
+                    backgroundColor: ['#ec4899', '#4b5563', '#10b981', '#f59e0b', '#6b7280', '#06b6d4', '#84cc16', '#374151', '#14b8a6', '#f43f5e']
                 }}]
             }},
             options: {{
@@ -889,7 +889,7 @@ def analytics():
                 datasets: [{{
                     label: 'Total Crime Cases',
                     data: {state_vals},
-                    backgroundColor: '#8b5cf6'
+                    backgroundColor: '#4b5563'
                 }}]
             }},
             options: {{
@@ -1625,13 +1625,13 @@ def crime_patterns():
 <div class="container-fluid py-4">
   <div class="row mb-4">
     <div class="col-12">
-      <h2 style="color:#5b21b6;">🔗 AI-Powered Crime Pattern &amp; Similarity Detector</h2>
+      <h2 style="color:#1f2937;">🔗 AI-Powered Crime Pattern &amp; Similarity Detector</h2>
       <p class="text-muted">Analyze historical crime trends, detect anomalies, find similar crime patterns across regions, and identify clusters — powered by real NCRB/Kaggle data (2001–2013).</p>
     </div>
   </div>
 
   <!-- Filter Form -->
-  <div class="card mb-4 p-4" style="border-left:4px solid #8b5cf6;">
+  <div class="card mb-4 p-4" style="border-left:4px solid #4b5563;">
     <form method="GET" action="/crime-patterns" id="patternForm">
       <div class="row g-3 align-items-end">
         <div class="col-md-3">
@@ -1655,7 +1655,7 @@ def crime_patterns():
           <select class="form-select" name="end_year">{year_opts_e}</select>
         </div>
         <div class="col-md-2">
-          <button type="submit" class="btn w-100" style="background:#8b5cf6;color:#fff;">🔍 Analyze</button>
+          <button type="submit" class="btn w-100 fw-bold" style="background:#4b5563;color:#fff;">🔍 Analyze</button>
         </div>
       </div>
     </form>
@@ -1693,11 +1693,11 @@ def _build_pattern_results(data, crime_type, state, district):
 
     trend    = data.get('trend', {})
     spikes   = data.get('spikes', [])
-    similar  = data.get('similarity_rankings', [])
+    similar  = data.get('similarities', []) or data.get('similarity_rankings', [])
     clusters = data.get('clusters', {})
-    insights = data.get('ai_insights', [])
-    series   = data.get('target_series', {})
-    comp_ser = data.get('comparison_series', {})
+    insights = data.get('insights', []) or data.get('ai_insights', [])
+    years_sorted = data.get('years', [])
+    counts_target = data.get('counts', [])
 
     location_label = f"{state}" + (f" / {district}" if district else " (State-level)")
 
@@ -1708,58 +1708,54 @@ def _build_pattern_results(data, crime_type, state, district):
     low_yr    = trend.get('lowest_year', 'N/A')
     slope     = trend.get('slope', 0)
 
-    dir_color  = '#2d6a4f' if direction == 'Increasing' else ('#ec4899' if direction == 'Decreasing' else '#8b5cf6')
+    dir_color  = '#2d6a4f' if direction == 'Increasing' else ('#ec4899' if direction == 'Decreasing' else '#4b5563')
     trend_badge = f'<span class="badge" style="background:{dir_color};font-size:1rem;">{direction}</span>'
 
     trend_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#5b21b6;">📈 Trend Analysis — {escape(crime_type)} in {escape(location_label)}</h5>
+  <h5 style="color:#1f2937;">📈 Trend Analysis — {escape(crime_type)} in {escape(location_label)}</h5>
   <div class="row text-center mt-3">
-    <div class="col-md-3"><div class="p-3 rounded" style="background:#faf5ff;">
+    <div class="col-md-3"><div class="p-3 rounded" style="background:#f9fafb;border:1px solid #e5e7eb;">
       <div style="font-size:1.8rem;">{trend_badge}</div><small class="text-muted">Overall Trend</small></div></div>
-    <div class="col-md-3"><div class="p-3 rounded" style="background:#faf5ff;">
-      <div style="font-size:1.8rem;font-weight:bold;color:#5b21b6;">{net_pct:+.1f}%</div><small class="text-muted">Net Change</small></div></div>
-    <div class="col-md-3"><div class="p-3 rounded" style="background:#faf5ff;">
-      <div style="font-size:1.8rem;font-weight:bold;color:#5b21b6;">{peak_yr}</div><small class="text-muted">Peak Year</small></div></div>
-    <div class="col-md-3"><div class="p-3 rounded" style="background:#faf5ff;">
-      <div style="font-size:1.8rem;font-weight:bold;color:#5b21b6;">{low_yr}</div><small class="text-muted">Lowest Year</small></div></div>
+    <div class="col-md-3"><div class="p-3 rounded" style="background:#f9fafb;border:1px solid #e5e7eb;">
+      <div style="font-size:1.8rem;font-weight:bold;color:#1f2937;">{net_pct:+.1f}%</div><small class="text-muted">Net Change</small></div></div>
+    <div class="col-md-3"><div class="p-3 rounded" style="background:#f9fafb;border:1px solid #e5e7eb;">
+      <div style="font-size:1.8rem;font-weight:bold;color:#1f2937;">{peak_yr}</div><small class="text-muted">Peak Year</small></div></div>
+    <div class="col-md-3"><div class="p-3 rounded" style="background:#f9fafb;border:1px solid #e5e7eb;">
+      <div style="font-size:1.8rem;font-weight:bold;color:#1f2937;">{low_yr}</div><small class="text-muted">Lowest Year</small></div></div>
   </div>
 </div>"""
 
     # ── Spikes / Drops ──────────────────────────────────────────────────────
     spike_items = ''
     for sp in spikes:
-        ev_type  = sp.get('event', 'spike')
-        yr       = sp.get('year', '')
-        pct      = sp.get('change_pct', 0)
-        prev_val = sp.get('prev_value', 0)
-        cur_val  = sp.get('value', 0)
-        icon = '🔺' if ev_type == 'spike' else '🔻'
-        col  = '#ec4899' if ev_type == 'spike' else '#8b5cf6'
-        spike_items += f'<div class="d-flex align-items-center mb-2 p-2 rounded" style="background:#fff0f6;border-left:4px solid {col};">{icon} <b class="ms-2">{yr}</b>: {ev_type.capitalize()} of <b>{pct:+.1f}%</b> &nbsp;<span class="text-muted">({int(prev_val):,} → {int(cur_val):,} cases)</span></div>'
+        headline = sp.get('headline', '')
+        detail   = sp.get('detail', '')
+        ev_type  = sp.get('type', 'Spike')
+        col      = '#ec4899' if 'Spike' in ev_type or 'Unusual' in headline else '#4b5563'
+        spike_items += f'<div class="d-flex align-items-center mb-2 p-2 rounded" style="background:#fdf2f8;border-left:4px solid {col};"><b class="me-2" style="color:#1f2937;">{escape(headline)}:</b> <span class="text-muted">{escape(detail)}</span></div>'
 
     spikes_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#5b21b6;">⚡ Anomaly & Spike Detection</h5>
-  {''.join([spike_items]) if spikes else '<p class="text-muted">No significant anomalies detected in the selected range.</p>'}
+  <h5 style="color:#1f2937;">⚡ Anomaly &amp; Spike Detection</h5>
+  {''.join([spike_items]) if spikes else '<p class="text-muted">No significant volatility spikes detected across the selected period.</p>'}
 </div>"""
 
     # ── Yearly trend chart + top similar overlay ────────────────────────────
-    years_sorted = sorted(series.keys())
     labels_js = str(years_sorted)
-    target_js  = str([series.get(y, 0) for y in years_sorted])
+    target_js = str(counts_target)
 
     # Pick top 3 similar for overlay
     top3_datasets = ''
     palette = ['#ec4899', '#f59e0b', '#10b981']
     for idx, sim in enumerate(similar[:3]):
-        loc_name = sim.get('location', '')
-        s_data   = comp_ser.get(loc_name, {})
-        vals     = [s_data.get(y, 0) for y in years_sorted]
-        color    = palette[idx]
+        loc_name  = sim.get('name') or sim.get('location', '')
+        vals      = sim.get('series', [])
+        score_val = sim.get('score', 0)
+        color     = palette[idx]
         top3_datasets += f""",
       {{
-        label: '{escape(loc_name)} ({sim.get("score_pct", 0):.1f}%)',
+        label: '{escape(loc_name)} ({score_val:.1f}%)',
         data: {vals},
         borderColor: '{color}',
         backgroundColor: 'transparent',
@@ -1770,7 +1766,7 @@ def _build_pattern_results(data, crime_type, state, district):
 
     trend_chart_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#5b21b6;">📊 Yearly Crime Trend Chart</h5>
+  <h5 style="color:#1f2937;">📊 Yearly Crime Trend Chart</h5>
   <canvas id="trendChart" height="100"></canvas>
 </div>
 <script>
@@ -1782,8 +1778,8 @@ new Chart(document.getElementById('trendChart'), {{
       {{
         label: '{escape(location_label)}',
         data: {target_js},
-        borderColor: '#8b5cf6',
-        backgroundColor: 'rgba(139,92,246,0.08)',
+        borderColor: '#1f2937',
+        backgroundColor: 'rgba(31,41,55,0.08)',
         borderWidth: 2.5,
         fill: true,
         pointRadius: 4
@@ -1807,32 +1803,32 @@ new Chart(document.getElementById('trendChart'), {{
     # ── Similarity Table ────────────────────────────────────────────────────
     sim_rows = ''
     for rank, sim in enumerate(similar[:15], 1):
-        loc      = sim.get('location', '')
-        score    = sim.get('score_pct', 0)
+        loc      = sim.get('name') or sim.get('location', '')
+        score    = sim.get('score', 0)
         pattern  = sim.get('pattern', 'N/A')
-        bar_w    = int(score)
-        bar_col  = '#2d6a4f' if score >= 75 else ('#f59e0b' if score >= 50 else '#ec4899')
+        bar_w    = min(100, max(0, int(score)))
+        bar_col  = '#2d6a4f' if score >= 85 else ('#f59e0b' if score >= 70 else '#ec4899')
         medal    = ['🥇', '🥈', '🥉'][rank - 1] if rank <= 3 else str(rank)
         sim_rows += f"""
 <tr>
   <td class="text-center">{medal}</td>
   <td><b>{escape(loc)}</b></td>
   <td>
-    <div style="background:#ede9fe;border-radius:4px;height:14px;width:100%;">
+    <div style="background:#f3f4f6;border-radius:4px;height:14px;width:100%;">
       <div style="background:{bar_col};width:{bar_w}%;height:14px;border-radius:4px;"></div>
     </div>
-    <small>{score:.1f}%</small>
+    <small class="fw-bold">{score:.1f}%</small>
   </td>
-  <td><span class="badge" style="background:#8b5cf6;">{escape(pattern)}</span></td>
+  <td><span class="badge" style="background:#4b5563;">{escape(pattern)}</span></td>
 </tr>"""
 
     # Similarity bar chart (top 8)
-    sim_labels = str([s.get('location','') for s in similar[:8]])
-    sim_scores = str([round(s.get('score_pct', 0), 1) for s in similar[:8]])
-    sim_colors_js = str(['#2d6a4f' if s.get('score_pct',0)>=75 else ('#f59e0b' if s.get('score_pct',0)>=50 else '#ec4899') for s in similar[:8]])
+    sim_labels = str([s.get('name') or s.get('location','') for s in similar[:8]])
+    sim_scores = str([round(s.get('score', 0), 1) for s in similar[:8]])
+    sim_colors_js = str(['#2d6a4f' if s.get('score',0)>=85 else ('#f59e0b' if s.get('score',0)>=70 else '#ec4899') for s in similar[:8]])
 
     if sim_rows:
-        sim_table_content = f'''<table class="table table-hover"><thead><tr><th>#</th><th>Region</th><th style="width:30%">Similarity Score</th><th>Pattern</th></tr></thead><tbody>{sim_rows}</tbody></table>'''
+        sim_table_content = f'''<table class="table table-hover"><thead><tr><th>#</th><th>Region</th><th style="width:30%">Similarity Score</th><th>Pattern Description</th></tr></thead><tbody>{sim_rows}</tbody></table>'''
         sim_chart_content = f'''<canvas id="simBarChart" height="80"></canvas>'''
         sim_script_content = f'''<script>new Chart(document.getElementById("simBarChart"), {{ type:"bar", data:{{ labels:{sim_labels}, datasets:[{{ label:"Similarity %", data:{sim_scores}, backgroundColor:{sim_colors_js} }}] }}, options:{{ indexAxis:"y", responsive:true, plugins:{{ legend:{{ display:false }} }}, scales:{{ x:{{ max:100, ticks:{{ color:"#1a1a1a" }} }}, y:{{ ticks:{{ color:"#1a1a1a" }} }} }} }} }});</script>'''
     else:
@@ -1842,7 +1838,7 @@ new Chart(document.getElementById('trendChart'), {{
 
     similarity_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#5b21b6;">🔁 Similarity Rankings (Pearson Correlation)</h5>
+  <h5 style="color:#1f2937;">🔁 Similarity Rankings (Pearson Correlation)</h5>
   <p class="text-muted small">Regions with the most similar crime trend <i>shapes</i> to {escape(location_label)}. Score = correlation mapped 0–100%.</p>
   {sim_table_content}
   {sim_chart_content}
@@ -1851,49 +1847,45 @@ new Chart(document.getElementById('trendChart'), {{
 
     # ── Cluster Cards ───────────────────────────────────────────────────────
     cluster_cards = ''
-    cluster_meta = [
-        ('high_volume_high_growth',   'High Volume + High Growth',   '🔴', '#fee2e2', '#dc2626'),
-        ('high_volume_low_growth',    'High Volume + Stable/Slow',   '🟠', '#fff7ed', '#ea580c'),
-        ('low_volume_high_growth',    'Low Volume + High Growth',    '🟡', '#fefce8', '#ca8a04'),
-        ('low_volume_low_growth',     'Low Volume + Low Activity',   '🟢', '#f0fdf4', '#16a34a'),
-    ]
-    for key, label, icon, bg, border in cluster_meta:
-        members = clusters.get(key, [])
-        badges  = ' '.join(f'<span class="badge me-1" style="background:{border};font-size:0.75rem;">{escape(m)}</span>' for m in members)
+    cluster_theme = {
+        'Cluster 1: High Volume & Surging Growth': ('🔴', '#fee2e2', '#dc2626'),
+        'Cluster 2: High Volume & Stabilized / Declining': ('🟢', '#f0fdf4', '#16a34a'),
+        'Cluster 3: Moderate Volume & Stable Pattern': ('⚪', '#f3f4f6', '#4b5563'),
+        'Cluster 4: Low Volume with Volatile Spikes': ('🟠', '#fff7ed', '#ea580c'),
+    }
+    for c_title, c_info in clusters.items():
+        icon, bg, border = cluster_theme.get(c_title, (c_info.get('icon', '📌'), '#f3f4f6', '#4b5563'))
+        members = c_info.get('members', [])
+        desc    = c_info.get('description', '')
+        badges  = ' '.join(f'<span class="badge me-1 mb-1" style="background:{border};font-size:0.75rem;">{escape(m)}</span>' for m in members)
         cluster_cards += f"""
 <div class="col-md-6 mb-3">
   <div class="card h-100 p-3" style="border-left:4px solid {border};background:{bg};">
-    <h6 style="color:{border};">{icon} {label}</h6>
-    <p class="text-muted small mb-2">{len(members)} region(s)</p>
+    <h6 style="color:{border};">{icon} {escape(c_title)}</h6>
+    <p class="text-muted small mb-2">{escape(desc)} — <b>{len(members)} region(s)</b></p>
     <div>{badges if badges else '<span class="text-muted small">No regions in this cluster</span>'}</div>
   </div>
 </div>"""
 
+    cluster_display = cluster_cards if cluster_cards else '<p class="text-muted">No cluster data available.</p>'
     clusters_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#5b21b6;">🗺️ Crime Clusters — {escape(crime_type)}</h5>
+  <h5 style="color:#1f2937;">🗺️ Crime Clusters — {escape(crime_type)}</h5>
   <p class="text-muted small">Regions grouped by crime volume &amp; growth trend across the selected period.</p>
-  <div class="row">{cluster_cards}</div>
+  <div class="row">{cluster_display}</div>
 </div>"""
 
     # ── AI Insights ─────────────────────────────────────────────────────────
-    insight_type_style = {
-        'warning':  ('⚠️', '#fef9c3', '#ca8a04'),
-        'danger':   ('🚨', '#fee2e2', '#dc2626'),
-        'success':  ('✅', '#f0fdf4', '#16a34a'),
-        'info':     ('💡', '#eff6ff', '#2563eb'),
-        'primary':  ('📌', '#f5f3ff', '#7c3aed'),
-    }
     insight_items = ''
     for ins in insights:
-        itype = ins.get('type', 'info')
-        itext = ins.get('text', '')
-        icon_d, bg_d, col_d = insight_type_style.get(itype, ('💡', '#eff6ff', '#2563eb'))
-        insight_items += f'<div class="d-flex align-items-start mb-3 p-3 rounded" style="background:{bg_d};border-left:4px solid {col_d};">{icon_d}<span class="ms-2">{escape(itext)}</span></div>'
+        itype  = ins.get('type', 'Insight')
+        icon_d = ins.get('icon', '💡')
+        itext  = ins.get('text', '')
+        insight_items += f'<div class="d-flex align-items-start mb-3 p-3 rounded" style="background:#f9fafb;border-left:4px solid #4b5563;"><span class="fs-5">{icon_d}</span><div class="ms-3"><b style="color:#1f2937;">{escape(itype)}:</b> <span class="text-secondary">{escape(itext)}</span></div></div>'
 
     insights_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color:#5b21b6;">🤖 AI Insights</h5>
+  <h5 style="color:#1f2937;">🤖 AI Insights</h5>
   {insight_items if insight_items else '<p class="text-muted">No insights generated.</p>'}
 </div>"""
 
