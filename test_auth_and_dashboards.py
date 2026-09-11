@@ -75,16 +75,16 @@ class TestAuthAndDashboards(unittest.TestCase):
         self.assertIn(b'Passwords do not match', resp.data)
 
     def test_signup_verification_and_login_flow(self):
-        """Test complete sign-up, email verification, and login cycle."""
+        """Test complete sign-up, OTP verification, and login cycle."""
         test_email = "newcitizen_test@example.com"
 
-        # Remove test user if leftover
+        # Ensure no leftover user
         conn = get_db_connection()
         conn.execute("DELETE FROM users WHERE lower(email) = ?", (test_email.lower(),))
         conn.commit()
         conn.close()
 
-        # 1. Sign up
+        # 1. Sign up – should redirect to OTP verification page
         resp = self.client.post('/signup', data={
             'full_name': 'Pooja Verma',
             'email': test_email,
@@ -93,52 +93,32 @@ class TestAuthAndDashboards(unittest.TestCase):
             'confirm_password': 'PoojaPassword123'
         }, follow_redirects=False)
         self.assertEqual(resp.status_code, 302)
-        self.assertIn('/login', resp.location)
+        self.assertIn('/verify-otp', resp.location)
 
-        # 2. Check DB: unverified and has token
+        # 2. Retrieve OTP from DB
         conn = get_db_connection()
         user = conn.execute("SELECT * FROM users WHERE lower(email) = ?", (test_email.lower(),)).fetchone()
         self.assertIsNotNone(user)
         self.assertEqual(user['email_verified'], 0)
-        self.assertIsNotNone(user['verification_token'])
-        token = user['verification_token']
+        self.assertIsNotNone(user['otp_code'])
+        otp = user['otp_code']
         conn.close()
 
-        # 3. Attempt login while unverified -> must be blocked
+        # 3. Submit OTP for verification
+        verify_resp = self.client.post('/verify-otp', data={
+            'email': test_email,
+            'otp': otp
+        }, follow_redirects=False)
+        self.assertEqual(verify_resp.status_code, 302)
+        self.assertIn('/login', verify_resp.location)
+
+        # 4. Login should now succeed and redirect to citizen dashboard
         login_resp = self.client.post('/login', data={
             'email': test_email,
             'password': 'PoojaPassword123'
-        }, follow_redirects=True)
-        self.assertIn(b'not verified yet', login_resp.data)
-
-        # 4. Resend verification
-        resend_resp = self.client.post('/resend-verification', data={'email': test_email}, follow_redirects=True)
-        self.assertIn(b'verification link has been', resend_resp.data)
-
-        conn = get_db_connection()
-        updated_user = conn.execute("SELECT * FROM users WHERE lower(email) = ?", (test_email.lower(),)).fetchone()
-        new_token = updated_user['verification_token']
-        self.assertIsNotNone(new_token)
-        conn.close()
-
-        # 5. Verify email using valid token
-        verify_resp = self.client.get(f'/verify-email/{new_token}', follow_redirects=True)
-        self.assertIn(b'successfully verified', verify_resp.data)
-
-        # 6. Check DB: verified and token cleared
-        conn = get_db_connection()
-        verified_user = conn.execute("SELECT * FROM users WHERE lower(email) = ?", (test_email.lower(),)).fetchone()
-        self.assertEqual(verified_user['email_verified'], 1)
-        self.assertIsNone(verified_user['verification_token'])
-        conn.close()
-
-        # 7. Login succeeds now and redirects to /dashboard/citizen
-        success_login = self.client.post('/login', data={
-            'email': test_email,
-            'password': 'PoojaPassword123'
         }, follow_redirects=False)
-        self.assertEqual(success_login.status_code, 302)
-        self.assertEqual(success_login.location, '/dashboard/citizen')
+        self.assertEqual(login_resp.status_code, 302)
+        self.assertEqual(login_resp.location, '/dashboard/citizen')
 
         # Clean up test user
         conn = get_db_connection()

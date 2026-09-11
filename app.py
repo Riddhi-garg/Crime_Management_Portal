@@ -16,7 +16,13 @@ from html import escape
 from flask import Flask, render_template_string, request, jsonify, redirect, flash, url_for, send_from_directory, session
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
-from crime_pattern_analysis import get_filter_options, get_districts_for_state, run_full_analysis
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # dotenv not installed – environment variables must be set manually
+    pass
+
 
 # The four account types the portal issues logins to. Every users.role value
 # must be one of these; the login/registration flow only ever assigns one of
@@ -155,7 +161,7 @@ def roles_required(*allowed_roles):
 @app.before_request
 def _require_login_globally():
     """Gate every route except public authentication endpoints and static assets."""
-    public_endpoints = {'login', 'logout', 'signup', 'verify_email', 'resend_verification', 'static'}
+    public_endpoints = {'login', 'logout', 'signup', 'verify_email', 'resend_verification', 'verify_otp', 'resend_otp', 'static'}
     if request.endpoint in public_endpoints or request.endpoint is None:
         return None
     if not session.get('user_id'):
@@ -180,6 +186,9 @@ def init_db():
         email_verified INTEGER DEFAULT 0,
         verification_token TEXT,
         token_expiry TIMESTAMP,
+        otp_code TEXT,
+        otp_expires_at TEXT,
+        otp_attempts INTEGER DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
@@ -193,6 +202,12 @@ def init_db():
         cursor.execute("ALTER TABLE users ADD COLUMN verification_token TEXT")
     if 'token_expiry' not in existing_cols:
         cursor.execute("ALTER TABLE users ADD COLUMN token_expiry TIMESTAMP")
+    if 'otp_code' not in existing_cols:
+        cursor.execute("ALTER TABLE users ADD COLUMN otp_code TEXT")
+    if 'otp_expires_at' not in existing_cols:
+        cursor.execute("ALTER TABLE users ADD COLUMN otp_expires_at TEXT")
+    if 'otp_attempts' not in existing_cols:
+        cursor.execute("ALTER TABLE users ADD COLUMN otp_attempts INTEGER DEFAULT 0")
 
     # Seed one login per role the first time the app runs. Passwords are
     # hashed with werkzeug's default (PBKDF2) — never stored in plain text.
@@ -698,7 +713,8 @@ def login():
         conn.close()
         if user and check_password_hash(user['password'], password):
             if not user['email_verified']:
-                error = 'Your email address is not verified yet. Please check your inbox or <a href="/resend-verification" class="alert-link text-decoration-underline">click here to resend the verification email</a>.'
+                flash("Please verify your email first. Enter the 6-digit code sent to your inbox.", "warning")
+                return redirect(url_for('verify_otp', email=user['email']))
             else:
                 session.clear()
                 session['user_id'] = user['user_id']
@@ -735,7 +751,7 @@ def login():
           <div class="text-center mt-3 pt-2 border-top">
             <p class="mb-1 small text-muted">Don't have an account yet?</p>
             <a href="/signup" class="btn btn-sm btn-outline-primary fw-semibold w-100 mb-2">Create New Account</a>
-            <a href="/resend-verification" class="small text-muted text-decoration-none">Resend Email Verification</a>
+            <a href="/verify-otp" class="small text-muted text-decoration-none">Enter Verification Code (OTP)</a>
           </div>
 
           <hr class="my-3">
@@ -784,36 +800,38 @@ def signup():
                 conn.close()
                 error = "An account with that email address already exists. Please sign in or use another email."
             else:
-                verification_token = secrets.token_urlsafe(32)
-                token_expiry = (datetime.datetime.now() + timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
+                otp = f"{secrets.randbelow(1000000):06d}"
+                otp_expires_at = (datetime.datetime.now() + timedelta(minutes=10)).isoformat()
                 pwd_hash = generate_password_hash(password)
                 conn.execute(
                     """
-                    INSERT INTO users (username, password, role, full_name, email, email_verified, verification_token, token_expiry)
-                    VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+                    INSERT INTO users (username, password, role, full_name, email, email_verified,
+                                       otp_code, otp_expires_at, otp_attempts)
+                    VALUES (?, ?, ?, ?, ?, 0, ?, ?, 0)
                     """,
-                    (email, pwd_hash, role, full_name, email, verification_token, token_expiry)
+                    (email, pwd_hash, role, full_name, email, otp, otp_expires_at)
                 )
                 conn.commit()
                 conn.close()
 
-                verify_url = request.url_root.rstrip('/') + url_for('verify_email', token=verification_token)
                 email_body = f"""Hello {full_name},
 
 Thank you for registering on the Crime Management Portal.
 
-Please verify your email address to activate your {role} account by clicking the link below (valid for 24 hours):
+Your 6-digit verification code (OTP) is:
 
-{verify_url}
+  {otp}
+
+This code is valid for 10 minutes. Enter it on the verification page to activate your {role} account.
 
 If you did not register for an account, you can safely ignore this message.
 
 Crime Management Portal
 National Crime Records System
 """
-                send_email(to_email=email, subject="Verify your Crime Management Portal account", body=email_body)
-                flash("Registration successful! A verification link has been sent to your email. Please verify before signing in.", "success")
-                return redirect(url_for('login'))
+                send_email(to_email=email, subject="Your Crime Management Portal verification code", body=email_body)
+                flash("Registration successful! A 6-digit verification code has been sent to your email.", "success")
+                return redirect(url_for('verify_otp', email=email))
 
     error_html = f'<div class="alert alert-danger py-2">{escape(error)}</div>' if error else ''
     role_options = "".join([
@@ -985,6 +1003,308 @@ def logout():
     session.clear()
     return redirect(url_for('login'))
 
+# OTP verification routes
+
+def verify_otp():
+    email = request.args.get('email') or request.form.get('email')
+    if request.method == 'GET':
+        if not email:
+            flash('Email parameter is required for OTP verification.', 'danger')
+            return redirect(url_for('login'))
+        # Render OTP input form
+        content = f"""<div class=\"row justify-content-center\">
+          <div class=\"col-md-5 col-lg-4\">
+            <div class=\"card p-4 shadow-sm mt-5\">
+              <h3 class=\"text-center mb-1\" style=\"color: #1f2937;\">Enter Verification Code</h3>
+              <p class=\"text-center text-muted mb-4\">A 6‑digit code was sent to <strong>{escape(email)}</strong></p>
+              <form method=\"POST\">
+                <input type=\"hidden\" name=\"email\" value=\"{escape(email)}\">
+                <div class=\"mb-3\">
+                  <label class=\"form-label fw-semibold\">Verification Code</label>
+                  <input type=\"text\" name=\"otp\" class=\"form-control\" placeholder=\"123456\" required>
+                </div>
+                <button type=\"submit\" class=\"btn btn-primary w-100 py-2\">Verify</button>
+              </form>
+            </div>
+          </div>
+        </div>"""
+        return render_template_string(HTML_LAYOUT, content=content, current_user_name=None, current_user_role=None)
+
+    # POST – verify OTP
+    otp_input = request.form.get('otp', '').strip()
+    if not email or not otp_input:
+        flash('Missing email or OTP.', 'danger')
+        return redirect(url_for('login'))
+
+    conn = get_db_connection()
+    user = conn.execute("SELECT * FROM users WHERE lower(email) = ?", (email.lower(),)).fetchone()
+    if not user:
+        conn.close()
+        flash('User not found.', 'danger')
+        return redirect(url_for('signup'))
+
+    # Check expiry and attempts
+    now = datetime.datetime.now()
+    try:
+        expires_at = datetime.datetime.fromisoformat(user['otp_expires_at']) if user['otp_expires_at'] else None
+    except Exception:
+        expires_at = None
+
+    if expires_at is None or now > expires_at:
+        conn.close()
+        flash('OTP has expired. Please request a new code.', 'warning')
+        return redirect(url_for('resend_otp', email=email))
+
+    if user['otp_attempts'] >= 5:
+        conn.close()
+        flash('Maximum verification attempts exceeded. Please request a new code.', 'warning')
+        return redirect(url_for('resend_otp', email=email))
+
+    if otp_input == user['otp_code']:
+        # Successful verification
+        conn.execute(
+            "UPDATE users SET email_verified = 1, otp_code = NULL, otp_expires_at = NULL, otp_attempts = 0 WHERE user_id = ?",
+            (user['user_id'],)
+        )
+        conn.commit()
+        conn.close()
+        flash('Your email has been verified. You may now sign in.', 'success')
+        return redirect(url_for('login'))
+    else:
+        # Increment attempts
+        conn.execute(
+            "UPDATE users SET otp_attempts = otp_attempts + 1 WHERE user_id = ?",
+            (user['user_id'],)
+        )
+        conn.commit()
+        conn.close()
+        flash('Invalid verification code. Please try again.', 'danger')
+        return redirect(url_for('verify_otp', email=email))
+
+
+
+@app.route('/verify-otp', methods=['GET', 'POST'])
+def verify_otp():
+    email = request.args.get('email') or request.form.get('email')
+
+    # Show OTP page
+    if request.method == 'GET':
+        if not email:
+            flash('Email parameter is required for OTP verification.', 'danger')
+            return redirect(url_for('login'))
+
+        content = f"""
+        <div class="row justify-content-center">
+          <div class="col-md-5 col-lg-4">
+            <div class="card p-4 shadow-sm mt-5">
+              <h3 class="text-center mb-1" style="color: #1f2937;">
+                Enter Verification Code
+              </h3>
+
+              <p class="text-center text-muted mb-4">
+                A 6-digit code was sent to
+                <strong>{escape(email)}</strong>
+              </p>
+
+              <form method="POST">
+                <input type="hidden" name="email" value="{escape(email)}">
+
+                <div class="mb-3">
+                  <label class="form-label fw-semibold">
+                    Verification Code
+                  </label>
+
+                  <input
+                    type="text"
+                    name="otp"
+                    class="form-control"
+                    placeholder="123456"
+                    required
+                  >
+                </div>
+
+                <button type="submit"
+                        class="btn btn-primary w-100 py-2">
+                  Verify
+                </button>
+              </form>
+
+              <div class="text-center mt-3">
+                <a href="{url_for('resend_otp', email=email)}"
+                   class="btn btn-link">
+                  Didn't receive the code? Resend OTP
+                </a>
+              </div>
+
+            </div>
+          </div>
+        </div>
+        """
+
+        return render_template_string(
+            HTML_LAYOUT,
+            content=content,
+            current_user_name=None,
+            current_user_role=None
+        )
+
+    # Verify submitted OTP
+    otp_input = request.form.get('otp', '').strip()
+
+    if not email or not otp_input:
+        flash('Missing email or OTP.', 'danger')
+        return redirect(url_for('login'))
+
+    conn = get_db_connection()
+
+    user = conn.execute(
+        "SELECT * FROM users WHERE lower(email) = ?",
+        (email.lower(),)
+    ).fetchone()
+
+    if not user:
+        conn.close()
+        flash('User not found.', 'danger')
+        return redirect(url_for('login'))
+
+    expires_at = None
+
+    if user['otp_expires_at']:
+        try:
+            expires_at = datetime.datetime.fromisoformat(
+                user['otp_expires_at']
+            )
+        except Exception:
+            expires_at = None
+
+    # Check expiry
+    if expires_at and datetime.datetime.now() > expires_at:
+        conn.close()
+        flash('OTP has expired. Please request a new one.', 'warning')
+        return redirect(url_for('resend_otp', email=email))
+
+    # Check attempt limit
+    if user['otp_attempts'] >= 5:
+        conn.close()
+        flash('Too many incorrect attempts. Please request a new OTP.', 'danger')
+        return redirect(url_for('resend_otp', email=email))
+
+    # Correct OTP
+    if otp_input == user['otp_code']:
+
+        conn.execute(
+            """
+            UPDATE users
+            SET email_verified = 1,
+                otp_code = NULL,
+                otp_expires_at = NULL,
+                otp_attempts = 0
+            WHERE user_id = ?
+            """,
+            (user['user_id'],)
+        )
+
+        conn.commit()
+        conn.close()
+
+        flash('Email verified successfully! You can now log in.', 'success')
+
+        return redirect(url_for('login'))
+
+    # Incorrect OTP
+    conn.execute(
+        """
+        UPDATE users
+        SET otp_attempts = otp_attempts + 1
+        WHERE user_id = ?
+        """,
+        (user['user_id'],)
+    )
+
+    conn.commit()
+    conn.close()
+
+    flash('Incorrect verification code. Please try again.', 'danger')
+
+    return redirect(url_for('verify_otp', email=email))
+
+
+@app.route('/resend-otp')
+def resend_otp():
+
+    email = request.args.get('email')
+
+    if not email:
+        flash('Email is required to resend OTP.', 'danger')
+        return redirect(url_for('login'))
+
+    conn = get_db_connection()
+
+    user = conn.execute(
+        "SELECT * FROM users WHERE lower(email) = ?",
+        (email.lower(),)
+    ).fetchone()
+
+    if not user:
+        conn.close()
+        flash('User not found.', 'danger')
+        return redirect(url_for('login'))
+
+    # Generate new OTP
+    new_otp = f"{secrets.randbelow(1000000):06d}"
+
+    # OTP expires in 10 minutes
+    expires_at = (
+        datetime.datetime.now()
+        + timedelta(minutes=10)
+    ).isoformat()
+
+    # Save new OTP
+    conn.execute(
+        """
+        UPDATE users
+        SET otp_code = ?,
+            otp_expires_at = ?,
+            otp_attempts = 0
+        WHERE user_id = ?
+        """,
+        (new_otp, expires_at, user['user_id'])
+    )
+
+    conn.commit()
+    conn.close()
+
+    # Email message
+    email_body = f"""Hello {user['full_name']},
+
+Your new 6-digit verification code (OTP) is:
+
+{new_otp}
+
+This code is valid for 10 minutes.
+
+Enter it on the verification page to activate your account.
+
+If you did not request this, you can safely ignore this message.
+
+Crime Management Portal
+"""
+
+    # Send OTP email
+    send_email(
+        to_email=user['email'],
+        subject="Your Crime Management Portal verification code",
+        body=email_body
+    )
+
+    flash(
+        'A new verification code has been sent to your email.',
+        'success'
+    )
+
+    return redirect(
+        url_for('verify_otp', email=email)
+    )
 
 # DASHBOARD ROUTE (Redirects to role-specific landing page)
 @app.route('/')
@@ -1128,6 +1448,7 @@ def dataset_overview():
 # ROLE DASHBOARD: CITIZEN
 @app.route('/dashboard/citizen')
 @login_required
+@roles_required('Citizen')
 def citizen_dashboard():
     full_name = session.get('full_name', 'Citizen')
     conn = get_db_connection()
