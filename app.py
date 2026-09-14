@@ -23,6 +23,8 @@ except ImportError:
     # dotenv not installed – environment variables must be set manually
     pass
 
+from crime_pattern_analysis import get_filter_options, get_districts_for_state, run_full_analysis
+
 
 # The four account types the portal issues logins to. Every users.role value
 # must be one of these; the login/registration flow only ever assigns one of
@@ -56,7 +58,7 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = 'crms-kaggle-ncrb-key-2026'
 app.config['UPLOAD_FOLDER'] = os.path.join(BASE_DIR, 'static', 'uploads')
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5 MB limit
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50 MB limit
 
 
 def get_db_connection():
@@ -333,15 +335,30 @@ def init_db():
 
     # Additional tables for analytics
     cursor.execute("""
-    CREATE TABLE IF NOT EXISTS crime_statistics (
+    CREATE TABLE IF NOT EXISTS ncrb_crime_data (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         year INTEGER NOT NULL,
         state TEXT NOT NULL,
         district TEXT NOT NULL,
+        crime_category TEXT NOT NULL,
         crime_type TEXT NOT NULL,
-        case_count INTEGER NOT NULL,
-        PRIMARY KEY (year, state, district, crime_type)
+        reported_cases INTEGER NOT NULL,
+        other_fields TEXT,
+        UNIQUE(year, state, district, crime_category, crime_type)
     );
     """)
+    # Flexible table for arbitrary NCRB CSV imports
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS ncrb_raw_data (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_file TEXT NOT NULL,
+        table_name TEXT,
+        row_hash TEXT UNIQUE,
+        raw_data TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS property_crime_statistics (
         state TEXT NOT NULL PRIMARY KEY,
@@ -554,7 +571,7 @@ HTML_NAVBAR = """
         <li class="nav-item"><a class="nav-link" href="{{ role_dashboard_url or '/' }}" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Dashboard</a></li>
 
         {% if current_user_role == 'Citizen' %}
-          <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">File / Track FIR</a></li>
+          <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Management System</a></li>
           <li class="nav-item"><a class="nav-link" href="/police-stations" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Police Stations</a></li>
           <li class="nav-item"><a class="nav-link" href="/police-station-map" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Station Map</a></li>
           <li class="nav-item"><a class="nav-link" href="/crime-statistics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Crime Statistics</a></li>
@@ -562,7 +579,7 @@ HTML_NAVBAR = """
           <li class="nav-item"><a class="nav-link" href="/women-children-analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Women &amp; Children</a></li>
 
         {% elif current_user_role == 'Police' %}
-          <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Management</a></li>
+          <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Management System</a></li>
           <li class="nav-item"><a class="nav-link" href="/criminal-records" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Criminal Records</a></li>
           <li class="nav-item"><a class="nav-link" href="/case-files" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Case Files</a></li>
           <li class="nav-item"><a class="nav-link" href="/police-stations" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Police Stations</a></li>
@@ -571,15 +588,15 @@ HTML_NAVBAR = """
           <li class="nav-item"><a class="nav-link" href="/analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Analytics &amp; Charts</a></li>
 
         {% elif current_user_role == 'Court' %}
+          <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Management System</a></li>
           <li class="nav-item"><a class="nav-link" href="/case-files" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Case Files</a></li>
-          <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Records</a></li>
           <li class="nav-item"><a class="nav-link" href="/criminal-records" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Criminal Records</a></li>
           <li class="nav-item"><a class="nav-link" href="/property-arrest-analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Property &amp; Arrests</a></li>
           <li class="nav-item"><a class="nav-link" href="/crime-statistics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Crime Statistics</a></li>
           <li class="nav-item"><a class="nav-link" href="/analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Analytics &amp; Charts</a></li>
 
         {% elif current_user_role == 'District Magistrate' %}
-          <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Management</a></li>
+          <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Management System</a></li>
           <li class="nav-item"><a class="nav-link" href="/criminal-records" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Criminal Records</a></li>
           <li class="nav-item"><a class="nav-link" href="/case-files" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Case Files</a></li>
           <li class="nav-item"><a class="nav-link" href="/police-stations" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Police Stations</a></li>
@@ -589,12 +606,12 @@ HTML_NAVBAR = """
           <li class="nav-item"><a class="nav-link" href="/property-arrest-analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Property &amp; Arrests</a></li>
 
         {% else %}
+          <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Management System</a></li>
           <li class="nav-item"><a class="nav-link" href="/analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Analytics &amp; Charts</a></li>
           <li class="nav-item"><a class="nav-link" href="/women-children-analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Women &amp; Children</a></li>
           <li class="nav-item"><a class="nav-link" href="/property-arrest-analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Property &amp; Arrests</a></li>
           <li class="nav-item"><a class="nav-link" href="/police-stations" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Police Stations</a></li>
           <li class="nav-item"><a class="nav-link" href="/police-station-map" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Station Map</a></li>
-          <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Management</a></li>
           <li class="nav-item"><a class="nav-link" href="/criminal-records" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Criminal Records</a></li>
           <li class="nav-item"><a class="nav-link" href="/case-files" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Case Files</a></li>
           <li class="nav-item"><a class="nav-link" href="/crime-patterns" style="color: #D6cfc4; font-weight: bold; font-family: 'Times New Roman', Times, serif;">Pattern Detector</a></li>
@@ -1492,7 +1509,7 @@ def citizen_dashboard():
         <tr>
             <td colspan="6" class="text-center text-muted py-4">
                 You have not filed any complaints or FIRs under this name yet.<br>
-                <a href="/fir-management" class="btn btn-sm btn-primary mt-2">File an Official FIR Complaint</a>
+                <a href="/fir-management" class="btn btn-sm btn-primary mt-2">Access FIR Management System</a>
             </td>
         </tr>
         """
@@ -1520,7 +1537,7 @@ def citizen_dashboard():
                         <p class="text-muted mb-0">Track filed FIRs, submit new complaints, access police station contacts and explore public safety analytics.</p>
                     </div>
                     <div class="d-flex flex-wrap gap-2">
-                        <a href="/fir-management" class="btn btn-primary fw-semibold">File a New FIR</a>
+                        <a href="/fir-management" class="btn btn-primary fw-semibold">FIR Management System</a>
                         <a href="/police-station-map" class="btn btn-outline-primary fw-semibold">Station Map</a>
                         <a href="/crime-statistics" class="btn btn-outline-secondary fw-semibold">Safety Trends</a>
                         <a href="/dataset-overview" class="btn btn-warning fw-semibold">National Overview</a>
@@ -1559,7 +1576,7 @@ def citizen_dashboard():
             <div class="card shadow-sm p-3">
                 <div class="d-flex justify-content-between align-items-center mb-3">
                     <h5 class="fw-bold mb-0" style="color: #1f2937;">My Filed Complaints &amp; FIR Records</h5>
-                    <a href="/fir-management" class="btn btn-sm btn-outline-primary">View All Records</a>
+                    <a href="/fir-management" class="btn btn-sm btn-outline-primary">FIR Management System</a>
                 </div>
                 <div class="table-responsive">
                     <table class="table table-hover align-middle mb-0">
@@ -1692,7 +1709,7 @@ def police_dashboard():
                         <p class="text-muted mb-0">Operational control for FIR registration, investigative case tracking, suspect identification, and station management.</p>
                     </div>
                     <div class="d-flex flex-wrap gap-2">
-                        <a href="/fir-management" class="btn btn-primary fw-semibold">Register FIR</a>
+                        <a href="/fir-management" class="btn btn-primary fw-semibold">FIR Management System</a>
                         <a href="/criminal-records" class="btn btn-outline-primary fw-semibold">Criminal Records</a>
                         <a href="/case-files" class="btn btn-outline-primary fw-semibold">Case Files</a>
                         <a href="/crime-patterns" class="btn btn-warning fw-semibold">Pattern Detector</a>
@@ -1738,7 +1755,7 @@ def police_dashboard():
             <div class="card shadow-sm p-3">
                 <div class="d-flex justify-content-between align-items-center mb-3">
                     <h5 class="fw-bold mb-0" style="color: #1f2937;">Recent FIR Activity</h5>
-                    <a href="/fir-management" class="btn btn-sm btn-outline-primary">Manage All FIRs</a>
+                    <a href="/fir-management" class="btn btn-sm btn-outline-primary">FIR Management System</a>
                 </div>
                 <div class="table-responsive">
                     <table class="table table-hover align-middle mb-0">
@@ -1878,7 +1895,7 @@ def court_dashboard():
                     </div>
                     <div class="d-flex flex-wrap gap-2">
                         <a href="/case-files" class="btn btn-primary fw-semibold">Case File Proceedings</a>
-                        <a href="/fir-management" class="btn btn-outline-primary fw-semibold">FIR Evidence</a>
+                        <a href="/fir-management" class="btn btn-outline-primary fw-semibold">FIR Management System</a>
                         <a href="/criminal-records" class="btn btn-outline-primary fw-semibold">Criminal Records</a>
                         <a href="/property-arrest-analytics" class="btn btn-warning fw-semibold">Arrests &amp; Convictions</a>
                     </div>
@@ -2057,7 +2074,7 @@ def magistrate_dashboard():
                         <p class="text-muted mb-0">District administrative authority: cross-departmental supervision across Police Stations, FIR Registrations, Criminal Surveillance, and Court Proceedings.</p>
                     </div>
                     <div class="d-flex flex-wrap gap-2">
-                        <a href="/fir-management" class="btn btn-primary fw-semibold">FIR Control</a>
+                        <a href="/fir-management" class="btn btn-primary fw-semibold">FIR Management System</a>
                         <a href="/case-files" class="btn btn-outline-primary fw-semibold">Case Dockets</a>
                         <a href="/criminal-records" class="btn btn-outline-primary fw-semibold">Criminal Profiles</a>
                         <a href="/crime-patterns" class="btn btn-outline-primary fw-semibold">Pattern Detector</a>
@@ -2111,7 +2128,7 @@ def magistrate_dashboard():
             <div class="card shadow-sm p-3">
                 <div class="d-flex justify-content-between align-items-center mb-3">
                     <h5 class="fw-bold mb-0" style="color: #1f2937;">Jurisdictional FIR Registrations</h5>
-                    <a href="/fir-management" class="btn btn-sm btn-outline-primary">All FIRs</a>
+                    <a href="/fir-management" class="btn btn-sm btn-outline-primary">FIR Management System</a>
                 </div>
                 <div class="table-responsive">
                     <table class="table table-hover align-middle mb-0">
@@ -2872,72 +2889,315 @@ def add_police_officer():
 
 
 @app.route('/fir-management')
+@login_required
 def fir_management():
+    """FIR Management System – Central portal interface powered by official NCRB Crime & Incident data."""
+    import math
+    from collections import OrderedDict
+
+    search_q = request.args.get('q', '').strip()
+    filter_file = request.args.get('source_file', '').strip()
+    page = max(1, int(request.args.get('page', 1)))
+    per_page = 25
+
     conn = get_db_connection()
-    firs = conn.execute("""
-        SELECT f.*, c.crime_type, v.name as victim_name, s.station_name 
-        FROM FIR f
-        LEFT JOIN crimes c ON f.crime_id = c.crime_id
-        LEFT JOIN victims v ON f.victim_id = v.victim_id
-        LEFT JOIN police_stations s ON f.station_id = s.station_id
-        ORDER BY f.fir_id DESC
-    """).fetchall()
-    stations = conn.execute("SELECT * FROM police_stations ORDER BY station_name").fetchall()
-    crime_categories = conn.execute("""
-        SELECT crime_type, SUM(case_count) AS total
-        FROM crime_statistics GROUP BY crime_type ORDER BY total DESC LIMIT 10
-    """).fetchall() if _table_exists(conn, 'crime_statistics') else []
+    cur = conn.cursor()
+
+    # Distinct source files for dropdown
+    all_files = [r[0] for r in cur.execute(
+        "SELECT DISTINCT source_file FROM ncrb_raw_data ORDER BY source_file"
+    ).fetchall()]
+
+    # WHERE clause
+    params = []
+    where_clauses = []
+    if filter_file:
+        where_clauses.append("source_file = ?")
+        params.append(filter_file)
+    if search_q:
+        where_clauses.append("raw_data LIKE ?")
+        params.append(f"%{search_q}%")
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    total_rows = cur.execute(f"SELECT COUNT(*) FROM ncrb_raw_data {where_sql}", params).fetchone()[0]
+    offset = (page - 1) * per_page
+    db_rows = cur.execute(
+        f"SELECT source_file, table_name, raw_data FROM ncrb_raw_data {where_sql} ORDER BY source_file, id LIMIT ? OFFSET ?",
+        params + [per_page, offset]
+    ).fetchall()
+
+    # Global totals (unfiltered)
+    total_all = cur.execute("SELECT COUNT(*) FROM ncrb_raw_data").fetchone()[0]
+    distinct_files = cur.execute("SELECT COUNT(DISTINCT source_file) FROM ncrb_raw_data").fetchone()[0]
     conn.close()
 
-    firs_html = "".join([f"""
-    <tr>
-        <td><span class="badge bg-warning text-dark fw-bold">{f['fir_number']}</span></td>
-        <td>{f['crime_type']}</td>
-        <td>{f['victim_name']}</td>
-        <td>{f['station_name']}</td>
-        <td>{f['filing_date']}</td>
-        <td><form method="POST" action="/fir-management/{f['fir_id']}/status" class="d-flex gap-1"><select name="status" class="form-select form-select-sm">{_options_html(FIR_STATUSES, f['status'])}</select><button class="btn btn-sm btn-outline-primary">Update</button></form></td>
-    </tr>
-    """ for f in firs]) or "<tr><td colspan='6' class='text-center text-muted py-4'>No individual FIR records filed yet. Analytical crime statistics are managed in <a href='/crime-statistics'>Crime Statistics</a>.</td></tr>"
-    category_rows = "".join(f"<tr><td>{c['crime_type']}</td><td class='fw-bold text-danger'>{c['total']:,}</td></tr>" for c in crime_categories) or "<tr><td colspan='2' class='text-center text-muted'>Run the dataset import to show categories.</td></tr>"
-    station_options = _station_options(stations, 'Select police station')
-    category_options = "".join(f'<option value="{c["crime_type"]}">' for c in crime_categories)
+    # Group rows by source_file
+    grouped = OrderedDict()
+    for r in db_rows:
+        sf = r['source_file']
+        if sf not in grouped:
+            grouped[sf] = {'rows': []}
+        grouped[sf]['rows'].append(json.loads(r['raw_data']))
 
-    body = f"""
-    <h2 class="text-secondary mb-3">FIR (First Information Report) Registry</h2>
-    <div class="card p-4 mb-4">
-        <div class="table-responsive">
-            <table class="table table-dark table-hover align-middle">
-                <thead><tr><th>FIR Number</th><th>Crime Type</th><th>Complainant/Victim</th><th>Police Station</th><th>Filing Date</th><th>Status</th></tr></thead>
-                <tbody>{firs_html}</tbody>
-            </table>
+    # Official table descriptions
+    TABLE_DESCRIPTIONS = {
+        'NCRB_ADSI_2023_Table_1A.3_2.csv':          'Table 1A.3.2 — Accidental Deaths by Mode of Transport (2023)',
+        'NCRB_ADSI_2023_Table_1A.3_2 (1).csv':      'Table 1A.3.2 (Duplicate File) — Accidental Deaths by Mode of Transport (2023)',
+        'NCRB_ADSI_2023_Table_2.4.csv':              'Table 2.4 — Causes of Suicides by Gender (2022–2023)',
+        'NCRB_ADSI_2023_Table_2.6.csv':              'Table 2.6 — Suicides by Profession of Victim (2023)',
+        'NCRB_ADSI_2023_Table_2.12.csv':             'Table 2.12 — Means/Mode of Suicide by Gender (2023)',
+        'AkolaPolice2025_0_1.csv':                   'Akola District Police Station Crime & Performance Metrics (2025)',
+        'All_India_Index_Upto_Apr25.csv':            'All India Consumer & Socio-Economic Price Index (Upto April 2025)',
+        'All_India_Index_Upto_Jan25.csv':            'All India Consumer & Socio-Economic Price Index (Upto January 2025)',
+        'Rajya_Sabha_Session_237_AU1971_1.1.csv':   'Rajya Sabha Parliamentary Report (Session 237) — Crimes Against Children',
+        'rs_session240_au2685_1.1.csv':             'Rajya Sabha Parliamentary Report (Session 240) — National Crime Head Statistics',
+    }
+    TABLE_ICONS = {
+        'NCRB_ADSI_2023_Table_1A.3_2.csv':          '&#128663;',
+        'NCRB_ADSI_2023_Table_1A.3_2 (1).csv':      '&#128663;',
+        'NCRB_ADSI_2023_Table_2.4.csv':              '&#128202;',
+        'NCRB_ADSI_2023_Table_2.6.csv':              '&#128084;',
+        'NCRB_ADSI_2023_Table_2.12.csv':             '&#9888;',
+        'AkolaPolice2025_0_1.csv':                   '&#128110;',
+        'All_India_Index_Upto_Apr25.csv':            '&#128200;',
+        'All_India_Index_Upto_Jan25.csv':            '&#128200;',
+        'Rajya_Sabha_Session_237_AU1971_1.1.csv':   '&#128103;',
+        'rs_session240_au2685_1.1.csv':             '&#128203;',
+    }
+
+    def is_num(v):
+        try:
+            s = str(v).replace(',', '').replace('NA', '').strip()
+            if not s:
+                return False
+            float(s)
+            return True
+        except (ValueError, TypeError):
+            return False
+
+    # Build per-table sections
+    sections_html = ''
+    all_chart_js = ''
+    chart_idx = 0
+
+    for sf, data in grouped.items():
+        rows_list = data['rows']
+        if not rows_list:
+            continue
+        title = TABLE_DESCRIPTIONS.get(sf) or data.get('table_name') or sf.replace('.csv', '').replace('_', ' ').title()
+        icon = TABLE_ICONS.get(sf, '&#128200;')
+        headers = list(rows_list[0].keys())
+        label_col = headers[1] if len(headers) > 1 else headers[0]
+        numeric_cols = [h for h in headers if h not in ('Sl. No.', 'SL', label_col) and
+                        any(is_num(r.get(h, '')) for r in rows_list)]
+
+        # Table header
+        header_cells = ''.join(
+            f'<th style="white-space:nowrap; background:#e5e7eb; color:#1f2937;">{escape(h)}</th>'
+            for h in headers
+        )
+
+        # Table body
+        body_rows = ''
+        for row in rows_list:
+            cells = ''
+            for h in headers:
+                val = row.get(h, '')
+                is_num_cell = h in numeric_cols and is_num(val)
+                style = ' style="text-align:right; font-weight:600; color:#374151;"' if is_num_cell else ''
+                cells += f'<td{style}>{escape(str(val))}</td>'
+            body_rows += f'<tr>{cells}</tr>'
+
+        # Bar chart for primary numeric column
+        chart_html = ''
+        if numeric_cols:
+            chart_col = numeric_cols[0]
+            chart_labels, chart_vals = [], []
+            for row in rows_list[:30]:
+                lbl = str(row.get(label_col, ''))[:40]
+                raw_v = str(row.get(chart_col, '')).replace(',', '').strip()
+                try:
+                    chart_labels.append(lbl)
+                    chart_vals.append(float(raw_v))
+                except ValueError:
+                    chart_labels.append(lbl)
+                    chart_vals.append(0)
+
+            cid = f'firChart{chart_idx}'
+            chart_idx += 1
+            chart_html = f'''
+            <div class="mt-3 px-3 pb-3">
+              <h6 class="text-muted mb-2" style="font-size:0.85rem;">{escape(chart_col)} — Graphical Distribution</h6>
+              <canvas id="{cid}" height="90"></canvas>
+            </div>'''
+            all_chart_js += f'''
+            new Chart(document.getElementById('{cid}'), {{
+                type: 'bar',
+                data: {{
+                    labels: {json.dumps(chart_labels)},
+                    datasets: [{{
+                        label: {json.dumps(chart_col)},
+                        data: {json.dumps(chart_vals)},
+                        backgroundColor: 'rgba(75,85,99,0.75)',
+                        borderColor: '#374151',
+                        borderWidth: 1
+                    }}]
+                }},
+                options: {{
+                    responsive: true,
+                    plugins: {{ legend: {{ display: false }} }},
+                    scales: {{
+                        x: {{ ticks: {{ maxRotation: 45, font: {{ size: 9, family: "'Times New Roman', serif" }} }} }},
+                        y: {{ beginAtZero: true, ticks: {{ font: {{ size: 9 }} }} }}
+                    }}
+                }}
+            }});'''
+
+        sections_html += f'''
+        <div class="card shadow-sm mb-4" style="border-left: 4px solid #D6cfc4;">
+          <div class="card-header d-flex justify-content-between align-items-center"
+               style="background:#f3f4f6; border-bottom:1px solid #dee2e6;">
+            <span style="color:#1f2937; font-weight:700; font-size:1rem;">
+              {icon}&nbsp; {escape(title)}
+            </span>
+            <span class="badge bg-secondary">{len(rows_list)} records</span>
+          </div>
+          <div class="card-body p-0">
+            <div class="table-responsive">
+              <table class="table table-sm table-hover align-middle mb-0"
+                     style="font-size:0.84rem;">
+                <thead><tr>{header_cells}</tr></thead>
+                <tbody>{body_rows}</tbody>
+              </table>
+            </div>
+            {chart_html}
+          </div>
+        </div>'''
+
+    # File filter dropdown options
+    file_options = '<option value="">All Source Tables</option>'
+    for f in all_files:
+        sel = ' selected' if f == filter_file else ''
+        lbl = TABLE_DESCRIPTIONS.get(f) or f.replace('.csv', '').replace('_', ' ').title()
+        lbl = lbl[:75]
+        file_options += f'<option value="{escape(f)}"{sel}>{escape(lbl)}</option>'
+
+    # Pagination
+    total_pages = max(1, math.ceil(total_rows / per_page))
+    def pg_link(p, lbl=None):
+        txt = lbl or str(p)
+        dis = ' disabled' if p < 1 or p > total_pages else ''
+        act = ' active' if p == page else ''
+        sf_param = f'&source_file={escape(filter_file)}' if filter_file else ''
+        q_param = f'&q={escape(search_q)}' if search_q else ''
+        return f'<li class="page-item{dis}{act}"><a class="page-link" href="?page={p}{sf_param}{q_param}">{txt}</a></li>'
+
+    pag_items = pg_link(page - 1, '&laquo;')
+    for p in range(max(1, page - 2), min(total_pages, page + 2) + 1):
+        pag_items += pg_link(p)
+    pag_items += pg_link(page + 1, '&raquo;')
+
+    pagination_html = f'''
+    <nav aria-label="FIR pagination" class="mt-2">
+      <ul class="pagination justify-content-center">{pag_items}</ul>
+      <p class="text-center text-muted small">
+        Showing {offset + 1}–{min(offset + per_page, total_rows)} of {total_rows} records
+      </p>
+    </nav>''' if total_pages > 1 else ''
+
+    no_data = f'''
+    <div class="card shadow-sm p-4 text-center" style="border-left:4px solid #D6cfc4;">
+      <p class="text-muted mb-2">No records found matching your search query.</p>
+      <a href="/fir-management" class="btn btn-outline-secondary btn-sm">Clear Filters</a>
+    </div>''' if not grouped else ''
+
+    chart_script = f'<script>{all_chart_js}</script>' if all_chart_js else ''
+
+    body = f'''
+    <!-- Main header banner -->
+    <div class="row g-4 mb-4">
+      <div class="col-12">
+        <div class="p-4 rounded-3 card shadow-sm" style="background:#f9fafb; border:2px solid #D6cfc4;">
+          <div class="d-flex flex-wrap justify-content-between align-items-center gap-3">
+            <div>
+              <span class="badge bg-secondary mb-2">Central Crime Registry</span>
+              <h2 class="fw-bold mb-1" style="color:#1f2937;">
+                FIR Management System
+              </h2>
+              <p class="text-muted mb-0">
+                Official National Crime Records Bureau (NCRB) repository &amp; First Information incident data across Accidental Deaths &amp; Suicides in India (ADSI). Real imported official records.
+              </p>
+            </div>
+            <div class="d-flex flex-wrap gap-2">
+              <a href="/fir-management" class="btn btn-outline-secondary btn-sm fw-semibold">Reset Filters</a>
+              <a href="/crime-statistics" class="btn btn-warning fw-semibold btn-sm">Crime Statistics</a>
+            </div>
+          </div>
         </div>
+      </div>
     </div>
 
-    <div class="row g-4">
-        <div class="col-lg-7"><div class="card p-4">
-            <h4 class="text-info mb-3">NCRB Crime Categories Reference</h4>
-            <div class="table-responsive"><table class="table table-dark table-hover"><thead><tr><th>Crime Category</th><th>Reported Cases</th></tr></thead><tbody>{category_rows}</tbody></table></div>
-        </div></div>
-        <div class="col-lg-5"><div class="card p-4">
-            <h4 class="text-info mb-3">File New FIR</h4>
-            <form method="POST" action="/fir-management/add">
-                <input class="form-control mb-2" name="crime_type" list="crime-categories" placeholder="Crime type" required><datalist id="crime-categories">{category_options}</datalist>
-                <textarea class="form-control mb-2" name="crime_description" placeholder="Crime description" rows="2" required></textarea>
-                <div class="row g-2 mb-2"><div class="col"><input type="date" class="form-control" name="crime_date" required></div><div class="col"><input type="time" class="form-control" name="crime_time"></div></div>
-                <input class="form-control mb-2" name="location" placeholder="Location" required>
-                <div class="row g-2 mb-2"><div class="col"><input class="form-control" name="city" placeholder="City" required></div><div class="col"><input class="form-control" name="state" placeholder="State" required></div></div>
-                <select class="form-select mb-3" name="severity"><option>Minor</option><option selected>Major</option><option>Critical</option></select>
-                <input class="form-control mb-2" name="victim_name" placeholder="Victim / complainant name" required>
-                <div class="row g-2 mb-2"><div class="col"><input type="number" min="0" class="form-control" name="victim_age" placeholder="Age"></div><div class="col"><select class="form-select" name="victim_gender"><option>Male</option><option>Female</option><option>Other</option></select></div></div>
-                <input class="form-control mb-2" name="victim_phone" placeholder="Victim phone" required><input class="form-control mb-2" name="victim_address" placeholder="Victim address">
-                <input class="form-control mb-2" name="fir_number" placeholder="FIR number" required><select class="form-select mb-2" name="station_id" required>{station_options}</select>
-                <input type="date" class="form-control mb-2" name="filing_date" required><textarea class="form-control mb-3" name="fir_description" placeholder="FIR narrative" rows="2" required></textarea>
-                <button type="submit" class="btn btn-warning w-100">File FIR</button>
-            </form>
-        </div></div>
+    <!-- Summary stat cards -->
+    <div class="row g-4 mb-4">
+      <div class="col-md-3 col-6">
+        <div class="card stats-card p-3 shadow-sm text-center">
+          <h6 class="text-uppercase text-secondary small">Total Records</h6>
+          <span class="fs-2 fw-bold text-info">{total_all}</span>
+          <br><small class="text-muted">Imported NCRB entries</small>
+        </div>
+      </div>
+      <div class="col-md-3 col-6">
+        <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color:#2d6a4f;">
+          <h6 class="text-uppercase text-secondary small">NCRB Source Tables</h6>
+          <span class="fs-2 fw-bold text-success">{distinct_files}</span>
+          <br><small class="text-muted">Active datasets</small>
+        </div>
+      </div>
+      <div class="col-md-3 col-6">
+        <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color:#d97706;">
+          <h6 class="text-uppercase text-secondary small">Publication Year</h6>
+          <span class="fs-2 fw-bold text-warning">2023</span>
+          <br><small class="text-muted">Government of India</small>
+        </div>
+      </div>
+      <div class="col-md-3 col-6">
+        <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color:#991b1b;">
+          <h6 class="text-uppercase text-secondary small">Report Series</h6>
+          <span class="fs-2 fw-bold text-danger">NCRB ADSI</span>
+          <br><small class="text-muted">Official Gazette Data</small>
+        </div>
+      </div>
     </div>
-    """
+
+    <!-- Filter & Search card -->
+    <div class="card shadow-sm p-3 mb-4">
+      <form method="GET" class="row g-2 align-items-end">
+        <div class="col-md-5">
+          <label class="form-label fw-semibold small" style="color:#4b5563;">Filter by NCRB Source Table</label>
+          <select name="source_file" class="form-select form-select-sm"
+                  onchange="this.form.submit()">
+            {file_options}
+          </select>
+        </div>
+        <div class="col-md-5">
+          <label class="form-label fw-semibold small" style="color:#4b5563;">Search Within Incident Records</label>
+          <input type="text" name="q" value="{escape(search_q)}"
+                 class="form-control form-control-sm"
+                 placeholder="e.g. Two-Wheeler, Hanging, Bankruptcy, Profession, Cause...">
+        </div>
+        <div class="col-md-2 d-flex gap-1">
+          <button type="submit" class="btn btn-primary btn-sm flex-grow-1">Search</button>
+          <a href="/fir-management" class="btn btn-outline-secondary btn-sm">&#x2715;</a>
+        </div>
+      </form>
+    </div>
+
+    <!-- Per-table data sections -->
+    {sections_html or no_data}
+
+    {pagination_html}
+    {chart_script}
+    '''
     return render_page(body)
 
 
@@ -3197,7 +3457,7 @@ def crime_patterns():
   <div class="row mb-4">
     <div class="col-12">
       <h2 style="color: #1f2937;">AI-Powered Crime Pattern &amp; Similarity Detector</h2>
-      <p class="text-muted">Analyze historical crime trends, detect anomalies, find similar crime patterns across regions, and identify clusters — powered by real NCRB/Kaggle data (2001–2013).</p>
+      <p class="text-muted">Analyze historical crime trends, detect anomalies, find similar crime patterns across regions, and categorize regions — powered by real NCRB/Kaggle data (2001–2013).</p>
     </div>
   </div>
 
@@ -3264,10 +3524,13 @@ def _build_pattern_results(data, crime_type, state, district):
 
     trend    = data.get('trend', {})
     spikes   = data.get('spikes', [])
-    similar  = data.get('similarity_rankings', [])
+    similar  = data.get('similarities', [])
     clusters = data.get('clusters', {})
-    insights = data.get('ai_insights', [])
-    series   = data.get('target_series', {})
+    insights = data.get('insights', [])
+    # run_full_analysis returns 'years' (list) and 'counts' (list); reconstruct dict
+    _years   = data.get('years', [])
+    _counts  = data.get('counts', [])
+    series   = dict(zip(_years, _counts)) if _years else {}
     comp_ser = data.get('comparison_series', {})
 
     location_label = f"{state}" + (f" / {district}" if district else " (State-level)")
@@ -3300,14 +3563,14 @@ def _build_pattern_results(data, crime_type, state, district):
     # ── Spikes / Drops ──────────────────────────────────────────────────────
     spike_items = ''
     for sp in spikes:
-        ev_type  = sp.get('event', 'spike')
+        ev_type  = sp.get('type', 'Spike')
         yr       = sp.get('year', '')
-        pct      = sp.get('change_pct', 0)
-        prev_val = sp.get('prev_value', 0)
-        cur_val  = sp.get('value', 0)
-        tag  = '[Spike]' if ev_type == 'spike' else '[Drop]'
-        col  = '#991b1b' if ev_type == 'spike' else '#374151'
-        spike_items += f'<div class="d-flex align-items-center mb-2 p-2 rounded" style="background: #f9fafb; border-left: 4px solid {col};"><span class="badge bg-secondary me-2">{tag}</span> <b class="ms-1">{yr}</b>: {ev_type.capitalize()} of <b>{pct:+.1f}%</b> &nbsp;<span class="text-muted">({int(prev_val):,} → {int(cur_val):,} cases)</span></div>'
+        pct      = sp.get('pct_change', 0)
+        prev_val = sp.get('prev_val', 0)
+        cur_val  = sp.get('curr_val', 0)
+        tag  = '[Spike]' if ev_type == 'Spike' else '[Drop]'
+        col  = '#991b1b' if ev_type == 'Spike' else '#374151'
+        spike_items += f'<div class="d-flex align-items-center mb-2 p-2 rounded" style="background: #f9fafb; border-left: 4px solid {col};"><span class="badge bg-secondary me-2">{tag}</span> <b class="ms-1">{yr}</b>: {ev_type} of <b>{pct:+.1f}%</b> &nbsp;<span class="text-muted">({int(prev_val):,} → {int(cur_val):,} cases)</span></div>'
 
     spikes_html = f"""
 <div class="card mb-4 p-4">
@@ -3326,11 +3589,16 @@ def _build_pattern_results(data, crime_type, state, district):
     for idx, sim in enumerate(similar[:3]):
         loc_name = sim.get('location', '')
         s_data   = comp_ser.get(loc_name, {})
-        vals     = [s_data.get(y, 0) for y in years_sorted]
+        # comp_ser values might be lists; handle both dict and list
+        if isinstance(s_data, list):
+            vals = s_data + [0] * max(0, len(years_sorted) - len(s_data))
+            vals = vals[:len(years_sorted)]
+        else:
+            vals = [s_data.get(y, 0) for y in years_sorted]
         color    = palette[idx]
         top3_datasets += f""",
       {{
-        label: '{escape(loc_name)} ({sim.get("score_pct", 0):.1f}%)',
+        label: '{escape(loc_name)} ({sim.get("score", 0):.1f}%)',
         data: {vals},
         borderColor: '{color}',
         backgroundColor: 'transparent',
@@ -3420,32 +3688,39 @@ new Chart(document.getElementById('trendChart'), {{
 </div>
 {sim_script_content}"""
 
-    # ── Cluster Cards ───────────────────────────────────────────────────────
+    
+    # ── Region Cards ────────────────────────────────────────────────────────
+    badge_colors = {
+        'danger': '#dc2626',
+        'success': '#16a34a',
+        'primary': '#2563eb',
+        'warning': '#d97706',
+    }
     cluster_cards = ''
-    cluster_meta = [
-        ('high_volume_high_growth',   'High Volume + High Growth',   '#991b1b', '#fee2e2'),
-        ('high_volume_low_growth',    'High Volume + Stable/Slow',   '#ea580c', '#fff7ed'),
-        ('low_volume_high_growth',    'Low Volume + High Growth',    '#ca8a04', '#fefce8'),
-        ('low_volume_low_growth',     'Low Volume + Low Activity',   '#16a34a', '#f0fdf4'),
-    ]
-    for key, label, border, bg in cluster_meta:
-        members = clusters.get(key, [])
-        badges  = ' '.join(f'<span class="badge me-1" style="background:{border};font-size:0.75rem;">{escape(m)}</span>' for m in members)
+    # clusters dict keys are descriptive names; each value contains members list
+    for key, meta in clusters.items():
+        label = key.replace("Cluster", "Region")
+        border = badge_colors.get(meta.get('badge'), '#2563eb')
+        desc = meta.get('description', '')
+        members = meta.get('members', [])
+        badges = ' '.join(f'<span class="badge me-1 mb-1" style="background: #f3f4f6; color: #000000; border: 1px solid #cbd5e1; font-size: 0.75rem; font-weight: 600; padding: 4px 8px;">{escape(m)}</span>' for m in members)
         cluster_cards += f"""
 <div class="col-md-6 mb-3">
-  <div class="card h-100 p-3" style="border-left: 4px solid {border}; background: {bg};">
-    <h6 style="color:{border};">{label}</h6>
-    <p class="text-muted small mb-2">{len(members)} region(s)</p>
-    <div>{badges if badges else '<span class="text-muted small">No regions in this cluster</span>'}</div>
+  <div class="card h-100 p-3" style="border-left: 4px solid {border}; background: #ffffff; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+    <h6 style="color: #000000; font-weight: 700;">{escape(label)}</h6>
+    <p class="small mb-1" style="color: #4b5563;">{escape(desc)}</p>
+    <p class="small mb-2" style="color: #000000; font-weight: 600;">{len(members)} region(s)</p>
+    <div>{badges if badges else '<span class="small" style="color: #000000;">No regions found</span>'}</div>
   </div>
 </div>"""
-
+    
     clusters_html = f"""
 <div class="card mb-4 p-4">
-  <h5 style="color: #1f2937;">Crime Clusters — {escape(crime_type)}</h5>
-  <p class="text-muted small">Regions grouped by crime volume &amp; growth trend across the selected period.</p>
+  <h5 style="color: #000000; font-weight: 700;">Region — {escape(crime_type)}</h5>
+  <p class="small" style="color: #374151;">Regions grouped by crime volume &amp; growth trend across the selected period.</p>
   <div class="row">{cluster_cards}</div>
 </div>"""
+
 
     # ── AI Insights ─────────────────────────────────────────────────────────
     insight_type_style = {
@@ -3470,6 +3745,243 @@ new Chart(document.getElementById('trendChart'), {{
 
     return trend_html + spikes_html + trend_chart_html + similarity_html + clusters_html + insights_html
 
+
+# FIR Search Feature
+@app.route('/search-fir', methods=['GET', 'POST'])
+@login_required
+def search_fir():
+    if request.method == 'POST':
+        fir_number = request.form.get('fir_number', '').strip()
+        conn = get_db_connection()
+        fir = conn.execute("SELECT fir_number FROM FIR WHERE fir_number = ?", (fir_number,)).fetchone()
+        conn.close()
+        if fir:
+            return redirect(url_for('fir_details', fir_number=fir['fir_number']))
+        else:
+            return render_page('''
+            <h3 class="text-danger">FIR not found in the available database.</h3>
+            <a href="/search-fir" class="btn btn-primary mt-3">Search Again</a>
+            ''')
+    # GET request – show search form
+    form_html = '''
+    <h3 class="mb-4">Search FIR by Number</h3>
+    <form method="POST" action="/search-fir" class="row g-3">
+        <div class="col-auto">
+            <input type="text" name="fir_number" placeholder="Enter FIR Number" class="form-control" required>
+        </div>
+        <div class="col-auto">
+            <button type="submit" class="btn btn-primary">Search</button>
+        </div>
+    </form>
+    '''
+    return render_page(form_html)
+
+@app.route('/fir/<fir_number>')
+@login_required
+def fir_details(fir_number):
+    conn = get_db_connection()
+    fir = conn.execute('''
+        SELECT f.*, c.crime_type, c.description AS crime_desc,
+               v.name AS victim_name, v.age AS victim_age, v.gender AS victim_gender,
+               v.address AS victim_address, v.phone AS victim_phone,
+               s.station_name, s.station_address
+        FROM FIR f
+        LEFT JOIN crimes c ON f.crime_id = c.crime_id
+        LEFT JOIN victims v ON f.victim_id = v.victim_id
+        LEFT JOIN police_stations s ON f.station_id = s.station_id
+        WHERE f.fir_number = ?
+    ''', (fir_number,)).fetchone()
+    conn.close()
+    if not fir:
+        return render_page('''
+        <h3 class="text-danger">FIR not found in the available database.</h3>
+        <a href="/search-fir" class="btn btn-primary mt-3">Search FIR</a>
+        ''', 404)
+    details_html = f'''<h3 class="mb-4">FIR Details: {fir["fir_number"]}</h3>
+    <table class="table table-bordered">
+        <tr><th>FIR Number</th><td>{fir["fir_number"]}</td></tr>
+        <tr><th>Filing Date</th><td>{fir["filing_date"]}</td></tr>
+        <tr><th>Status</th><td>{fir["status"]}</td></tr>
+        <tr><th>Crime Type</th><td>{fir.get("crime_type", "")}</td></tr>
+        <tr><th>Crime Description</th><td>{fir.get("crime_desc", "")}</td></tr>
+        <tr><th>Victim Name</th><td>{fir.get("victim_name", "")}</td></tr>
+        <tr><th>Victim Age</th><td>{fir.get("victim_age", "")}</td></tr>
+        <tr><th>Victim Gender</th><td>{fir.get("victim_gender", "")}</td></tr>
+        <tr><th>Victim Phone</th><td>{fir.get("victim_phone", "")}</td></tr>
+        <tr><th>Victim Address</th><td>{fir.get("victim_address", "")}</td></tr>
+        <tr><th>Police Station</th><td>{fir.get("station_name", "")}</td></tr>
+        <tr><th>Station Address</th><td>{fir.get("station_address", "")}</td></tr>
+        <tr><th>FIR Description</th><td>{fir.get("description", "")}</td></tr>
+    </table>
+    <a href="/search-fir" class="btn btn-secondary mt-3">Search Another FIR</a>
+    '''
+    return render_page(details_html)
+
+@app.route('/recent-firs')
+@login_required
+def recent_firs():
+    conn = get_db_connection()
+    firs = conn.execute("SELECT fir_number, filing_date FROM FIR ORDER BY filing_date DESC LIMIT 10").fetchall()
+    conn.close()
+    rows = ''
+    for f in firs:
+        rows += f'''<tr>
+            <td><a href="/fir/{{escape(f["fir_number"])}}">{{escape(f["fir_number"])}}</a></td>
+            <td>{{escape(f["filing_date"])}}</td>
+        </tr>'''
+    body = f'''<h3 class="mb-4">Recent FIRs</h3>
+    <table class="table table-hover">
+        <thead><tr><th>FIR Number</th><th>Filing Date</th></tr></thead>
+        <tbody>{rows if rows else '<tr><td colspan="2" class="text-center text-muted">No FIR records found.</td></tr>'}</tbody>
+    </table>'''
+    return render_page(body)
+
+# ---------------------------------------------------------------------
+# NCRB Data Import (Admin) and Browsing
+# ---------------------------------------------------------------------
+@app.route('/admin/ncrb-import', methods=['GET', 'POST'])
+@login_required
+@roles_required('District Magistrate')
+def ncrb_import():
+    """Upload CSV/XLSX official NCRB dataset and import into ncrb_crime_data table.
+    The admin can upload a file; the server will parse, clean, and insert rows.
+    Duplicate (year,state,district,crime_category,crime_type) rows are ignored via UNIQUE constraint.
+    """
+    if request.method == 'POST':
+        if 'file' not in request.files:
+            flash('No file part', 'danger')
+            return redirect(request.url)
+        file = request.files['file']
+        if file.filename == '':
+            flash('No selected file', 'danger')
+            return redirect(request.url)
+        filename = secure_filename(file.filename)
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in {'.csv', '.xlsx'}:
+            flash('Unsupported file type. Use CSV or XLSX.', 'danger')
+            return redirect(request.url)
+        tmp_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(tmp_path)
+        inserted = 0
+        skipped = 0
+        errors = []
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            if ext == '.csv':
+                import csv
+                with open(tmp_path, newline='', encoding='utf-8-sig', errors='ignore') as f:
+                    reader = csv.DictReader(f)
+                    for row_num, row in enumerate(reader, start=2):
+                        year = row.get('Year') or row.get('YEAR')
+                        state = row.get('State/UT') or row.get('STATE/UT') or row.get('State')
+                        district = row.get('District')
+                        if not year or not state or not district:
+                            skipped += 1
+                            continue
+                        try:
+                            year = int(year)
+                        except ValueError:
+                            skipped += 1
+                            continue
+                        state = state.strip().title()
+                        district = district.strip().title()
+                        for col, val in row.items():
+                            if col in ('Year','YEAR','State/UT','STATE/UT','State','District'):
+                                continue
+                            if not val:
+                                continue
+                            try:
+                                cases = int(val)
+                            except ValueError:
+                                continue
+                            if cases <= 0:
+                                continue
+                            crime_type = col.strip()
+                            crime_category = 'IPC'
+                            try:
+                                cur.execute(
+                                    "INSERT OR IGNORE INTO ncrb_crime_data (year, state, district, crime_category, crime_type, reported_cases) VALUES (?,?,?,?,?,?)",
+                                    (year, state, district, crime_category, crime_type, cases)
+                                )
+                                inserted += cur.rowcount
+                            except Exception as e:
+                                errors.append(f'Row {row_num}: {e}')
+            else:
+                try:
+                    import openpyxl
+                except ImportError:
+                    flash('openpyxl not installed – cannot process XLSX files.', 'danger')
+                    return redirect(request.url)
+                wb = openpyxl.load_workbook(tmp_path, data_only=True)
+                ws = wb.active
+                headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+                for idx, row in enumerate(ws.iter_rows(min_row=2), start=2):
+                    row_dict = {headers[i]: row[i].value for i in range(len(headers))}
+                    year = row_dict.get('Year') or row_dict.get('YEAR')
+                    state = row_dict.get('State/UT') or row_dict.get('STATE/UT') or row_dict.get('State')
+                    district = row_dict.get('District')
+                    if not year or not state or not district:
+                        skipped += 1
+                        continue
+                    try:
+                        year = int(year)
+                    except ValueError:
+                        skipped += 1
+                        continue
+                    state = str(state).strip().title()
+                    district = str(district).strip().title()
+                    for col, val in row_dict.items():
+                        if col in ('Year','YEAR','State/UT','STATE/UT','State','District'):
+                            continue
+                        if val is None:
+                            continue
+                        try:
+                            cases = int(val)
+                        except ValueError:
+                            continue
+                        if cases <= 0:
+                            continue
+                        crime_type = str(col).strip()
+                        crime_category = 'IPC'
+                        try:
+                            cur.execute(
+                                "INSERT OR IGNORE INTO ncrb_crime_data (year, state, district, crime_category, crime_type, reported_cases) VALUES (?,?,?,?,?,?)",
+                                (year, state, district, crime_category, crime_type, cases)
+                            )
+                            inserted += cur.rowcount
+                        except Exception as e:
+                            errors.append(f'Row {idx}: {e}')
+            conn.commit()
+            flash(f'Import completed – inserted: {inserted}, skipped: {skipped}.', 'success')
+            if errors:
+                flash('Some rows produced errors – see server log.', 'warning')
+        finally:
+            conn.close()
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        return redirect(url_for('ncrb_browse'))
+    # GET – show upload form
+    form_html = '''
+    <h3 class="mb-4">Import Official NCRB Data</h3>
+    <form method="POST" enctype="multipart/form-data" class="row g-3">
+        <div class="col-auto">
+            <input type="file" name="file" class="form-control" accept=".csv,.xlsx" required>
+        </div>
+        <div class="col-auto">
+            <button type="submit" class="btn btn-primary">Upload</button>
+        </div>
+    </form>
+    '''
+    return render_page(form_html)
+
+@app.route('/ncrb-data')
+@login_required
+def ncrb_browse():
+    """Redirect legacy /ncrb-data endpoint to the new FIR Management System."""
+    return redirect(url_for('fir_management', **request.args))
 
 if __name__ == '__main__':
     init_db()
