@@ -43,9 +43,15 @@ class CBIFir(db.Model):
     fir_number = db.Column(db.String(50), nullable=True)
     fir_date = db.Column(db.Date, nullable=True)
     title_or_subject = db.Column(db.String(500), nullable=True)
+    offence = db.Column(db.String(500), nullable=True)
+    agency = db.Column(db.String(200), default="Central Bureau of Investigation (CBI)")
+    branch = db.Column(db.String(200), nullable=True)
+    location = db.Column(db.String(200), nullable=True)
+    status = db.Column(db.String(100), default="Under Investigation")
+    source = db.Column(db.String(200), default="Public CBI Portal (cbi.gov.in)")
 
-    pdf_url = db.Column(db.String(500), nullable=False)
-    source_page_url = db.Column(db.String(500), nullable=False)
+    pdf_url = db.Column(db.String(500), nullable=True)
+    source_page_url = db.Column(db.String(500), default="https://cbi.gov.in/view-fir")
 
     first_seen_at = db.Column(db.DateTime, default=datetime.utcnow)
     last_seen_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -57,7 +63,14 @@ class CBIFir(db.Model):
             "fir_number": self.fir_number,
             "fir_date": self.fir_date.isoformat() if self.fir_date else None,
             "title_or_subject": self.title_or_subject,
+            "offence": self.offence,
+            "agency": self.agency,
+            "branch": self.branch,
+            "location": self.location,
+            "status": self.status,
+            "source": self.source,
             "pdf_url": self.pdf_url,
+            "source_page_url": self.source_page_url,
             "first_seen_at": self.first_seen_at.isoformat() if self.first_seen_at else None,
             "last_seen_at": self.last_seen_at.isoformat() if self.last_seen_at else None,
         }

@@ -3,6 +3,11 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+
+# Java / JDK (large binaries — do not commit)
+Java/
+*.jdk/
+*.jsa
 .Python
 *.egg
 *.egg-info/
@@ -17,6 +22,7 @@ env/
 # SQLite databases (keep structure, not large data files)
 data/crms.db
 data/crms_backup.db
+data/cms.db
 
 # macOS
 .DS_Store

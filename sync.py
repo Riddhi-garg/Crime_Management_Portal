@@ -7,8 +7,12 @@ inserts new ones / updates the "last_seen_at" timestamp on existing ones.
 
 import logging
 
-from .models import db, CBIFir
-from .scraper import get_current_firs, CBIScraperError
+try:
+    from models import db, CBIFir
+    from scraper import get_current_firs, CBIScraperError
+except ImportError:
+    from .models import db, CBIFir
+    from .scraper import get_current_firs, CBIScraperError
 
 logger = logging.getLogger(__name__)
 

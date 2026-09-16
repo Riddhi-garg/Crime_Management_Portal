@@ -2,7 +2,6 @@
 Crime Management Portal - Application Entry Point & Web Server
 Integrated with Real Kaggle/NCRB Crime Statistics Dataset (2001-2014)
 """
-
 import os
 import json
 import sqlite3
@@ -332,6 +331,19 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS cbi_firs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        rc_number TEXT UNIQUE NOT NULL,
+        fir_number TEXT,
+        fir_date DATE,
+        title_or_subject TEXT,
+        pdf_url TEXT NOT NULL,
+        source_page_url TEXT NOT NULL DEFAULT 'https://cbi.gov.in/view-fir',
+        first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
 
     # Additional tables for analytics
     cursor.execute("""
@@ -551,6 +563,20 @@ def init_db():
                 "INSERT INTO children_crime_statistics (crime_type, case_count) VALUES (?,?)",
                 (crime_type, total)
             )
+
+    # Auto-synchronize official NCRB CSV files from ncrb/ folder
+    try:
+        from import_ncrb_data import sync_ncrb_csvs
+        sync_ncrb_csvs(conn)
+    except Exception as e:
+        print(f"[WARN] Could not auto-sync NCRB CSV directory: {e}")
+
+    # Auto-synchronize genuine public CBI data from data/cbi/ folder if present
+    try:
+        from import_cbi_data import sync_all_cbi_files
+        sync_all_cbi_files(conn)
+    except Exception as e:
+        print(f"[WARN] Could not auto-sync CBI directory: {e}")
 
     conn.commit()
     conn.close()
@@ -2943,26 +2969,32 @@ def fir_management():
     TABLE_DESCRIPTIONS = {
         'NCRB_ADSI_2023_Table_1A.3_2.csv':          'Table 1A.3.2 — Accidental Deaths by Mode of Transport (2023)',
         'NCRB_ADSI_2023_Table_1A.3_2 (1).csv':      'Table 1A.3.2 (Duplicate File) — Accidental Deaths by Mode of Transport (2023)',
+        'NCRB_ADSI_2023_Table_1.11.csv':            'Table 1.11 — Accidental Fire Incidents, Injuries & Deaths by Cause (2022–2023)',
         'NCRB_ADSI_2023_Table_2.4.csv':              'Table 2.4 — Causes of Suicides by Gender (2022–2023)',
         'NCRB_ADSI_2023_Table_2.6.csv':              'Table 2.6 — Suicides by Profession of Victim (2023)',
         'NCRB_ADSI_2023_Table_2.12.csv':             'Table 2.12 — Means/Mode of Suicide by Gender (2023)',
         'AkolaPolice2025_0_1.csv':                   'Akola District Police Station Crime & Performance Metrics (2025)',
         'All_India_Index_Upto_Apr25.csv':            'All India Consumer & Socio-Economic Price Index (Upto April 2025)',
         'All_India_Index_Upto_Jan25.csv':            'All India Consumer & Socio-Economic Price Index (Upto January 2025)',
+        'Rajya_Sabha_Session_234_AU2375_1.csv':     'Rajya Sabha Parliamentary Report (Session 234) — Foreign National Arrivals by Country (2011–2013)',
         'Rajya_Sabha_Session_237_AU1971_1.1.csv':   'Rajya Sabha Parliamentary Report (Session 237) — Crimes Against Children',
         'rs_session240_au2685_1.1.csv':             'Rajya Sabha Parliamentary Report (Session 240) — National Crime Head Statistics',
+        'rs_session_239_AU1970_1.2.csv':            'Rajya Sabha Parliamentary Report (Session 239) — Crimes Committed Against Women by State/UT',
     }
     TABLE_ICONS = {
         'NCRB_ADSI_2023_Table_1A.3_2.csv':          '&#128663;',
         'NCRB_ADSI_2023_Table_1A.3_2 (1).csv':      '&#128663;',
+        'NCRB_ADSI_2023_Table_1.11.csv':            '&#128293;',
         'NCRB_ADSI_2023_Table_2.4.csv':              '&#128202;',
         'NCRB_ADSI_2023_Table_2.6.csv':              '&#128084;',
         'NCRB_ADSI_2023_Table_2.12.csv':             '&#9888;',
         'AkolaPolice2025_0_1.csv':                   '&#128110;',
         'All_India_Index_Upto_Apr25.csv':            '&#128200;',
         'All_India_Index_Upto_Jan25.csv':            '&#128200;',
+        'Rajya_Sabha_Session_234_AU2375_1.csv':     '&#127757;',
         'Rajya_Sabha_Session_237_AU1971_1.1.csv':   '&#128103;',
         'rs_session240_au2685_1.1.csv':             '&#128203;',
+        'rs_session_239_AU1970_1.2.csv':            '&#128105;',
     }
 
     def is_num(v):
@@ -3292,46 +3324,216 @@ def update_criminal_status(criminal_id):
 
 @app.route('/case-files')
 def case_files():
+    search_q = request.args.get('q', '').strip()
+    filter_source = request.args.get('source', '').strip()
+
     conn = get_db_connection()
-    cases = conn.execute("""
-        SELECT c.*, f.fir_number, po.name as officer_name 
+    cur = conn.cursor()
+
+    # 1. Fetch public CBI cases (if cbi_firs table exists)
+    cbi_rows = []
+    if _table_exists(conn, 'cbi_firs'):
+        cbi_sql = """
+            SELECT 
+                id,
+                rc_number AS case_number,
+                fir_number,
+                title_or_subject AS title_offence,
+                fir_date AS case_date,
+                'Central Bureau of Investigation (CBI)' AS agency,
+                'National Jurisdiction' AS location,
+                'Under Investigation' AS status,
+                'High' AS priority,
+                pdf_url,
+                source_page_url,
+                'Public CBI Case' AS source_type,
+                'cbi' AS source_key
+            FROM cbi_firs
+        """
+        cbi_params = []
+        cbi_clauses = []
+        if search_q:
+            cbi_clauses.append("(rc_number LIKE ? OR fir_number LIKE ? OR title_or_subject LIKE ?)")
+            q_pat = f"%{search_q}%"
+            cbi_params.extend([q_pat, q_pat, q_pat])
+        if cbi_clauses:
+            cbi_sql += " WHERE " + " AND ".join(cbi_clauses)
+        cbi_sql += " ORDER BY id DESC"
+        cbi_rows = cur.execute(cbi_sql, cbi_params).fetchall()
+
+    # 2. Fetch portal registered cases
+    reg_rows = []
+    reg_sql = """
+        SELECT 
+            c.case_id AS id,
+            c.case_number,
+            f.fir_number,
+            COALESCE(cr.crime_type, f.description, 'Not available') AS title_offence,
+            COALESCE(c.start_date, f.filing_date, 'Not available') AS case_date,
+            COALESCE(ps.station_name, 'Not available') AS agency,
+            COALESCE(cr.city || ', ' || cr.state, ps.city || ', ' || ps.state, 'Not available') AS location,
+            c.case_status AS status,
+            c.priority,
+            NULL AS pdf_url,
+            NULL AS source_page_url,
+            'Portal Registered Case' AS source_type,
+            'registered' AS source_key,
+            po.name AS officer_name,
+            c.remarks
         FROM cases c
         LEFT JOIN FIR f ON c.fir_id = f.fir_id
+        LEFT JOIN crimes cr ON f.crime_id = cr.crime_id
+        LEFT JOIN police_stations ps ON f.station_id = ps.station_id
         LEFT JOIN police_officers po ON c.investigating_officer_id = po.officer_id
-        ORDER BY c.case_id DESC
-    """).fetchall()
-    open_firs = conn.execute("SELECT fir_id, fir_number FROM FIR WHERE fir_id NOT IN (SELECT fir_id FROM cases)").fetchall()
-    officers = conn.execute("SELECT * FROM police_officers ORDER BY name").fetchall()
+    """
+    reg_params = []
+    reg_clauses = []
+    if search_q:
+        reg_clauses.append("(c.case_number LIKE ? OR f.fir_number LIKE ? OR cr.crime_type LIKE ? OR cr.city LIKE ? OR cr.state LIKE ?)")
+        q_pat = f"%{search_q}%"
+        reg_params.extend([q_pat, q_pat, q_pat, q_pat, q_pat])
+    if reg_clauses:
+        reg_sql += " WHERE " + " AND ".join(reg_clauses)
+    reg_sql += " ORDER BY c.case_id DESC"
+    reg_rows = cur.execute(reg_sql, reg_params).fetchall()
+
+    # Apply source filter if selected
+    if filter_source == 'cbi':
+        combined_cases = [dict(r) for r in cbi_rows]
+    elif filter_source == 'registered':
+        combined_cases = [dict(r) for r in reg_rows]
+    else:
+        combined_cases = [dict(r) for r in cbi_rows] + [dict(r) for r in reg_rows]
+
     dataset_years = conn.execute("SELECT year, SUM(case_count) AS total FROM crime_statistics GROUP BY year ORDER BY year").fetchall() if _table_exists(conn, 'crime_statistics') else []
     conn.close()
 
-    cases_html = "".join([f"""
-    <tr>
-        <td><span class="badge bg-primary fw-bold">{cs['case_number']}</span></td>
-        <td>{cs['fir_number']}</td>
-        <td>{cs['officer_name'] or 'Unassigned'}</td>
-        <td><span class="badge bg-warning text-dark">{cs['priority']}</span></td>
-        <td><form method="POST" action="/case-files/{cs['case_id']}/status" class="d-flex gap-1"><select name="case_status" class="form-select form-select-sm">{_options_html(CASE_STATUSES, cs['case_status'])}</select><button class="btn btn-sm btn-outline-primary">Update</button></form></td>
-        <td>{cs['start_date']}</td>
-        <td>{cs['remarks'] or ''}</td>
-    </tr>
-    """ for cs in cases]) or "<tr><td colspan='7' class='text-center text-muted py-4'>No active individual court cases registered. Overall statistical reports are available in <a href='/analytics'>Analytics</a>.</td></tr>"
+    # Build table rows
+    cases_html = ""
+    for cs in combined_cases:
+        is_cbi = cs.get('source_key') == 'cbi'
+        src_badge = '<span class="badge bg-primary">Public CBI Case</span>' if is_cbi else '<span class="badge bg-secondary">Portal Registered</span>'
+        
+        pdf_btn = f'<a href="{escape(cs["pdf_url"])}" target="_blank" class="btn btn-sm btn-outline-danger ms-1" title="Download FIR PDF">PDF</a>' if cs.get('pdf_url') else ''
+        
+        fir_display = escape(cs['fir_number']) if cs.get('fir_number') else '<span class="text-muted small">Not available</span>'
+        offence_display = escape(cs['title_offence']) if cs.get('title_offence') else '<span class="text-muted small">Not available</span>'
+        date_display = escape(str(cs['case_date'])) if cs.get('case_date') else '<span class="text-muted small">Not available</span>'
+        agency_display = escape(cs['agency']) if cs.get('agency') else '<span class="text-muted small">Not available</span>'
+        location_display = escape(cs['location']) if cs.get('location') else '<span class="text-muted small">Not available</span>'
+
+        if is_cbi:
+            status_display = f'<span class="badge bg-info text-dark">{escape(cs["status"])}</span>'
+        else:
+            status_display = f"""
+            <form method="POST" action="/case-files/{cs['id']}/status" class="d-flex gap-1">
+                <select name="case_status" class="form-select form-select-sm">
+                    {_options_html(CASE_STATUSES, cs['status'])}
+                </select>
+                <button class="btn btn-sm btn-outline-primary">Update</button>
+            </form>"""
+
+        cases_html += f"""
+        <tr>
+            <td class="fw-bold" style="color: #1f2937;">{escape(cs['case_number'])}</td>
+            <td>{fir_display}</td>
+            <td>{offence_display}</td>
+            <td>{date_display}</td>
+            <td>{agency_display}</td>
+            <td>{location_display}</td>
+            <td>{status_display}</td>
+            <td>{src_badge}{pdf_btn}</td>
+        </tr>
+        """
+
+    if not cases_html:
+        cases_html = """
+        <tr>
+            <td colspan="8" class="text-center py-5 text-muted">
+                <div class="mb-2" style="font-size: 1.15rem; color: #374151; font-weight: 600;">No Case Files Available</div>
+                <p class="mb-1" style="font-size: 0.88rem; color: #6b7280;">No public CBI case records or registered court cases match the current query.</p>
+                <p class="small text-muted mb-0">Public CBI FIR records will automatically display here when synchronized via the CBI feed.</p>
+            </td>
+        </tr>
+        """
+
     year_rows = "".join(f"<tr><td>{y['year']}</td><td>{y['total']:,}</td></tr>" for y in dataset_years) or "<tr><td colspan='2' class='text-center text-muted'>Run the dataset import to show yearly context.</td></tr>"
-    fir_options = "".join(f'<option value="{f["fir_id"]}">{f["fir_number"]}</option>' for f in open_firs) or '<option value="" disabled selected>No unassigned FIRs</option>'
-    officer_options = "".join(f'<option value="{o["officer_id"]}">{o["name"]} ({o["rank"]})</option>' for o in officers) or '<option value="">Unassigned</option>'
+    reset_btn = f'<a href="/case-files" class="btn btn-outline-secondary">Reset</a>' if (search_q or filter_source) else ''
 
     body = f"""
-    <h2 class="text-secondary mb-3">Active &amp; Closed Case Files</h2>
-    <div class="card p-4 mb-4">
+    <div class="d-flex justify-content-between align-items-center mb-3">
+        <h2 style="color: #1f2937; font-family: 'Times New Roman', Times, serif; font-weight: bold;">Case Files &amp; Judicial Oversight</h2>
+        <span class="badge bg-secondary fs-6">{len(combined_cases)} Total Cases</span>
+    </div>
+
+    <!-- Data Classification & Source Distinction Banner -->
+    <div class="card mb-4 p-3 shadow-sm" style="background-color: #f9fafb; border-left: 4px solid #374151; border-color: #dee2e6;">
+        <h6 class="fw-bold mb-1" style="color: #1f2937;">Data Classification &amp; Authority Notice</h6>
+        <p class="small mb-0" style="color: #4b5563;">
+            &bull; <strong>Public CBI Cases:</strong> Individual Regular Cases (RCs) and public FIR records sourced from the Central Bureau of Investigation.<br>
+            &bull; <strong>Portal Registered Cases:</strong> Individual case files linked to verified departmental FIR registrations.<br>
+            &bull; <strong>Official NCRB Statistics:</strong> Aggregated annual crime statistics compiled at the national/state/district level (available in <a href="/fir-management" class="fw-bold" style="color: #1f2937; text-decoration: underline;">FIR Management</a> and <a href="/analytics" class="fw-bold" style="color: #1f2937; text-decoration: underline;">Analytics</a>).
+        </p>
+    </div>
+
+    <!-- Search & Filter Bar -->
+    <div class="card p-3 mb-4 shadow-sm" style="border: 1px solid #D6cfc4;">
+        <form method="GET" action="/case-files" class="row g-2 align-items-center">
+            <div class="col-md-5">
+                <input type="text" name="q" value="{escape(search_q)}" class="form-control" placeholder="Search by Case/RC number, FIR number, offence, or location...">
+            </div>
+            <div class="col-md-4">
+                <select name="source" class="form-select">
+                    <option value="">All Sources (CBI &amp; Registered)</option>
+                    <option value="cbi" {'selected' if filter_source == 'cbi' else ''}>Public CBI Cases</option>
+                    <option value="registered" {'selected' if filter_source == 'registered' else ''}>Portal Registered Cases</option>
+                </select>
+            </div>
+            <div class="col-md-3 d-flex gap-2">
+                <button type="submit" class="btn text-white fw-semibold w-100" style="background-color: #374151;">Filter Cases</button>
+                {reset_btn}
+            </div>
+        </form>
+    </div>
+
+    <!-- Case Files Table -->
+    <div class="card p-0 mb-4 shadow-sm" style="border: 1px solid #D6cfc4;">
         <div class="table-responsive">
-            <table class="table table-dark table-hover align-middle">
-                <thead><tr><th>Case Number</th><th>FIR Ref</th><th>Investigating Officer</th><th>Priority</th><th>Status</th><th>Start Date</th><th>Remarks</th></tr></thead>
+            <table class="table table-hover align-middle mb-0" style="font-size: 0.88rem;">
+                <thead style="background-color: #e5e7eb; color: #1f2937;">
+                    <tr>
+                        <th>Case / RC Number</th>
+                        <th>FIR Number</th>
+                        <th>Crime / Offence</th>
+                        <th>Date</th>
+                        <th>Agency / Station</th>
+                        <th>Location</th>
+                        <th>Status</th>
+                        <th>Source</th>
+                    </tr>
+                </thead>
                 <tbody>{cases_html}</tbody>
             </table>
         </div>
     </div>
-    <div class="row g-4"><div class="col-lg-7"><div class="card p-4"><h4 class="text-info mb-3">NCRB Yearly Reference</h4><div class="table-responsive"><table class="table table-dark table-hover"><thead><tr><th>Year</th><th>Reported Cases</th></tr></thead><tbody>{year_rows}</tbody></table></div></div></div>
-    <div class="col-lg-5"><div class="card p-4"><h4 class="text-info mb-3">Open New Case File</h4><form method="POST" action="/case-files/add"><input class="form-control mb-2" name="case_number" placeholder="Case number" required><select class="form-select mb-2" name="fir_id" required>{fir_options}</select><select class="form-select mb-2" name="investigating_officer_id">{officer_options}</select><div class="row g-2 mb-2"><div class="col"><select class="form-select" name="priority"><option>Low</option><option selected>Medium</option><option>High</option></select></div><div class="col"><input type="date" class="form-control" name="start_date" required></div></div><textarea class="form-control mb-3" name="remarks" placeholder="Remarks" rows="2"></textarea><button type="submit" class="btn btn-warning w-100">Open Case</button></form></div></div></div>
+
+    <div class="row g-4">
+        <div class="col-12">
+            <div class="card p-4 shadow-sm" style="border: 1px solid #D6cfc4;">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h5 class="mb-0" style="color: #1f2937; font-weight: bold;">NCRB Yearly Context (Aggregated Reference)</h5>
+                    <span class="badge bg-secondary">Official NCRB Annual Data</span>
+                </div>
+                <p class="small text-muted mb-3">Historical national crime incidence totals compiled from NCRB official publications (2001–2013). These aggregate statistics provide background context and are distinct from individual Case/FIR files.</p>
+                <div class="table-responsive">
+                    <table class="table table-sm table-hover mb-0">
+                        <thead style="background-color: #f3f4f6;"><tr><th>Year</th><th>Total Recorded Cases</th></tr></thead>
+                        <tbody>{year_rows}</tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
     """
     return render_page(body)
 
@@ -3419,7 +3621,7 @@ def crime_patterns():
     # Build district dropdown options via JS; pre-populate if state selected
     districts_for_selected = get_districts_for_state(conn, sel_state) if sel_state else []
 
-    # ── Crime dropdown ──────────────────────────────────────────────────────
+    # Crime dropdown 
     crime_opts = ''.join(
         f'<option value="{c}" {"selected" if c == sel_crime else ""}>{c}</option>'
         for c in crimes
@@ -3441,7 +3643,7 @@ def crime_patterns():
         for y in years
     )
 
-    # ── Run analysis only when form submitted ───────────────────────────────
+    # Run analysis only when form submitted 
     results_html = ''
     if submitted:
         try:

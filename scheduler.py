@@ -14,7 +14,10 @@ import logging
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from .sync import sync_cbi_firs
+try:
+    from sync import sync_cbi_firs
+except ImportError:
+    from .sync import sync_cbi_firs
 
 logger = logging.getLogger(__name__)
 

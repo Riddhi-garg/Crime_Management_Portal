@@ -13,8 +13,12 @@ Endpoints:
 
 from flask import Blueprint, jsonify, current_app
 
-from .models import CBIFir
-from .sync import sync_cbi_firs
+try:
+    from models import CBIFir
+    from sync import sync_cbi_firs
+except ImportError:
+    from .models import CBIFir
+    from .sync import sync_cbi_firs
 
 cbi_bp = Blueprint("cbi_firs", __name__)
 
