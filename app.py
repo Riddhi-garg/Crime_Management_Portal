@@ -3,7 +3,9 @@ Crime Management Portal - Application Entry Point & Web Server
 Integrated with Real Kaggle/NCRB Crime Statistics Dataset (2001-2014)
 """
 import os
+import re
 import json
+import hashlib
 import sqlite3
 import datetime
 from datetime import timedelta
@@ -25,22 +27,22 @@ except ImportError:
 from crime_pattern_analysis import get_filter_options, get_districts_for_state, run_full_analysis
 
 
-# The four account types the portal issues logins to. Every users.role value
+# The two account types the portal issues logins to. Every users.role value
 # must be one of these; the login/registration flow only ever assigns one of
-# these four.
-ROLES = ['Citizen', 'Police', 'Court', 'District Magistrate']
+# these two.
+ROLES = ['Citizen', 'Police']
 
-# Which of the four roles may reach which write actions. View-only pages are
+# Which of the two roles may reach which write actions. View-only pages are
 # open to any signed-in user regardless of role.
 ROLE_PERMISSIONS = {
-    'add_police_station':   ['Police', 'District Magistrate'],
-    'add_police_officer':   ['Police', 'District Magistrate'],
-    'add_fir':               ['Citizen', 'Police', 'District Magistrate'],
-    'update_fir_status':     ['Police', 'District Magistrate'],
-    'add_criminal':          ['Police', 'District Magistrate'],
-    'update_criminal_status':['Police', 'District Magistrate'],
-    'add_case':               ['Court', 'Police', 'District Magistrate'],
-    'update_case_status':     ['Court', 'District Magistrate'],
+    'add_police_station':    ['Police'],
+    'add_police_officer':    ['Police'],
+    'add_fir':               ['Citizen', 'Police'],
+    'update_fir_status':     ['Police'],
+    'add_criminal':          ['Police'],
+    'update_criminal_status':['Police'],
+    'add_case':              ['Police'],
+    'update_case_status':    ['Police'],
 }
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -72,8 +74,8 @@ def get_role_dashboard_url(role):
     mapping = {
         'Citizen': '/dashboard/citizen',
         'Police': '/dashboard/police',
-        'Court': '/dashboard/court',
-        'District Magistrate': '/dashboard/district-magistrate'
+        'Court': '/dashboard/police',
+        'District Magistrate': '/dashboard/police'
     }
     return mapping.get(role, '/')
 
@@ -209,6 +211,12 @@ def init_db():
         cursor.execute("ALTER TABLE users ADD COLUMN otp_expires_at TEXT")
     if 'otp_attempts' not in existing_cols:
         cursor.execute("ALTER TABLE users ADD COLUMN otp_attempts INTEGER DEFAULT 0")
+    if 'aadhaar_hash' not in existing_cols:
+        cursor.execute("ALTER TABLE users ADD COLUMN aadhaar_hash TEXT")
+    if 'aadhaar_last4' not in existing_cols:
+        cursor.execute("ALTER TABLE users ADD COLUMN aadhaar_last4 TEXT")
+    if 'police_station_id' not in existing_cols:
+        cursor.execute("ALTER TABLE users ADD COLUMN police_station_id INTEGER")
 
     # Seed one login per role the first time the app runs. Passwords are
     # hashed with werkzeug's default (PBKDF2) — never stored in plain text.
@@ -218,8 +226,6 @@ def init_db():
             # (full_name, email, temporary password, role)
             ("Citizen Portal Account",        "citizen@crms.gov.in",     "Citizen@123",     "Citizen"),
             ("Police Station Account",        "police@crms.gov.in",      "Police@123",      "Police"),
-            ("District Court Account",        "court@crms.gov.in",       "Court@123",       "Court"),
-            ("District Magistrate Account",   "magistrate@crms.gov.in",  "Magistrate@123",  "District Magistrate"),
         ]
         for full_name, email, temp_password, role in default_accounts:
             cursor.execute(
@@ -229,7 +235,7 @@ def init_db():
         conn.commit()
     else:
         # Ensure seeded default accounts are marked email_verified = 1
-        default_emails = ["citizen@crms.gov.in", "police@crms.gov.in", "court@crms.gov.in", "magistrate@crms.gov.in"]
+        default_emails = ["citizen@crms.gov.in", "police@crms.gov.in"]
         for email in default_emails:
             cursor.execute("UPDATE users SET email_verified = 1 WHERE lower(email) = ?", (email.lower(),))
         conn.commit()
@@ -599,7 +605,6 @@ HTML_NAVBAR = """
         {% if current_user_role == 'Citizen' %}
           <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Management System</a></li>
           <li class="nav-item"><a class="nav-link" href="/police-stations" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Police Stations</a></li>
-          <li class="nav-item"><a class="nav-link" href="/police-station-map" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Station Map</a></li>
           <li class="nav-item"><a class="nav-link" href="/crime-statistics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Crime Statistics</a></li>
           <li class="nav-item"><a class="nav-link" href="/analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Analytics &amp; Charts</a></li>
           <li class="nav-item"><a class="nav-link" href="/women-children-analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Women &amp; Children</a></li>
@@ -609,24 +614,8 @@ HTML_NAVBAR = """
           <li class="nav-item"><a class="nav-link" href="/criminal-records" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Criminal Records</a></li>
           <li class="nav-item"><a class="nav-link" href="/case-files" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Case Files</a></li>
           <li class="nav-item"><a class="nav-link" href="/police-stations" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Police Stations</a></li>
-          <li class="nav-item"><a class="nav-link" href="/police-station-map" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Station Map</a></li>
           <li class="nav-item"><a class="nav-link" href="/crime-patterns" style="color: #D6cfc4; font-weight: bold; font-family: 'Times New Roman', Times, serif;">Pattern Detector</a></li>
-          <li class="nav-item"><a class="nav-link" href="/analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Analytics &amp; Charts</a></li>
-
-        {% elif current_user_role == 'Court' %}
-          <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Management System</a></li>
-          <li class="nav-item"><a class="nav-link" href="/case-files" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Case Files</a></li>
-          <li class="nav-item"><a class="nav-link" href="/criminal-records" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Criminal Records</a></li>
-          <li class="nav-item"><a class="nav-link" href="/property-arrest-analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Property &amp; Arrests</a></li>
           <li class="nav-item"><a class="nav-link" href="/crime-statistics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Crime Statistics</a></li>
-          <li class="nav-item"><a class="nav-link" href="/analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Analytics &amp; Charts</a></li>
-
-        {% elif current_user_role == 'District Magistrate' %}
-          <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Management System</a></li>
-          <li class="nav-item"><a class="nav-link" href="/criminal-records" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Criminal Records</a></li>
-          <li class="nav-item"><a class="nav-link" href="/case-files" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Case Files</a></li>
-          <li class="nav-item"><a class="nav-link" href="/police-stations" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Police Stations</a></li>
-          <li class="nav-item"><a class="nav-link" href="/crime-patterns" style="color: #D6cfc4; font-weight: bold; font-family: 'Times New Roman', Times, serif;">Pattern Detector</a></li>
           <li class="nav-item"><a class="nav-link" href="/analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Analytics &amp; Charts</a></li>
           <li class="nav-item"><a class="nav-link" href="/women-children-analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Women &amp; Children</a></li>
           <li class="nav-item"><a class="nav-link" href="/property-arrest-analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Property &amp; Arrests</a></li>
@@ -637,7 +626,6 @@ HTML_NAVBAR = """
           <li class="nav-item"><a class="nav-link" href="/women-children-analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Women &amp; Children</a></li>
           <li class="nav-item"><a class="nav-link" href="/property-arrest-analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Property &amp; Arrests</a></li>
           <li class="nav-item"><a class="nav-link" href="/police-stations" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Police Stations</a></li>
-          <li class="nav-item"><a class="nav-link" href="/police-station-map" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Station Map</a></li>
           <li class="nav-item"><a class="nav-link" href="/criminal-records" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Criminal Records</a></li>
           <li class="nav-item"><a class="nav-link" href="/case-files" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Case Files</a></li>
           <li class="nav-item"><a class="nav-link" href="/crime-patterns" style="color: #D6cfc4; font-weight: bold; font-family: 'Times New Roman', Times, serif;">Pattern Detector</a></li>
@@ -764,6 +752,7 @@ def login():
                 session['role'] = user['role']
                 session['full_name'] = user['full_name']
                 session['email'] = user['email']
+                session['police_station_id'] = user['police_station_id'] if 'police_station_id' in user.keys() else None
                 next_url = request.args.get('next')
                 if next_url and next_url.startswith('/') and not next_url.startswith('//'):
                     return redirect(next_url)
@@ -800,10 +789,8 @@ def login():
           <hr class="my-3">
           <p class="small text-muted mb-1 fw-semibold">Portal Account Types:</p>
           <ul class="small text-muted mb-0 ps-3">
-            <li><strong>Citizen</strong> — file and track personal FIRs</li>
-            <li><strong>Police</strong> — FIRs, criminal records, stations</li>
-            <li><strong>Court</strong> — case files, hearings, judicial oversight</li>
-            <li><strong>District Magistrate</strong> — executive law & order oversight</li>
+            <li><strong>Citizen</strong> — file and track personal FIRs, check case status</li>
+            <li><strong>Police</strong> — FIRs, criminal records, cases, stations, analytics</li>
           </ul>
         </div>
       </div>
@@ -903,7 +890,7 @@ National Crime Records System
               <select name="role" class="form-select" required>
                 {role_options}
               </select>
-              <div class="form-text text-muted">Select role: Citizen, Police, Court, or District Magistrate.</div>
+              <div class="form-text text-muted">Select role: Citizen or Police.</div>
             </div>
             <div class="row">
               <div class="col-md-6 mb-3">
@@ -1512,8 +1499,10 @@ def citizen_dashboard():
     pending_firs = sum(1 for f in firs if f['status'] in ('Pending', 'Investigating', 'Active', 'Reported'))
     resolved_firs = sum(1 for f in firs if f['status'] in ('Resolved', 'Closed', 'Disposed'))
 
-    # Nearby police stations for emergency contact
-    stations = conn.execute("SELECT station_name, city, state, contact_number FROM police_stations LIMIT 5").fetchall()
+    user_id = session.get('user_id')
+    user_row = conn.execute("SELECT aadhaar_hash, aadhaar_last4 FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    aadhaar_linked = bool(user_row and user_row['aadhaar_hash'])
+    aadhaar_last4 = user_row['aadhaar_last4'] if (user_row and user_row['aadhaar_last4']) else ""
     conn.close()
 
     fir_rows = ""
@@ -1540,16 +1529,25 @@ def citizen_dashboard():
         </tr>
         """
 
-    station_rows = ""
-    for s in stations:
-        station_rows += f"""
-        <li class="list-group-item d-flex justify-content-between align-items-center bg-transparent">
-            <div>
-                <strong>{escape(s['station_name'])}</strong><br>
-                <small class="text-muted">{escape(s['city'])}, {escape(s['state'])}</small>
-            </div>
-            <a href="tel:{escape(s['contact_number'])}" class="btn btn-sm btn-outline-primary">{escape(s['contact_number'])}</a>
-        </li>
+    aadhaar_badge = f'<span class="badge bg-success"><i class="bi bi-shield-check"></i> Identity Linked (XXXX-XXXX-{escape(aadhaar_last4)})</span>' if aadhaar_linked else '<span class="badge bg-warning text-dark"><i class="bi bi-exclamation-triangle"></i> Aadhaar Not Linked</span>'
+
+    linking_html = ""
+    if not aadhaar_linked:
+        linking_html = f"""
+        <div class="alert alert-warning mb-3">
+            Your citizen profile is not linked to an Aadhaar identifier. Please contact the authorized department or link your Aadhaar below to verify your citizen identity.
+        </div>
+        <div class="card bg-light p-3 border mb-3" style="max-width: 520px;">
+            <h6 class="fw-bold mb-1 text-dark">Verify Citizen Identity (Link Aadhaar)</h6>
+            <p class="small text-muted mb-2">Link your 12-digit Aadhaar number to enable case status lookup for your portal account.</p>
+            <form id="link-aadhaar-form" onsubmit="linkAadhaar(event)">
+                <div class="input-group mb-2">
+                    <input type="password" class="form-control" id="link_aadhaar_input" placeholder="Enter 12-digit Aadhaar Number" pattern="\\d{{12}}" maxlength="12" title="Must be exactly 12 digits" required autocomplete="off">
+                    <button class="btn btn-dark" type="submit">Verify &amp; Link</button>
+                </div>
+            </form>
+            <div id="link-aadhaar-status"></div>
+        </div>
         """
 
     body = f"""
@@ -1564,7 +1562,6 @@ def citizen_dashboard():
                     </div>
                     <div class="d-flex flex-wrap gap-2">
                         <a href="/fir-management" class="btn btn-primary fw-semibold">FIR Management System</a>
-                        <a href="/police-station-map" class="btn btn-outline-primary fw-semibold">Station Map</a>
                         <a href="/crime-statistics" class="btn btn-outline-secondary fw-semibold">Safety Trends</a>
                         <a href="/dataset-overview" class="btn btn-warning fw-semibold">National Overview</a>
                     </div>
@@ -1599,7 +1596,7 @@ def citizen_dashboard():
 
     <div class="row g-4">
         <div class="col-lg-8">
-            <div class="card shadow-sm p-3">
+            <div class="card shadow-sm p-3 h-100">
                 <div class="d-flex justify-content-between align-items-center mb-3">
                     <h5 class="fw-bold mb-0" style="color: #1f2937;">My Filed Complaints &amp; FIR Records</h5>
                     <a href="/fir-management" class="btn btn-sm btn-outline-primary">FIR Management System</a>
@@ -1625,28 +1622,456 @@ def citizen_dashboard():
         </div>
 
         <div class="col-lg-4">
-            <div class="card shadow-sm p-3 mb-4">
-                <div class="d-flex justify-content-between align-items-center mb-3">
-                    <h5 class="fw-bold mb-0" style="color: #1f2937;">Station Directory</h5>
-                    <a href="/police-stations" class="small">All Stations</a>
+            <div class="card shadow-sm p-4 h-100 d-flex flex-column justify-content-between" style="background-color: #ffffff; border-left: 4px solid #0d6efd;">
+                <div>
+                    <h5 class="fw-bold mb-2" style="color: #1f2937;">Station Map</h5>
+                    <p class="text-muted small mb-3">Find nearby police stations and view their locations.</p>
                 </div>
-                <ul class="list-group list-group-flush">
-                    {station_rows if station_rows else '<li class="list-group-item text-muted">No station records found.</li>'}
-                </ul>
-            </div>
-
-            <div class="card shadow-sm p-3" style="background-color: #f8f9fa;">
-                <h6 class="fw-bold mb-2" style="color: #1f2937;">Citizen Legal Protections</h6>
-                <ul class="small text-muted ps-3 mb-0">
-                    <li>Every citizen is entitled to a free, signed copy of their registered FIR.</li>
-                    <li>Zero FIRs may be registered at any station regardless of territorial jurisdiction.</li>
-                    <li>All sensitive complaints concerning women and children receive priority processing.</li>
-                </ul>
+                <div>
+                    <a href="/police-station-map" class="btn btn-outline-primary w-100 fw-semibold">View Station Map</a>
+                </div>
             </div>
         </div>
     </div>
+
+    <div class="row g-4 mt-1 mb-4">
+        <div class="col-12">
+            <div class="card shadow-sm p-4" style="border-left: 4px solid #1f2937;">
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <h5 class="fw-bold mb-0" style="color: #1f2937;">Check Case Status</h5>
+                    {aadhaar_badge}
+                </div>
+                <p class="text-muted small mb-3">
+                    Check official case records and proceedings associated with your authenticated portal profile.
+                    <span class="d-block mt-1 text-secondary" style="font-size: 0.82rem;">
+                        <strong>Privacy Notice:</strong> The Aadhaar identifier is cryptographically hashed (SHA-256) and strictly utilized as an internal portal identifier. This system does NOT connect to UIDAI servers and does not query national criminal databases.
+                    </span>
+                </p>
+
+                {linking_html}
+
+                <form id="aadhaar-form" onsubmit="lookupCaseStatus(event)">
+                    <div class="input-group mb-2" style="max-width: 440px;">
+                        <input type="password" class="form-control" id="aadhaar_input" placeholder="Enter Aadhaar Number" pattern="\\d{{12}}" maxlength="12" title="Must be exactly 12 digits" required autocomplete="off">
+                        <button class="btn btn-primary" type="submit">Check Case Status</button>
+                    </div>
+                    <small class="text-muted">Enter your 12-digit Aadhaar number to verify identity and retrieve records.</small>
+                </form>
+                <div id="case-status-results"></div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+    function escapeHtml(str) {{
+        if (!str) return '';
+        return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+    }}
+
+    function linkAadhaar(event) {{
+        event.preventDefault();
+        const input = document.getElementById('link_aadhaar_input');
+        const aadhaar = input ? input.value.trim() : '';
+        const statusDiv = document.getElementById('link-aadhaar-status');
+        statusDiv.innerHTML = '<span class="text-muted small">Verifying and hashing identifier...</span>';
+
+        fetch('/api/citizen/link-aadhaar', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+            body: 'aadhaar=' + encodeURIComponent(aadhaar)
+        }})
+        .then(res => res.json())
+        .then(data => {{
+            if (data.error) {{
+                statusDiv.innerHTML = '<div class="alert alert-danger small mt-2 py-2 mb-0">' + escapeHtml(data.error) + '</div>';
+            }} else {{
+                statusDiv.innerHTML = '<div class="alert alert-success small mt-2 py-2 mb-0">' + escapeHtml(data.message) + ' (Identifier: ' + escapeHtml(data.aadhaar_masked) + ')</div>';
+                setTimeout(function() {{ window.location.reload(); }}, 1200);
+            }}
+        }})
+        .catch(err => {{
+            statusDiv.innerHTML = '<div class="alert alert-danger small mt-2 py-2 mb-0">An error occurred during identity verification.</div>';
+        }});
+    }}
+
+    function lookupCaseStatus(event) {{
+        event.preventDefault();
+        const input = document.getElementById('aadhaar_input');
+        const aadhaar = input ? input.value.trim() : '';
+        const resultsDiv = document.getElementById('case-status-results');
+        resultsDiv.innerHTML = '<span class="text-muted small">Verifying identifier and retrieving authorized records...</span>';
+
+        fetch('/api/citizen/case-status', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+            body: 'aadhaar=' + encodeURIComponent(aadhaar)
+        }})
+        .then(response => response.json().then(data => ({{ ok: response.ok, body: data }})))
+        .then(res => {{
+            const data = res.body;
+            if (data.error) {{
+                resultsDiv.innerHTML = '<div class="alert alert-danger mt-3">' + escapeHtml(data.error) + '</div>';
+                return;
+            }}
+
+            if (data.message && (!data.records || data.records.length === 0)) {{
+                resultsDiv.innerHTML = '<div class="alert alert-info mt-3">' + escapeHtml(data.message) + '</div>';
+                return;
+            }}
+
+            if (!data.records || data.records.length === 0) {{
+                resultsDiv.innerHTML = '<div class="alert alert-info mt-3">No matching case records were found in this portal.</div>';
+                return;
+            }}
+
+            let html = '<div class="card bg-light border p-3 mt-3 shadow-sm">';
+            html += '<div class="d-flex justify-content-between align-items-center mb-2 border-bottom pb-2">';
+            html += '<h6 class="fw-bold mb-0 text-dark">Case Status</h6>';
+            html += '<span class="badge bg-secondary font-monospace">Aadhaar: ' + escapeHtml(data.aadhaar_masked || 'XXXX-XXXX-****') + '</span>';
+            html += '</div>';
+
+            html += '<div class="alert alert-secondary small py-2 mb-3"><i class="bi bi-info-circle"></i> Note: An FIR or case record is a formal record of proceedings and does not determine or imply guilt.</div>';
+
+            html += '<div class="table-responsive"><table class="table table-bordered table-hover align-middle mb-0 bg-white"><thead><tr class="table-light text-secondary small">' +
+                    '<th>Case/FIR Number</th><th>Police Station</th><th>Offence</th>' +
+                    '<th>FIR Date</th><th>Investigation Status</th><th>Court Status</th>' +
+                    '<th>Last Updated</th></tr></thead><tbody>';
+
+            data.records.forEach(r => {{
+                html += '<tr>' +
+                        '<td class="fw-bold">' + escapeHtml(r.case_fir_number || r.fir_number || 'N/A') + '</td>' +
+                        '<td>' + escapeHtml(r.station_name || 'N/A') + '</td>' +
+                        '<td>' + escapeHtml(r.offence || 'N/A') + '</td>' +
+                        '<td>' + escapeHtml(r.fir_date || 'N/A') + '</td>' +
+                        '<td><span class="badge bg-primary">' + escapeHtml(r.investigation_status || 'FIR Registered') + '</span></td>' +
+                        '<td><span class="badge bg-secondary">' + escapeHtml(r.court_status || 'Pending') + '</span></td>' +
+                        '<td><small class="text-muted">' + escapeHtml(r.last_updated || 'N/A') + '</small></td>' +
+                        '</tr>';
+            }});
+            html += '</tbody></table></div></div>';
+            resultsDiv.innerHTML = html;
+        }})
+        .catch(err => {{
+            resultsDiv.innerHTML = '<div class="alert alert-danger mt-3">An error occurred while fetching case status.</div>';
+        }});
+    }}
+    </script>
     """
     return render_page(body)
+
+
+@app.route('/api/citizen/link-aadhaar', methods=['POST'])
+@login_required
+@roles_required('Citizen')
+def api_citizen_link_aadhaar():
+    raw_aadhaar = request.form.get('aadhaar', '').strip()
+    normalized = re.sub(r'[\s\-]', '', raw_aadhaar)
+    if not normalized.isdigit() or len(normalized) != 12:
+        return jsonify({'error': 'Invalid Aadhaar format. Must be exactly 12 digits.'}), 400
+
+    user_id = session.get('user_id')
+    aadhaar_hash = hashlib.sha256(normalized.encode('utf-8')).hexdigest()
+    aadhaar_last4 = normalized[-4:]
+
+    conn = get_db_connection()
+    existing = conn.execute(
+        "SELECT user_id FROM users WHERE aadhaar_hash = ? AND user_id != ?",
+        (aadhaar_hash, user_id)
+    ).fetchone()
+    if existing:
+        conn.close()
+        return jsonify({'error': 'This Aadhaar identifier is already linked to another portal account.'}), 409
+
+    conn.execute(
+        "UPDATE users SET aadhaar_hash = ?, aadhaar_last4 = ? WHERE user_id = ?",
+        (aadhaar_hash, aadhaar_last4, user_id)
+    )
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        'success': True,
+        'message': 'Citizen identity verified and Aadhaar identifier linked successfully.',
+        'aadhaar_masked': f"XXXX-XXXX-{aadhaar_last4}"
+    })
+
+
+@app.route('/api/citizen/case-status', methods=['POST'])
+@login_required
+@roles_required('Citizen')
+
+def api_citizen_case_status():
+    raw_aadhaar = request.form.get('aadhaar', '').strip()
+    normalized = re.sub(r'[\s\-]', '', raw_aadhaar)
+    if not normalized.isdigit() or len(normalized) != 12:
+        return jsonify({'error': 'Invalid Aadhaar format. Must be exactly 12 digits.'}), 400
+
+    user_id = session.get('user_id')
+    # Ensure the citizen has a linked Aadhaar (security requirement)
+    conn = get_db_connection()
+    user_row = conn.execute(
+        "SELECT user_id, full_name, aadhaar_hash, aadhaar_last4 FROM users WHERE user_id = ?",
+        (user_id,)
+    ).fetchone()
+    if not user_row:
+        conn.close()
+        return jsonify({'error': 'User not found.'}), 404
+    if not user_row['aadhaar_hash']:
+        conn.close()
+        return jsonify({
+            'error': 'Your citizen profile is not linked to an Aadhaar identifier. Please contact the authorized department.'
+        }), 400
+
+    # Compute hash of entered Aadhaar and masked version for response
+    entered_hash = hashlib.sha256(normalized.encode('utf-8')).hexdigest()
+    masked_aadhaar = f"XXXX-XXXX-{normalized[-4:]}"
+
+    # Ensure FIR table has test-only column; ignore if exists
+    try:
+        conn.execute('ALTER TABLE FIR ADD COLUMN aadhaar_hash TEXT')
+        conn.commit()
+    except Exception:
+        pass
+
+    # Query FIR / cases linked via Aadhaar hash
+    query = """
+        SELECT f.fir_number,
+               c.case_number,
+               ps.station_name,
+               cr.crime_type AS offence,
+               f.filing_date AS fir_date,
+               f.status AS investigation_status,
+               c.case_status AS court_status,
+               COALESCE(c.created_at, f.filing_date) AS last_updated
+        FROM FIR f
+        LEFT JOIN cases c ON f.fir_id = c.fir_id
+        JOIN crimes cr ON f.crime_id = cr.crime_id
+        JOIN police_stations ps ON f.station_id = ps.station_id
+        WHERE f.aadhaar_hash = ?
+        ORDER BY f.filing_date DESC
+    """
+    records = conn.execute(query, (entered_hash,)).fetchall()
+    conn.close()
+
+    if not records:
+        return jsonify({
+            'success': True,
+            'message': 'No matching case records were found in this portal.',
+            'aadhaar_masked': masked_aadhaar,
+            'records': []
+        })
+
+    formatted_records = []
+    for r in records:
+        inv_status = r['investigation_status'] or 'Under Investigation'
+        court_stat = r['court_status'] or 'Pending'
+        formatted_records.append({
+            'case_fir_number': r['case_number'] if r['case_number'] else (r['fir_number'] or 'N/A'),
+            'fir_number': r['fir_number'] or 'N/A',
+            'case_number': r['case_number'] or 'N/A',
+            'station_name': r['station_name'] or 'N/A',
+            'offence': r['offence'] or 'N/A',
+            'fir_date': r['fir_date'] or 'N/A',
+            'investigation_status': inv_status,
+            'court_status': court_stat,
+            'last_updated': r['last_updated'] or 'N/A'
+        })
+
+    return jsonify({
+        'success': True,
+        'aadhaar_masked': masked_aadhaar,
+        'records': formatted_records
+    })
+
+# POLICE STATION CASE SEARCH API
+@app.route('/api/police/station-cases', methods=['GET'])
+@roles_required('Police', 'District Magistrate')
+def api_police_station_cases():
+    """
+    Search portal FIR/case records by police station name.
+    CBI records (cbi_firs) are NOT included because branch/location fields
+    are entirely NULL in the imported dataset — no station-level data exists
+    to perform an honest match.
+    """
+    query = request.args.get('station', '').strip()
+    if not query:
+        return jsonify({'error': 'Please enter a station name to search.'}), 400
+
+    # Normalise: strip extra spaces, collapse whitespace, upper
+    import re as _re
+    norm_query = _re.sub(r'\s+', ' ', query).upper()
+
+    # Reject single-word generic terms that would match too broadly
+    # (e.g. "Delhi" must not return every station in Delhi)
+    generic_terms = {'DELHI', 'MUMBAI', 'INDIA', 'POLICE', 'STATION', 'NORTH', 'SOUTH', 'EAST', 'WEST', 'CENTRAL'}
+    if norm_query in generic_terms:
+        return jsonify({'error': 'Search term too generic. Please enter a specific station name.'}), 400
+
+    conn = get_db_connection()
+
+    # --- Fetch all portal stations for autocomplete + fuzzy name resolution ---
+    all_stations = conn.execute(
+        "SELECT station_id, station_name, city, state FROM police_stations"
+    ).fetchall()
+
+    # Find matching stations: the normalised station_name must CONTAIN the
+    # normalised query as a substring (not just city/state).
+    def _norm(s):
+        return _re.sub(r'\s+', ' ', (s or '').upper()).strip()
+
+    matched_stations = [
+        s for s in all_stations
+        if norm_query in _norm(s['station_name'])
+    ]
+
+    # --- Requesting officer's own station context ---
+    officer_station_id = session.get('police_station_id')
+
+    # --- Portal FIR results ---
+    fir_results = []
+    case_results = []
+
+    for st in matched_stations:
+        sid = st['station_id']
+
+        # Access control: if officer has an assigned station, they may only
+        # view portal operational records for their own station.
+        # Public CBI records have no such restriction (see below).
+        if officer_station_id and sid != officer_station_id:
+            # Officer is not authorised to view another station's operational records
+            continue
+
+        firs = conn.execute("""
+            SELECT f.fir_id, f.fir_number, f.filing_date, f.status, f.description,
+                   c.crime_type, ps.station_name, ps.city, ps.state
+            FROM FIR f
+            LEFT JOIN crimes c ON f.crime_id = c.crime_id
+            LEFT JOIN police_stations ps ON f.station_id = ps.station_id
+            WHERE f.station_id = ?
+            ORDER BY f.filing_date DESC
+        """, (sid,)).fetchall()
+
+        for f in firs:
+            fir_results.append({
+                'type': 'Portal FIR',
+                'fir_id': f['fir_id'],
+                'ref_number': f['fir_number'],
+                'date': f['filing_date'],
+                'offence': f['crime_type'] or 'N/A',
+                'station': f['station_name'],
+                'city': f['city'],
+                'state': f['state'],
+                'status': f['status'],
+                'description': f['description'],
+                'detail_url': '/fir-management',
+                'pdf_url': None,
+                'source': 'Portal FIR Database'
+            })
+
+        cases = conn.execute("""
+            SELECT cs.case_id, cs.case_number, cs.case_status, cs.priority,
+                   cs.start_date, cs.remarks,
+                   f.fir_number,
+                   ps.station_name, ps.city, ps.state,
+                   po.name as officer_name
+            FROM cases cs
+            JOIN FIR f ON cs.fir_id = f.fir_id
+            LEFT JOIN police_stations ps ON f.station_id = ps.station_id
+            LEFT JOIN police_officers po ON cs.investigating_officer_id = po.officer_id
+            WHERE f.station_id = ?
+            ORDER BY cs.start_date DESC
+        """, (sid,)).fetchall()
+
+        for c in cases:
+            case_results.append({
+                'type': 'Portal Case',
+                'case_id': c['case_id'],
+                'ref_number': c['case_number'],
+                'date': c['start_date'],
+                'offence': f"FIR #{c['fir_number']}",
+                'station': c['station_name'],
+                'city': c['city'],
+                'state': c['state'],
+                'status': c['case_status'],
+                'description': c['remarks'] or '',
+                'officer': c['officer_name'] or 'Unassigned',
+                'detail_url': '/case-files',
+                'pdf_url': None,
+                'source': 'Portal Case Database'
+            })
+
+    # --- CBI records: include those with matching branch or location ---
+    cbi_results = []
+    cbi_count = 0
+    cbi_note = ''
+    if _table_exists(get_db_connection(), 'cbi_firs'):
+        conn_cbi = get_db_connection()
+        for st in matched_stations:
+            rows = conn_cbi.execute(
+                """
+                SELECT id, rc_number, fir_number, title_or_subject AS offence, fir_date,
+                       COALESCE(branch, location) AS station, status, pdf_url
+                FROM cbi_firs
+                WHERE (branch IS NOT NULL AND LOWER(branch) = LOWER(?))
+                   OR (location IS NOT NULL AND LOWER(location) = LOWER(?))
+                """,
+                (st['station_name'], st['station_name'])
+            ).fetchall()
+            for r in rows:
+                cbi_results.append({
+                    'type': 'CBI PUBLIC',
+                    'ref_number': r['rc_number'] or r['fir_number'],
+                    'date': r['fir_date'],
+                    'offence': r['offence'],
+                    'station': r['station'],
+                    'status': r['status'],
+                    'detail_url': r['pdf_url'] or '#',
+                    'pdf_url': r['pdf_url'],
+                    'source': 'CBI PUBLIC'
+                })
+        cbi_count = len(cbi_results)
+        conn_cbi.close()
+    else:
+        cbi_note = ('CBI public records (cbi_firs) imported from cbi.gov.in do not contain '
+                    'police station field data (branch and location are not populated in the '
+                    'current dataset). No CBI records can be reliably linked to a specific '
+                    'police station.')
+
+    conn.close()
+
+    station_names = [_norm(s['station_name']) for s in matched_stations]
+
+    return jsonify({
+        'searched_query': query,
+        'matched_station_names': station_names,
+        'portal_fir_count': len(fir_results),
+        'portal_case_count': len(case_results),
+        'cbi_count': cbi_count,
+        'cbi_note': cbi_note,
+        'total_results': len(fir_results) + len(case_results) + cbi_count,
+        'fir_results': fir_results,
+        'case_results': case_results,
+        'cbi_results': cbi_results,
+        'restricted': bool(officer_station_id and matched_stations and all(
+            s['station_id'] != officer_station_id for s in matched_stations
+        ))
+    })
+
+
+# AUTOCOMPLETE: list all station names for the search box
+@app.route('/api/police/stations-list', methods=['GET'])
+@roles_required('Police', 'District Magistrate')
+def api_police_stations_list():
+    conn = get_db_connection()
+    rows = conn.execute(
+        "SELECT station_id, station_name, city, state FROM police_stations ORDER BY station_name"
+    ).fetchall()
+    conn.close()
+    return jsonify([
+        {'id': r['station_id'], 'name': r['station_name'],
+         'city': r['city'], 'state': r['state']}
+        for r in rows
+    ])
 
 
 # ROLE DASHBOARD: POLICE
@@ -1654,29 +2079,58 @@ def citizen_dashboard():
 @roles_required('Police', 'District Magistrate')
 def police_dashboard():
     conn = get_db_connection()
-    total_firs = conn.execute("SELECT COUNT(*) FROM FIR").fetchone()[0]
-    pending_firs = conn.execute("SELECT COUNT(*) FROM FIR WHERE status != 'Closed'").fetchone()[0]
-    active_cases = conn.execute("SELECT COUNT(*) FROM cases WHERE case_status = 'Active'").fetchone()[0]
-    wanted_criminals = conn.execute("SELECT COUNT(*) FROM criminals WHERE status = 'Wanted'").fetchone()[0]
-    total_stations = conn.execute("SELECT COUNT(*) FROM police_stations").fetchone()[0]
+    station_id = session.get('police_station_id')
 
-    recent_firs = conn.execute("""
-        SELECT f.fir_id, f.fir_number, f.filing_date, f.status, f.description,
-               c.crime_type, ps.station_name
-        FROM FIR f
-        LEFT JOIN crimes c ON f.crime_id = c.crime_id
-        LEFT JOIN police_stations ps ON f.station_id = ps.station_id
-        ORDER BY f.filing_date DESC LIMIT 5
-    """).fetchall()
+    if station_id:
+        total_firs = conn.execute("SELECT COUNT(*) FROM FIR WHERE station_id = ?", (station_id,)).fetchone()[0]
+        pending_firs = conn.execute("SELECT COUNT(*) FROM FIR WHERE status != 'Closed' AND station_id = ?", (station_id,)).fetchone()[0]
+        active_cases = conn.execute("SELECT COUNT(*) FROM cases c JOIN FIR f ON c.fir_id = f.fir_id WHERE c.case_status = 'Active' AND f.station_id = ?", (station_id,)).fetchone()[0]
+        wanted_criminals = conn.execute("SELECT COUNT(*) FROM criminals WHERE status = 'Wanted'").fetchone()[0]
+        total_stations = conn.execute("SELECT COUNT(*) FROM police_stations").fetchone()[0]
 
-    active_cases_list = conn.execute("""
-        SELECT c.case_id, c.case_number, c.priority, c.case_status, c.start_date,
-               po.name as officer_name, po.badge_number
-        FROM cases c
-        LEFT JOIN police_officers po ON c.investigating_officer_id = po.officer_id
-        WHERE c.case_status = 'Active'
-        ORDER BY c.start_date DESC LIMIT 5
-    """).fetchall()
+        recent_firs = conn.execute("""
+            SELECT f.fir_id, f.fir_number, f.filing_date, f.status, f.description,
+                   c.crime_type, ps.station_name
+            FROM FIR f
+            LEFT JOIN crimes c ON f.crime_id = c.crime_id
+            LEFT JOIN police_stations ps ON f.station_id = ps.station_id
+            WHERE f.station_id = ?
+            ORDER BY f.filing_date DESC LIMIT 5
+        """, (station_id,)).fetchall()
+
+        active_cases_list = conn.execute("""
+            SELECT c.case_id, c.case_number, c.priority, c.case_status, c.start_date,
+                   po.name as officer_name, po.badge_number
+            FROM cases c
+            JOIN FIR f ON c.fir_id = f.fir_id
+            LEFT JOIN police_officers po ON c.investigating_officer_id = po.officer_id
+            WHERE c.case_status = 'Active' AND f.station_id = ?
+            ORDER BY c.start_date DESC LIMIT 5
+        """, (station_id,)).fetchall()
+    else:
+        total_firs = conn.execute("SELECT COUNT(*) FROM FIR").fetchone()[0]
+        pending_firs = conn.execute("SELECT COUNT(*) FROM FIR WHERE status != 'Closed'").fetchone()[0]
+        active_cases = conn.execute("SELECT COUNT(*) FROM cases WHERE case_status = 'Active'").fetchone()[0]
+        wanted_criminals = conn.execute("SELECT COUNT(*) FROM criminals WHERE status = 'Wanted'").fetchone()[0]
+        total_stations = conn.execute("SELECT COUNT(*) FROM police_stations").fetchone()[0]
+
+        recent_firs = conn.execute("""
+            SELECT f.fir_id, f.fir_number, f.filing_date, f.status, f.description,
+                   c.crime_type, ps.station_name
+            FROM FIR f
+            LEFT JOIN crimes c ON f.crime_id = c.crime_id
+            LEFT JOIN police_stations ps ON f.station_id = ps.station_id
+            ORDER BY f.filing_date DESC LIMIT 5
+        """).fetchall()
+
+        active_cases_list = conn.execute("""
+            SELECT c.case_id, c.case_number, c.priority, c.case_status, c.start_date,
+                   po.name as officer_name, po.badge_number
+            FROM cases c
+            LEFT JOIN police_officers po ON c.investigating_officer_id = po.officer_id
+            WHERE c.case_status = 'Active'
+            ORDER BY c.start_date DESC LIMIT 5
+        """).fetchall()
 
     wanted_suspects = conn.execute("""
         SELECT criminal_id, name, alias, status, identification_details
@@ -1684,6 +2138,24 @@ def police_dashboard():
         WHERE status = 'Wanted'
         LIMIT 5
     """).fetchall()
+
+    cbi_count = 0
+    if _table_exists(conn, 'cbi_firs'):
+        cbi_count = conn.execute("SELECT COUNT(*) FROM cbi_firs").fetchone()[0]
+
+    # Officer's assigned station name
+    officer_station_name = ''
+    if station_id:
+        row = conn.execute("SELECT station_name FROM police_stations WHERE station_id = ?", (station_id,)).fetchone()
+        if row:
+            officer_station_name = row['station_name']
+
+    # All station names for autocomplete
+    all_station_names = conn.execute("SELECT station_name FROM police_stations ORDER BY station_name").fetchall()
+    station_options_html = ''
+    for sn in all_station_names:
+        station_options_html += f'<option value="{escape(sn["station_name"])}">'
+
     conn.close()
 
     fir_rows = ""
@@ -1771,10 +2243,137 @@ def police_dashboard():
             <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #2d6a4f;">
                 <h6 class="text-uppercase text-secondary small">Police Stations</h6>
                 <span class="fs-2 fw-bold text-success">{total_stations}</span>
-                <small class="text-muted"><a href="/police-station-map" class="text-success text-decoration-none">Open Map View</a></small>
+                <small class="text-muted">Operational network</small>
             </div>
         </div>
     </div>
+
+    <!-- POLICE STATION CASE SEARCH -->
+    <div class="row g-4 mb-4">
+        <div class="col-12">
+            <div class="card shadow-sm p-4" style="border-left: 4px solid #0d6efd;">
+                <h5 class="fw-bold mb-3" style="color: #1f2937;">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="#0d6efd" class="bi bi-search me-2" viewBox="0 0 16 16"><path d="M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85zm-5.598 1.1a5.5 5.5 0 1 1 0-11 5.5 5.5 0 0 1 0 11z"/></svg>
+                    Search Cases by Police Station
+                </h5>
+                {'<div class="alert alert-info d-flex align-items-center mb-3 py-2" style="border-left: 4px solid #0d6efd;"><div><strong>My Police Station:</strong> ' + escape(officer_station_name) + ' <button class="btn btn-sm btn-primary ms-3" onclick="stationSearchAutoFill()">View Cases for My Station</button></div></div>' if officer_station_name else '<div class="alert alert-secondary mb-3 py-2"><small>No police station assigned to your account. Use the search below to look up any station.</small></div>'}
+                <div class="row g-2 align-items-end">
+                    <div class="col-md-8">
+                        <label for="stationSearchInput" class="form-label text-muted small mb-1">Enter Police Station Name</label>
+                        <input type="text" class="form-control" id="stationSearchInput" placeholder="e.g. Crossing Republic" list="stationSuggestions" autocomplete="off">
+                        <datalist id="stationSuggestions">{station_options_html}</datalist>
+                    </div>
+                    <div class="col-md-4 d-grid">
+                        <button class="btn btn-primary fw-semibold" onclick="searchStationCases()">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-search me-1" viewBox="0 0 16 16"><path d="M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85zm-5.598 1.1a5.5 5.5 0 1 1 0-11 5.5 5.5 0 0 1 0 11z"/></svg>
+                            Search
+                        </button>
+                    </div>
+                </div>
+                <div id="stationSearchResults" class="mt-3"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    function stationSearchAutoFill() {{
+        var input = document.getElementById('stationSearchInput');
+        input.value = {f'"{escape(officer_station_name)}"' if officer_station_name else '""'};
+        searchStationCases();
+    }}
+
+    function searchStationCases() {{
+        var query = document.getElementById('stationSearchInput').value.trim();
+        var resultsDiv = document.getElementById('stationSearchResults');
+        if (!query) {{
+            resultsDiv.innerHTML = '<div class="alert alert-warning py-2">Please enter a station name to search.</div>';
+            return;
+        }}
+        resultsDiv.innerHTML = '<div class="text-center py-3"><div class="spinner-border text-primary" role="status"><span class="visually-hidden">Searching...</span></div><p class="text-muted mt-2">Searching records...</p></div>';
+
+        fetch('/api/police/station-cases?station=' + encodeURIComponent(query))
+        .then(function(resp) {{ return resp.json(); }})
+        .then(function(data) {{
+            if (data.error) {{
+                resultsDiv.innerHTML = '<div class="alert alert-danger py-2">' + data.error + '</div>';
+                return;
+            }}
+            if (data.restricted) {{
+                resultsDiv.innerHTML = '<div class="alert alert-warning py-2">Access restricted: You may only view operational records for your assigned police station.</div>';
+                return;
+            }}
+
+            var html = '';
+
+            // Summary header
+            var stationLabel = data.matched_station_names.length > 0 ? data.matched_station_names.join(', ') : data.searched_query;
+            html += '<div class="card p-3 mb-3" style="background: #f0f9ff; border: 1px solid #bae6fd;">';
+            html += '<div class="row text-center">';
+            html += '<div class="col-md-3"><h6 class="text-muted small text-uppercase">Station</h6><strong>' + stationLabel + '</strong></div>';
+            html += '<div class="col-md-3"><h6 class="text-muted small text-uppercase">Portal FIRs</h6><span class="fs-4 fw-bold text-primary">' + data.portal_fir_count + '</span></div>';
+            html += '<div class="col-md-3"><h6 class="text-muted small text-uppercase">Portal Cases</h6><span class="fs-4 fw-bold text-info">' + data.portal_case_count + '</span></div>';
+            html += '<div class="col-md-3"><h6 class="text-muted small text-uppercase">Total Results</h6><span class="fs-4 fw-bold text-dark">' + data.total_results + '</span></div>';
+            html += '</div></div>';
+
+            // CBI data note
+            if (data.cbi_note) {{
+                html += '<div class="alert alert-secondary py-2 small"><strong>CBI Records:</strong> ' + data.cbi_note + '</div>';
+            }}
+
+            // Results table
+            if (data.total_results > 0) {{
+                html += '<div class="table-responsive"><table class="table table-hover align-middle mb-0">';
+                html += '<thead><tr><th>Case/FIR No.</th><th>Date</th><th>Offence / Subject</th><th>Station</th><th>Status</th><th>Source</th><th>Actions</th></tr></thead><tbody>';
+
+                // FIR results
+                for (var i = 0; i < data.fir_results.length; i++) {{
+                    var r = data.fir_results[i];
+                    var statusCls = r.status === 'Closed' ? 'bg-success' : (r.status === 'Pending' ? 'bg-warning text-dark' : 'bg-secondary');
+                    html += '<tr>';
+                    html += '<td class="fw-bold">' + (r.ref_number || 'N/A') + '</td>';
+                    html += '<td>' + (r.date || 'N/A') + '</td>';
+                    html += '<td>' + (r.offence || 'N/A') + (r.description ? '<br><small class="text-muted">' + r.description + '</small>' : '') + '</td>';
+                    html += '<td>' + (r.station || 'N/A') + '</td>';
+                    html += '<td><span class="badge ' + statusCls + '">' + (r.status || 'N/A') + '</span></td>';
+                    html += '<td><span class="badge bg-primary">' + r.source + '</span></td>';
+                    html += '<td><a href="' + r.detail_url + '" class="btn btn-sm btn-outline-primary">View Details</a></td>';
+                    html += '</tr>';
+                }}
+
+                // Case results
+                for (var j = 0; j < data.case_results.length; j++) {{
+                    var c = data.case_results[j];
+                    var cStatusCls = c.status === 'Active' ? 'bg-info' : (c.status === 'Closed' ? 'bg-success' : 'bg-secondary');
+                    html += '<tr>';
+                    html += '<td class="fw-bold">' + (c.ref_number || 'N/A') + '</td>';
+                    html += '<td>' + (c.date || 'N/A') + '</td>';
+                    html += '<td>' + (c.offence || 'N/A') + '</td>';
+                    html += '<td>' + (c.station || 'N/A') + '</td>';
+                    html += '<td><span class="badge ' + cStatusCls + '">' + (c.status || 'N/A') + '</span></td>';
+                    html += '<td><span class="badge bg-info">' + c.source + '</span></td>';
+                    html += '<td><a href="' + c.detail_url + '" class="btn btn-sm btn-outline-primary">View Details</a></td>';
+                    html += '</tr>';
+                }}
+
+                html += '</tbody></table></div>';
+            }} else if (data.matched_station_names.length === 0) {{
+                html += '<div class="alert alert-warning py-2">No police station found matching "<strong>' + data.searched_query + '</strong>". Please check the station name and try again.</div>';
+            }} else {{
+                html += '<div class="alert alert-info py-2">No FIR or case records found for <strong>' + stationLabel + '</strong>.</div>';
+            }}
+
+            resultsDiv.innerHTML = html;
+        }})
+        .catch(function(err) {{
+            resultsDiv.innerHTML = '<div class="alert alert-danger py-2">Error searching: ' + err.message + '</div>';
+        }});
+    }}
+
+    // Allow pressing Enter in the search field
+    document.getElementById('stationSearchInput').addEventListener('keypress', function(e) {{
+        if (e.key === 'Enter') {{ searchStationCases(); }}
+    }});
+    </script>
 
     <div class="row g-4">
         <div class="col-lg-6">
@@ -1826,8 +2425,8 @@ def police_dashboard():
             </div>
         </div>
 
-        <div class="col-12">
-            <div class="card shadow-sm p-3">
+        <div class="col-lg-8">
+            <div class="card shadow-sm p-3 h-100">
                 <div class="d-flex justify-content-between align-items-center mb-3">
                     <h5 class="fw-bold mb-0" style="color: #1f2937;">Most Wanted Suspects</h5>
                     <a href="/criminal-records" class="btn btn-sm btn-outline-primary">Criminal Database</a>
@@ -1837,6 +2436,18 @@ def police_dashboard():
                 </ul>
             </div>
         </div>
+
+        <div class="col-lg-4">
+            <div class="card shadow-sm p-4 h-100 d-flex flex-column justify-content-between" style="background-color: #ffffff; border-left: 4px solid #0d6efd;">
+                <div>
+                    <h5 class="fw-bold mb-2" style="color: #1f2937;">Station Map</h5>
+                    <p class="text-muted small mb-3">Find nearby police stations and view their locations.</p>
+                </div>
+                <div>
+                    <a href="/police-station-map" class="btn btn-outline-primary w-100 fw-semibold">View Station Map</a>
+                </div>
+            </div>
+        </div>
     </div>
     """
     return render_page(body)
@@ -1844,8 +2455,9 @@ def police_dashboard():
 
 # ROLE DASHBOARD: COURT
 @app.route('/dashboard/court')
-@roles_required('Court', 'District Magistrate')
+@roles_required('Police', 'Court', 'District Magistrate')
 def court_dashboard():
+    return redirect(url_for('police_dashboard'))
     conn = get_db_connection()
     total_cases = conn.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
     active_trials = conn.execute("SELECT COUNT(*) FROM cases WHERE case_status = 'Active'").fetchone()[0]
@@ -2022,8 +2634,9 @@ def court_dashboard():
 
 # ROLE DASHBOARD: DISTRICT MAGISTRATE
 @app.route('/dashboard/district-magistrate')
-@roles_required('District Magistrate')
+@roles_required('Police', 'Court', 'District Magistrate')
 def magistrate_dashboard():
+    return redirect(url_for('police_dashboard'))
     conn = get_db_connection()
     total_firs = conn.execute("SELECT COUNT(*) FROM FIR").fetchone()[0]
     total_cases = conn.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
@@ -3333,19 +3946,24 @@ def case_files():
     # 1. Fetch public CBI cases (if cbi_firs table exists)
     cbi_rows = []
     if _table_exists(conn, 'cbi_firs'):
+        # Use actual DB columns — DO NOT hardcode values that override real data.
+        # Fields that are NULL in DB display as "Not available" in the UI.
+        # location, branch, fir_number, fir_date, offence are genuinely NULL
+        # in the current dataset (the CBI index page did not provide them).
         cbi_sql = """
-            SELECT 
+            SELECT
                 id,
                 rc_number AS case_number,
                 fir_number,
-                title_or_subject AS title_offence,
+                COALESCE(offence, title_or_subject) AS title_offence,
                 fir_date AS case_date,
-                'Central Bureau of Investigation (CBI)' AS agency,
-                'National Jurisdiction' AS location,
-                'Under Investigation' AS status,
-                'High' AS priority,
+                agency,
+                location,
+                branch,
+                status,
                 pdf_url,
                 source_page_url,
+                source,
                 'Public CBI Case' AS source_type,
                 'cbi' AS source_key
             FROM cbi_firs
@@ -3353,9 +3971,9 @@ def case_files():
         cbi_params = []
         cbi_clauses = []
         if search_q:
-            cbi_clauses.append("(rc_number LIKE ? OR fir_number LIKE ? OR title_or_subject LIKE ?)")
+            cbi_clauses.append("(rc_number LIKE ? OR fir_number LIKE ? OR title_or_subject LIKE ? OR offence LIKE ? OR location LIKE ? OR branch LIKE ?)")
             q_pat = f"%{search_q}%"
-            cbi_params.extend([q_pat, q_pat, q_pat])
+            cbi_params.extend([q_pat, q_pat, q_pat, q_pat, q_pat, q_pat])
         if cbi_clauses:
             cbi_sql += " WHERE " + " AND ".join(cbi_clauses)
         cbi_sql += " ORDER BY id DESC"
@@ -3414,12 +4032,23 @@ def case_files():
         is_cbi = cs.get('source_key') == 'cbi'
         src_badge = '<span class="badge bg-primary">Public CBI Case</span>' if is_cbi else '<span class="badge bg-secondary">Portal Registered</span>'
         
-        pdf_btn = f'<a href="{escape(cs["pdf_url"])}" target="_blank" class="btn btn-sm btn-outline-danger ms-1" title="Download FIR PDF">PDF</a>' if cs.get('pdf_url') else ''
+        pdf_btn = ''
+        if cs.get('pdf_url'):
+            url = cs['pdf_url']
+            if is_cbi and not url.startswith('https://cbi.gov.in/'):
+                pass # Security: only allow official CBI domain for CBI records
+            else:
+                pdf_btn = f'<a href="{escape(url)}" target="_blank" rel="noopener noreferrer" class="btn btn-sm btn-outline-danger ms-1" title="View Official FIR PDF">View</a>'
         
         fir_display = escape(cs['fir_number']) if cs.get('fir_number') else '<span class="text-muted small">Not available</span>'
         offence_display = escape(cs['title_offence']) if cs.get('title_offence') else '<span class="text-muted small">Not available</span>'
         date_display = escape(str(cs['case_date'])) if cs.get('case_date') else '<span class="text-muted small">Not available</span>'
-        agency_display = escape(cs['agency']) if cs.get('agency') else '<span class="text-muted small">Not available</span>'
+        
+        agency_str = escape(cs['agency']) if cs.get('agency') else ''
+        if is_cbi and cs.get('branch'):
+            agency_str += f" - {escape(cs['branch'])}"
+        agency_display = agency_str if agency_str else '<span class="text-muted small">Not available</span>'
+        
         location_display = escape(cs['location']) if cs.get('location') else '<span class="text-muted small">Not available</span>'
 
         if is_cbi:
@@ -4043,7 +4672,7 @@ def recent_firs():
 # ---------------------------------------------------------------------
 @app.route('/admin/ncrb-import', methods=['GET', 'POST'])
 @login_required
-@roles_required('District Magistrate')
+@roles_required('Police')
 def ncrb_import():
     """Upload CSV/XLSX official NCRB dataset and import into ncrb_crime_data table.
     The admin can upload a file; the server will parse, clean, and insert rows.
@@ -4187,5 +4816,14 @@ def ncrb_browse():
 
 if __name__ == '__main__':
     init_db()
+    
+    # Auto-seed test citizen data so the user just runs app.py
+    try:
+        import seed_test_citizens
+        seed_test_citizens.seed()
+        print("Auto-seeded test citizen accounts.")
+    except Exception as e:
+        print(f"[WARN] Failed to auto-seed test citizens: {e}")
+        
     print("Starting Crime Management Portal (Kaggle/NCRB Version) on http://127.0.0.1:5051")
     app.run(host='0.0.0.0', port=5051, debug=True)
