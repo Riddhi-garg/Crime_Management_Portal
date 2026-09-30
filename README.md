@@ -39,7 +39,7 @@ python3 import_kaggle_data.py
 python3 app.py
 ```
 
-Open your browser at: **http://127.0.0.1:5050**
+Open your browser at: **http://127.0.0.1:5051**
 
 ## Data Source
 

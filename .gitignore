@@ -23,6 +23,9 @@ env/
 data/crms.db
 data/crms_backup.db
 data/cms.db
+*.db
+*.db*
+*.bak
 
 # macOS
 .DS_Store
