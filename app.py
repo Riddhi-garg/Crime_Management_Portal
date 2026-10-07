@@ -10,19 +10,40 @@ import sqlite3
 import datetime
 from datetime import timedelta
 import secrets
+import socket
+import ssl
 import smtplib
 from email.mime.text import MIMEText
 from functools import wraps
 from html import escape
-from flask import Flask, render_template_string, request, jsonify, redirect, flash, url_for, send_from_directory, session
+from flask import Flask, render_template_string, request, jsonify, redirect, flash, url_for, session
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+env_file = os.path.join(BASE_DIR, '.env')
+
+# Load environment variables (.env file)
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(env_file)
 except ImportError:
-    # dotenv not installed – environment variables must be set manually
     pass
+
+# Built-in robust fallback to ensure .env is parsed even if python-dotenv is not installed
+if os.path.isfile(env_file):
+    try:
+        with open(env_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    k, v = line.split('=', 1)
+                    k = k.strip()
+                    v = v.strip().strip('\'"')
+                    if k and k not in os.environ:
+                        os.environ[k] = v
+    except Exception as e:
+        print(f"[WARN] Could not parse .env fallback: {e}")
 
 from crime_pattern_analysis import get_filter_options, get_districts_for_state, run_full_analysis
 
@@ -37,7 +58,8 @@ ROLES = ['Citizen', 'Police']
 ROLE_PERMISSIONS = {
     'add_police_station':    ['Police'],
     'add_police_officer':    ['Police'],
-    'add_fir':               ['Citizen', 'Police'],
+    'add_fir':               ['Citizen', 'Police', 'District Magistrate'],
+    'file_fir':              ['Citizen', 'Police', 'District Magistrate'],
     'update_fir_status':     ['Police'],
     'add_criminal':          ['Police'],
     'update_criminal_status':['Police'],
@@ -80,15 +102,126 @@ def get_role_dashboard_url(role):
     return mapping.get(role, '/')
 
 
+def get_officer_current_posting(conn, user_id=None, email=None):
+    """
+    Determine the current assigned station, district, and state of a police officer.
+    Checked dynamically from the database:
+    1. Direct police_transfers (active Current posting)
+    2. police_officers.station_id
+    3. users.police_station_id
+    Returns dictionary with station details, or None if unassigned.
+    """
+    if not user_id and not email:
+        return None
+
+    email_lower = email.lower() if email else ''
+    officer = None
+    if user_id:
+        officer = conn.execute("SELECT * FROM police_officers WHERE user_id = ?", (user_id,)).fetchone()
+    if not officer and email_lower:
+        officer = conn.execute("SELECT * FROM police_officers WHERE lower(email) = ?", (email_lower,)).fetchone()
+
+    user = None
+    if user_id:
+        user = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    if not user and email_lower:
+        user = conn.execute("SELECT * FROM users WHERE lower(email) = ?", (email_lower,)).fetchone()
+
+    station_id = None
+    # 1. Check police_transfers for latest Current posting
+    if officer:
+        tr = conn.execute(
+            "SELECT station_id FROM police_transfers WHERE officer_id = ? AND posting_status = 'Current' ORDER BY transfer_id DESC LIMIT 1",
+            (officer['officer_id'],)
+        ).fetchone()
+        if tr and tr['station_id']:
+            station_id = tr['station_id']
+
+    # 2. Check police_officers.station_id
+    if not station_id and officer and officer['station_id']:
+        station_id = officer['station_id']
+
+    # 3. Check users.police_station_id
+    if not station_id and user and ('police_station_id' in user.keys()) and user['police_station_id']:
+        station_id = user['police_station_id']
+
+    # If direct DB update was applied to police_officers.station_id or users.police_station_id,
+    # honor the latest explicit DB state:
+    if officer and officer['station_id'] and officer['station_id'] != station_id:
+        station_id = officer['station_id']
+    elif user and ('police_station_id' in user.keys()) and user['police_station_id'] and user['police_station_id'] != station_id:
+        station_id = user['police_station_id']
+
+    if not station_id:
+        return None
+
+    st = conn.execute("SELECT * FROM police_stations WHERE station_id = ?", (station_id,)).fetchone()
+    if not st:
+        return None
+
+    district = st['city'] if 'city' in st.keys() else (st['address'] if 'address' in st.keys() else 'District')
+    state = st['state'] if 'state' in st.keys() else 'State'
+
+    return {
+        'officer_id': officer['officer_id'] if officer else None,
+        'user_id': user['user_id'] if user else None,
+        'station_id': st['station_id'],
+        'station_name': st['station_name'],
+        'district': district,
+        'state': state,
+        'address': st['address'] if 'address' in st.keys() else ''
+    }
+
+
+def record_officer_transfer(conn, officer_id, new_station_id):
+    """
+    Record an official transfer for a police officer to a new police station.
+    Updates police_transfers, police_officers, and users tables.
+    """
+    st = conn.execute("SELECT * FROM police_stations WHERE station_id = ?", (new_station_id,)).fetchone()
+    if not st:
+        raise ValueError(f"Station {new_station_id} not found.")
+
+    district = st['city'] if 'city' in st.keys() else 'District'
+    state = st['state'] if 'state' in st.keys() else 'State'
+
+    # Mark prior postings as Previous
+    conn.execute(
+        "UPDATE police_transfers SET posting_status = 'Previous' WHERE officer_id = ?",
+        (officer_id,)
+    )
+
+    # Insert new Current transfer record
+    conn.execute(
+        """
+        INSERT INTO police_transfers (officer_id, station_id, district, state, posting_status)
+        VALUES (?, ?, ?, ?, 'Current')
+        """,
+        (officer_id, new_station_id, district, state)
+    )
+
+    # Synchronize police_officers and linked users
+    conn.execute("UPDATE police_officers SET station_id = ? WHERE officer_id = ?", (new_station_id, officer_id))
+    off = conn.execute("SELECT user_id, email FROM police_officers WHERE officer_id = ?", (officer_id,)).fetchone()
+    if off:
+        if off['user_id']:
+            conn.execute("UPDATE users SET police_station_id = ? WHERE user_id = ?", (new_station_id, off['user_id']))
+        if off['email']:
+            conn.execute("UPDATE users SET police_station_id = ? WHERE lower(email) = ?", (new_station_id, off['email'].lower()))
+    conn.commit()
+
+
 def send_email(to_email, subject, body):
     """
     Send an email via SMTP if configured via environment variables.
-    Otherwise, log the complete email with verification link to console as a safe fallback.
+    Logs technical errors safely without exposing credentials or plaintext OTP.
     """
     smtp_host = os.environ.get('SMTP_HOST')
     smtp_port = int(os.environ.get('SMTP_PORT', 587))
     smtp_user = os.environ.get('SMTP_USER')
     smtp_pass = os.environ.get('SMTP_PASSWORD') or os.environ.get('SMTP_PASS')
+    if smtp_pass:
+        smtp_pass = smtp_pass.strip()
 
     if smtp_host and smtp_user and smtp_pass:
         try:
@@ -96,24 +229,41 @@ def send_email(to_email, subject, body):
             msg['Subject'] = subject
             msg['From'] = smtp_user
             msg['To'] = to_email
-            with smtplib.SMTP(smtp_host, smtp_port) as server:
+
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+                server.ehlo()
                 server.starttls()
+                server.ehlo()
                 server.login(smtp_user, smtp_pass)
                 server.send_message(msg)
+
             print(f"[EMAIL] Verification email sent to {to_email} via SMTP ({smtp_host}).")
             return True
+        except smtplib.SMTPAuthenticationError:
+            print(f"[EMAIL ERROR] SMTP authentication failed: Check SMTP_USER or Gmail App Password.")
+            return False
+        except smtplib.SMTPConnectError:
+            print(f"[EMAIL ERROR] SMTP connection failed: Could not connect to {smtp_host}:{smtp_port}.")
+            return False
+        except (socket.timeout, TimeoutError):
+            print(f"[EMAIL ERROR] Connection timeout: Timed out connecting to {smtp_host}:{smtp_port}.")
+            return False
+        except smtplib.SMTPRecipientsRefused:
+            print(f"[EMAIL ERROR] Recipient rejected: {to_email} was rejected by {smtp_host}.")
+            return False
+        except ssl.SSLError as e:
+            print(f"[EMAIL ERROR] TLS error: SSL/TLS handshake failed ({type(e).__name__}).")
+            return False
         except Exception as e:
-            print(f"[EMAIL ERROR] SMTP delivery failed: {e}. Falling back to console dispatch.")
-
-    # Safe fallback: Print email details to console/log
-    print("\n" + "=" * 70)
-    print(f"[EMAIL NOTIFICATION - CONSOLE FALLBACK]")
-    print(f"To: {to_email}")
-    print(f"Subject: {subject}")
-    print("-" * 70)
-    print(body)
-    print("=" * 70 + "\n")
-    return True
+            print(f"[EMAIL ERROR] SMTP delivery failed ({type(e).__name__}).")
+            return False
+    else:
+        missing = []
+        if not smtp_host: missing.append('SMTP_HOST')
+        if not smtp_user: missing.append('SMTP_USER')
+        if not smtp_pass: missing.append('SMTP_PASS')
+        print(f"[EMAIL WARN] SMTP is not fully configured (missing: {', '.join(missing)}).")
+        return False
 
 
 def render_page(content, status_code=200):
@@ -217,6 +367,8 @@ def init_db():
         cursor.execute("ALTER TABLE users ADD COLUMN aadhaar_last4 TEXT")
     if 'police_station_id' not in existing_cols:
         cursor.execute("ALTER TABLE users ADD COLUMN police_station_id INTEGER")
+    if 'photo_url' not in existing_cols:
+        cursor.execute("ALTER TABLE users ADD COLUMN photo_url TEXT")
 
     # Seed one login per role the first time the app runs. Passwords are
     # hashed with werkzeug's default (PBKDF2) — never stored in plain text.
@@ -265,6 +417,112 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
+
+    cursor.execute("PRAGMA table_info(police_officers)")
+    officer_cols = [row[1] for row in cursor.fetchall()]
+    if 'photo_url' not in officer_cols:
+        cursor.execute("ALTER TABLE police_officers ADD COLUMN photo_url TEXT")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS police_transfers (
+        transfer_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        officer_id INTEGER NOT NULL,
+        station_id INTEGER NOT NULL,
+        district TEXT,
+        state TEXT,
+        posting_status TEXT DEFAULT 'Current',
+        transfer_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (officer_id) REFERENCES police_officers(officer_id),
+        FOREIGN KEY (station_id) REFERENCES police_stations(station_id)
+    );
+    """)
+
+    # Ensure default police user has an officer record and active posting
+    p_user = cursor.execute("SELECT user_id, police_station_id FROM users WHERE lower(email) = 'police@crms.gov.in'").fetchone()
+    if p_user:
+        p_off = cursor.execute("SELECT officer_id, station_id FROM police_officers WHERE user_id = ? OR lower(email) = 'police@crms.gov.in'", (p_user[0],)).fetchone()
+        if not p_off:
+            st1 = cursor.execute("SELECT station_id, city, state FROM police_stations WHERE station_id = 1").fetchone()
+            if st1:
+                cursor.execute("""
+                    INSERT INTO police_officers (name, rank, badge_number, phone, email, station_id, user_id)
+                    VALUES ('Inspector In-Charge', 'Station House Officer (SHO)', 'POL-001', '0120-2741100', 'police@crms.gov.in', 1, ?)
+                """, (p_user[0],))
+                new_off_id = cursor.lastrowid
+                cursor.execute("UPDATE users SET police_station_id = 1 WHERE user_id = ?", (p_user[0],))
+                cursor.execute("""
+                    INSERT INTO police_transfers (officer_id, station_id, district, state, posting_status)
+                    VALUES (?, 1, ?, ?, 'Current')
+                """, (new_off_id, st1[1], st1[2]))
+                conn.commit()
+        elif not p_user[1] and p_off:
+            cursor.execute("UPDATE users SET police_station_id = ? WHERE user_id = ?", (p_off[1], p_user[0]))
+            conn.commit()
+
+    # Ensure a second genuine reference station exists for transfer capabilities if only 1 exists
+    st_count = cursor.execute("SELECT COUNT(*) FROM police_stations").fetchone()[0]
+    if st_count == 1 and os.path.exists(POLICE_STATIONS_GEOJSON):
+        try:
+            _resolve_station_id(conn, 'geo:1004008')
+            conn.commit()
+        except Exception:
+            pass
+
+    # Ensure Pari (gargriddhi1321@gmail.com) is mapped to Station 1
+    pari_user = cursor.execute("SELECT user_id, police_station_id FROM users WHERE lower(email) = 'gargriddhi1321@gmail.com'").fetchone()
+    if pari_user:
+        pari_off = cursor.execute("SELECT officer_id, station_id FROM police_officers WHERE user_id = ? OR lower(email) = 'gargriddhi1321@gmail.com'", (pari_user[0],)).fetchone()
+        st1 = cursor.execute("SELECT station_id, city, state FROM police_stations WHERE station_id = 1").fetchone()
+        if not pari_off and st1:
+            cursor.execute("""
+                INSERT INTO police_officers (name, rank, badge_number, phone, email, station_id, user_id)
+                VALUES ('Pari', 'Sub-Inspector', 'POL-PARI-01', '0120-2741102', 'gargriddhi1321@gmail.com', 1, ?)
+            """, (pari_user[0],))
+            pari_off_id = cursor.lastrowid
+            cursor.execute("UPDATE users SET police_station_id = 1 WHERE user_id = ?", (pari_user[0],))
+            cursor.execute("""
+                INSERT INTO police_transfers (officer_id, station_id, district, state, posting_status)
+                VALUES (?, 1, ?, ?, 'Current')
+            """, (pari_off_id, st1[1], st1[2]))
+            conn.commit()
+        elif pari_off and st1 and pari_off[1] != 1:
+            cursor.execute("UPDATE police_officers SET station_id = 1 WHERE officer_id = ?", (pari_off[0],))
+            cursor.execute("UPDATE users SET police_station_id = 1 WHERE user_id = ?", (pari_user[0],))
+            cursor.execute("UPDATE police_transfers SET posting_status = 'Previous' WHERE officer_id = ?", (pari_off[0],))
+            cursor.execute("""
+                INSERT INTO police_transfers (officer_id, station_id, district, state, posting_status)
+                VALUES (?, 1, ?, ?, 'Current')
+            """, (pari_off[0], st1[1], st1[2]))
+            conn.commit()
+
+    # Ensure Riya (siddhi2213@gmail.com) is mapped to Station 2
+    riya_user = cursor.execute("SELECT user_id, police_station_id FROM users WHERE lower(email) = 'siddhi2213@gmail.com'").fetchone()
+    if riya_user:
+        riya_off = cursor.execute("SELECT officer_id, station_id FROM police_officers WHERE user_id = ? OR lower(email) = 'siddhi2213@gmail.com'", (riya_user[0],)).fetchone()
+        st2 = cursor.execute("SELECT station_id, city, state FROM police_stations WHERE station_id = 2").fetchone()
+        if not riya_off and st2:
+            cursor.execute("""
+                INSERT INTO police_officers (name, rank, badge_number, phone, email, station_id, user_id)
+                VALUES ('Riya', 'Sub-Inspector', 'POL-RIYA-02', '03193-264223', 'siddhi2213@gmail.com', 2, ?)
+            """, (riya_user[0],))
+            riya_off_id = cursor.lastrowid
+            cursor.execute("UPDATE users SET police_station_id = 2 WHERE user_id = ?", (riya_user[0],))
+            cursor.execute("""
+                INSERT INTO police_transfers (officer_id, station_id, district, state, posting_status)
+                VALUES (?, 2, ?, ?, 'Current')
+            """, (riya_off_id, st2[1], st2[2]))
+            conn.commit()
+        elif riya_off and st2 and riya_off[1] != 2:
+            cursor.execute("UPDATE police_officers SET station_id = 2 WHERE officer_id = ?", (riya_off[0],))
+            cursor.execute("UPDATE users SET police_station_id = 2 WHERE user_id = ?", (riya_user[0],))
+            cursor.execute("UPDATE police_transfers SET posting_status = 'Previous' WHERE officer_id = ?", (riya_off[0],))
+            cursor.execute("""
+                INSERT INTO police_transfers (officer_id, station_id, district, state, posting_status)
+                VALUES (?, 2, ?, ?, 'Current')
+            """, (riya_off[0], st2[1], st2[2]))
+            conn.commit()
+    cursor.execute("UPDATE users SET police_station_id = 2 WHERE lower(email) = 'riddhi1713@gmail.com'")
+    conn.commit()
 
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS crimes (
@@ -322,6 +580,23 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
+
+    # Ensure CBI wanted fugitive columns exist on criminals table
+    cursor.execute("PRAGMA table_info(criminals)")
+    existing_crm_cols = {row[1] for row in cursor.fetchall()}
+    for col_name, col_def in [
+        ('notice_reference', 'TEXT'),
+        ('case_rc_number', 'TEXT'),
+        ('branch', 'TEXT'),
+        ('location', 'TEXT'),
+        ('source', "TEXT DEFAULT 'Central Bureau of Investigation (cbi.gov.in)'"),
+        ('cbi_source_url', 'TEXT'),
+        ('notice_dossier_url', 'TEXT'),
+        ('is_cbi_verified', 'INTEGER DEFAULT 0')
+    ]:
+        if col_name not in existing_crm_cols:
+            cursor.execute(f"ALTER TABLE criminals ADD COLUMN {col_name} {col_def}")
+
 
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS cases (
@@ -409,7 +684,7 @@ def init_db():
     cur.execute("SELECT COUNT(DISTINCT crime_type) FROM crime_statistics")
     crime_types_count = cur.fetchone()[0] or 0
     if crime_types_count <= 1:
-        import csv, glob, os
+        import csv, glob
         data_dir = os.path.join(BASE_DIR, "archive")
         canonical_crimes = [
             'MURDER', 'ATTEMPT TO MURDER', 'CULPABLE HOMICIDE NOT AMOUNTING TO MURDER',
@@ -459,7 +734,7 @@ def init_db():
     # Load property_crime_statistics if empty
     cur.execute("SELECT COUNT(*) FROM property_crime_statistics")
     if cur.fetchone()[0] == 0:
-        import csv, os
+        import csv
         data_dir = os.path.join(BASE_DIR, "archive")
         prop_file = os.path.join(data_dir, "10_Property_stolen_and_recovered.csv")
         if os.path.exists(prop_file):
@@ -489,7 +764,7 @@ def init_db():
     # Load arrest_statistics if empty
     cur.execute("SELECT COUNT(*) FROM arrest_statistics")
     if cur.fetchone()[0] == 0:
-        import csv, glob, os
+        import csv, glob
         pattern = os.path.join(data_dir, "*_Persons_arrested_and_their_disposal_*.csv")
         agg = {}
         for file_path in glob.glob(pattern):
@@ -523,7 +798,7 @@ def init_db():
     # Load women_crime_statistics if empty
     cur.execute("SELECT COUNT(*) FROM women_crime_statistics")
     if cur.fetchone()[0] == 0:
-        import csv, glob, os
+        import csv, glob
         pattern = os.path.join(data_dir, "42_District_wise_crimes_committed_against_women_*.csv")
         agg = {}
         for file_path in glob.glob(pattern):
@@ -548,7 +823,7 @@ def init_db():
     # Load children_crime_statistics if empty
     cur.execute("SELECT COUNT(*) FROM children_crime_statistics")
     if cur.fetchone()[0] == 0:
-        import csv, glob, os
+        import csv, glob
         pattern = os.path.join(data_dir, "03_District_wise_crimes_committed_against_children_*.csv")
         agg = {}
         for file_path in glob.glob(pattern):
@@ -588,6 +863,36 @@ def init_db():
     conn.close()
 
 
+def sync_cbi_wanted_fugitives(conn=None):
+    """
+    Safely retrieves and synchronizes genuine wanted fugitive records from official CBI source:
+    https://cbi.gov.in/interpol-red-notice
+    
+    If network is temporarily unavailable, loads verified records from data/cbi/cbi_wanted_fugitives.csv
+    without fabricating data or disrupting operations.
+    """
+    close_at_end = False
+    if conn is None:
+        conn = get_db_connection()
+        close_at_end = True
+
+    try:
+        from import_cbi_data import ensure_criminals_table, import_cbi_wanted_csv, CBI_DIR
+        ensure_criminals_table(conn)
+        
+        cur = conn.cursor()
+        cbi_count = cur.execute("SELECT COUNT(*) FROM criminals WHERE is_cbi_verified = 1").fetchone()[0]
+        csv_path = CBI_DIR / "cbi_wanted_fugitives.csv"
+        if cbi_count == 0 and csv_path.exists():
+            import_cbi_wanted_csv(conn, csv_path)
+    except Exception as e:
+        print(f"[WARN] CBI wanted sync notice: {e}")
+    finally:
+        if close_at_end:
+            conn.close()
+
+
+
 # Base Layout & Navigation Bar
 HTML_NAVBAR = """
 <nav class="navbar navbar-expand-lg sticky-top shadow-sm" style="background-color: #374151; border-bottom: 2px solid #D6cfc4;">
@@ -601,6 +906,7 @@ HTML_NAVBAR = """
     <div class="collapse navbar-collapse" id="navbarNav">
       <ul class="navbar-nav me-auto mb-2 mb-lg-0">
         <li class="nav-item"><a class="nav-link" href="{{ role_dashboard_url or '/' }}" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Dashboard</a></li>
+        <li class="nav-item"><a class="nav-link" href="/file-fir" style="color: #FBBF24; font-weight: bold; font-family: 'Times New Roman', Times, serif;"><i class="bi bi-file-earmark-plus"></i> File FIR</a></li>
 
         {% if current_user_role == 'Citizen' %}
           <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Management System</a></li>
@@ -610,6 +916,7 @@ HTML_NAVBAR = """
           <li class="nav-item"><a class="nav-link" href="/women-children-analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Women &amp; Children</a></li>
 
         {% elif current_user_role == 'Police' %}
+          <li class="nav-item"><a class="nav-link text-nowrap" href="/information" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Information</a></li>
           <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Management System</a></li>
           <li class="nav-item"><a class="nav-link" href="/criminal-records" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Criminal Records</a></li>
           <li class="nav-item"><a class="nav-link" href="/case-files" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Case Files</a></li>
@@ -617,8 +924,6 @@ HTML_NAVBAR = """
           <li class="nav-item"><a class="nav-link" href="/crime-patterns" style="color: #D6cfc4; font-weight: bold; font-family: 'Times New Roman', Times, serif;">Pattern Detector</a></li>
           <li class="nav-item"><a class="nav-link" href="/crime-statistics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Crime Statistics</a></li>
           <li class="nav-item"><a class="nav-link" href="/analytics" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">Analytics &amp; Charts</a></li>
-
-
 
         {% else %}
           <li class="nav-item"><a class="nav-link" href="/fir-management" style="color: #ffffff; font-family: 'Times New Roman', Times, serif;">FIR Management System</a></li>
@@ -741,9 +1046,9 @@ def login():
         password = request.form.get('password', '')
         conn = get_db_connection()
         user = conn.execute("SELECT * FROM users WHERE lower(email) = ?", (email,)).fetchone()
-        conn.close()
         if user and check_password_hash(user['password'], password):
             if not user['email_verified']:
+                conn.close()
                 flash("Please verify your email first. Enter the 6-digit code sent to your inbox.", "warning")
                 return redirect(url_for('verify_otp', email=user['email']))
             else:
@@ -752,12 +1057,15 @@ def login():
                 session['role'] = user['role']
                 session['full_name'] = user['full_name']
                 session['email'] = user['email']
-                session['police_station_id'] = user['police_station_id'] if 'police_station_id' in user.keys() else None
+                posting = get_officer_current_posting(conn, user_id=user['user_id'], email=user['email'])
+                session['police_station_id'] = posting['station_id'] if posting else (user['police_station_id'] if 'police_station_id' in user.keys() else None)
+                conn.close()
                 next_url = request.args.get('next')
                 if next_url and next_url.startswith('/') and not next_url.startswith('//'):
                     return redirect(next_url)
                 return redirect(get_role_dashboard_url(user['role']))
         else:
+            conn.close()
             error = "No account matches that email address and password."
 
     error_html = f'<div class="alert alert-danger py-2">{error}</div>' if error else ''
@@ -825,22 +1133,34 @@ def signup():
             error = "Passwords do not match."
         else:
             conn = get_db_connection()
-            existing = conn.execute("SELECT user_id FROM users WHERE lower(email) = ?", (email,)).fetchone()
-            if existing:
+            existing = conn.execute("SELECT user_id, email_verified FROM users WHERE lower(email) = ?", (email,)).fetchone()
+            if existing and existing['email_verified']:
                 conn.close()
                 error = "An account with that email address already exists. Please sign in or use another email."
             else:
                 otp = f"{secrets.randbelow(1000000):06d}"
                 otp_expires_at = (datetime.datetime.now() + timedelta(minutes=10)).isoformat()
                 pwd_hash = generate_password_hash(password)
-                conn.execute(
-                    """
-                    INSERT INTO users (username, password, role, full_name, email, email_verified,
-                                       otp_code, otp_expires_at, otp_attempts)
-                    VALUES (?, ?, ?, ?, ?, 0, ?, ?, 0)
-                    """,
-                    (email, pwd_hash, role, full_name, email, otp, otp_expires_at)
-                )
+                if existing:
+                    # Same unverified email requesting OTP again: replace previous OTP and credentials
+                    conn.execute(
+                        """
+                        UPDATE users
+                        SET username = ?, password = ?, role = ?, full_name = ?,
+                            email_verified = 0, otp_code = ?, otp_expires_at = ?, otp_attempts = 0
+                        WHERE user_id = ?
+                        """,
+                        (email, pwd_hash, role, full_name, otp, otp_expires_at, existing['user_id'])
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO users (username, password, role, full_name, email, email_verified,
+                                           otp_code, otp_expires_at, otp_attempts)
+                        VALUES (?, ?, ?, ?, ?, 0, ?, ?, 0)
+                        """,
+                        (email, pwd_hash, role, full_name, email, otp, otp_expires_at)
+                    )
                 conn.commit()
                 conn.close()
 
@@ -859,8 +1179,11 @@ If you did not register for an account, you can safely ignore this message.
 Crime Management Portal
 National Crime Records System
 """
-                send_email(to_email=email, subject="Your Crime Management Portal verification code", body=email_body)
-                flash("Registration successful! A 6-digit verification code has been sent to your email.", "success")
+                delivered = send_email(to_email=email, subject="Your Crime Management Portal verification code", body=email_body)
+                if delivered:
+                    flash("Registration successful! A 6-digit verification code has been sent to your email.", "success")
+                else:
+                    flash("Account registered, but the verification email could not be delivered. Please click Resend OTP.", "warning")
                 return redirect(url_for('verify_otp', email=email))
 
     error_html = f'<div class="alert alert-danger py-2">{escape(error)}</div>' if error else ''
@@ -1035,92 +1358,41 @@ def logout():
 
 # OTP verification routes
 
-def verify_otp():
-    email = request.args.get('email') or request.form.get('email')
-    if request.method == 'GET':
-        if not email:
-            flash('Email parameter is required for OTP verification.', 'danger')
-            return redirect(url_for('login'))
-        # Render OTP input form
-        content = f"""<div class=\"row justify-content-center\">
-          <div class=\"col-md-5 col-lg-4\">
-            <div class=\"card p-4 shadow-sm mt-5\">
-              <h3 class=\"text-center mb-1\" style=\"color: #1f2937;\">Enter Verification Code</h3>
-              <p class=\"text-center text-muted mb-4\">A 6‑digit code was sent to <strong>{escape(email)}</strong></p>
-              <form method=\"POST\">
-                <input type=\"hidden\" name=\"email\" value=\"{escape(email)}\">
-                <div class=\"mb-3\">
-                  <label class=\"form-label fw-semibold\">Verification Code</label>
-                  <input type=\"text\" name=\"otp\" class=\"form-control\" placeholder=\"123456\" required>
-                </div>
-                <button type=\"submit\" class=\"btn btn-primary w-100 py-2\">Verify</button>
-              </form>
-            </div>
-          </div>
-        </div>"""
-        return render_template_string(HTML_LAYOUT, content=content, current_user_name=None, current_user_role=None)
-
-    # POST – verify OTP
-    otp_input = request.form.get('otp', '').strip()
-    if not email or not otp_input:
-        flash('Missing email or OTP.', 'danger')
-        return redirect(url_for('login'))
-
-    conn = get_db_connection()
-    user = conn.execute("SELECT * FROM users WHERE lower(email) = ?", (email.lower(),)).fetchone()
-    if not user:
-        conn.close()
-        flash('User not found.', 'danger')
-        return redirect(url_for('signup'))
-
-    # Check expiry and attempts
-    now = datetime.datetime.now()
-    try:
-        expires_at = datetime.datetime.fromisoformat(user['otp_expires_at']) if user['otp_expires_at'] else None
-    except Exception:
-        expires_at = None
-
-    if expires_at is None or now > expires_at:
-        conn.close()
-        flash('OTP has expired. Please request a new code.', 'warning')
-        return redirect(url_for('resend_otp', email=email))
-
-    if user['otp_attempts'] >= 5:
-        conn.close()
-        flash('Maximum verification attempts exceeded. Please request a new code.', 'warning')
-        return redirect(url_for('resend_otp', email=email))
-
-    if otp_input == user['otp_code']:
-        # Successful verification
-        conn.execute(
-            "UPDATE users SET email_verified = 1, otp_code = NULL, otp_expires_at = NULL, otp_attempts = 0 WHERE user_id = ?",
-            (user['user_id'],)
-        )
-        conn.commit()
-        conn.close()
-        flash('Your email has been verified. You may now sign in.', 'success')
-        return redirect(url_for('login'))
-    else:
-        # Increment attempts
-        conn.execute(
-            "UPDATE users SET otp_attempts = otp_attempts + 1 WHERE user_id = ?",
-            (user['user_id'],)
-        )
-        conn.commit()
-        conn.close()
-        flash('Invalid verification code. Please try again.', 'danger')
-        return redirect(url_for('verify_otp', email=email))
-
-
-
 @app.route('/verify-otp', methods=['GET', 'POST'])
 def verify_otp():
-    email = request.args.get('email') or request.form.get('email')
+    email = (request.args.get('email') or request.form.get('email') or '').strip().lower()
 
     # Show OTP page
     if request.method == 'GET':
         if not email:
-            flash('Email parameter is required for OTP verification.', 'danger')
+            content = f"""
+            <div class="row justify-content-center">
+              <div class="col-md-5 col-lg-4">
+                <div class="card p-4 shadow-sm mt-5">
+                  <h3 class="text-center mb-1" style="color: #1f2937;">Verify Account</h3>
+                  <p class="text-center text-muted mb-4">Enter your registered email address to verify your account</p>
+                  <form method="GET" action="/verify-otp">
+                    <div class="mb-3">
+                      <label class="form-label fw-semibold">Email address</label>
+                      <input type="email" name="email" class="form-control" placeholder="name@example.com" required autofocus>
+                    </div>
+                    <button type="submit" class="btn btn-primary w-100 py-2">Continue</button>
+                  </form>
+                  <div class="text-center mt-3">
+                    <a href="/login" class="small text-muted text-decoration-none">&larr; Back to Sign In</a>
+                  </div>
+                </div>
+              </div>
+            </div>
+            """
+            return render_template_string(HTML_LAYOUT, content=content, current_user_name=None, current_user_role=None)
+
+        conn = get_db_connection()
+        user = conn.execute("SELECT * FROM users WHERE lower(email) = ?", (email,)).fetchone()
+        conn.close()
+
+        if user and user['email_verified']:
+            flash('This email is already verified. Please sign in.', 'info')
             return redirect(url_for('login'))
 
         content = f"""
@@ -1189,12 +1461,17 @@ def verify_otp():
 
     user = conn.execute(
         "SELECT * FROM users WHERE lower(email) = ?",
-        (email.lower(),)
+        (email,)
     ).fetchone()
 
     if not user:
         conn.close()
-        flash('User not found.', 'danger')
+        flash('User not found. Please register first.', 'danger')
+        return redirect(url_for('signup'))
+
+    if user['email_verified']:
+        conn.close()
+        flash('This email is already verified. Please sign in.', 'info')
         return redirect(url_for('login'))
 
     expires_at = None
@@ -1210,13 +1487,13 @@ def verify_otp():
     # Check expiry
     if expires_at and datetime.datetime.now() > expires_at:
         conn.close()
-        flash('OTP has expired. Please request a new one.', 'warning')
+        flash('OTP has expired. Generating a new code...', 'warning')
         return redirect(url_for('resend_otp', email=email))
 
     # Check attempt limit
     if user['otp_attempts'] >= 5:
         conn.close()
-        flash('Too many incorrect attempts. Please request a new OTP.', 'danger')
+        flash('Too many incorrect attempts. Generating a new OTP...', 'danger')
         return redirect(url_for('resend_otp', email=email))
 
     # Correct OTP
@@ -1259,10 +1536,10 @@ def verify_otp():
     return redirect(url_for('verify_otp', email=email))
 
 
-@app.route('/resend-otp')
+@app.route('/resend-otp', methods=['GET', 'POST'])
 def resend_otp():
 
-    email = request.args.get('email')
+    email = (request.args.get('email') or request.form.get('email') or '').strip().lower()
 
     if not email:
         flash('Email is required to resend OTP.', 'danger')
@@ -1272,12 +1549,17 @@ def resend_otp():
 
     user = conn.execute(
         "SELECT * FROM users WHERE lower(email) = ?",
-        (email.lower(),)
+        (email,)
     ).fetchone()
 
     if not user:
         conn.close()
-        flash('User not found.', 'danger')
+        flash('User not found. Please register first.', 'danger')
+        return redirect(url_for('signup'))
+
+    if user['email_verified']:
+        conn.close()
+        flash('Your email is already verified. Please sign in.', 'info')
         return redirect(url_for('login'))
 
     # Generate new OTP
@@ -1289,7 +1571,7 @@ def resend_otp():
         + timedelta(minutes=10)
     ).isoformat()
 
-    # Save new OTP
+    # Save new OTP: invalidates the old OTP, updates expiration time, resets attempts
     conn.execute(
         """
         UPDATE users
@@ -1309,7 +1591,7 @@ def resend_otp():
 
 Your new 6-digit verification code (OTP) is:
 
-{new_otp}
+  {new_otp}
 
 This code is valid for 10 minutes.
 
@@ -1321,16 +1603,22 @@ Crime Management Portal
 """
 
     # Send OTP email
-    send_email(
+    delivered = send_email(
         to_email=user['email'],
         subject="Your Crime Management Portal verification code",
         body=email_body
     )
 
-    flash(
-        'A new verification code has been sent to your email.',
-        'success'
-    )
+    if delivered:
+        flash(
+            'A new verification code has been sent to your email.',
+            'success'
+        )
+    else:
+        flash(
+            'Could not deliver verification email right now. Please check server logs or try again shortly.',
+            'warning'
+        )
 
     return redirect(
         url_for('verify_otp', email=email)
@@ -1524,7 +1812,8 @@ def citizen_dashboard():
         <tr>
             <td colspan="6" class="text-center text-muted py-4">
                 You have not filed any complaints or FIRs under this name yet.<br>
-                <a href="/fir-management" class="btn btn-sm btn-primary mt-2">Access FIR Management System</a>
+                <a href="/file-fir" class="btn btn-sm btn-warning mt-2 fw-bold"><i class="bi bi-file-earmark-plus"></i> File New FIR</a>
+                <a href="/fir-management" class="btn btn-sm btn-outline-primary mt-2 ms-2">Access FIR Management System</a>
             </td>
         </tr>
         """
@@ -1610,9 +1899,10 @@ def citizen_dashboard():
                         <p class="text-muted mb-0">Track filed FIRs, submit new complaints, access police station contacts and explore public safety analytics.</p>
                     </div>
                     <div class="d-flex flex-wrap gap-2">
+                        <a href="/file-fir" class="btn btn-warning fw-bold"><i class="bi bi-file-earmark-plus"></i> File New FIR</a>
                         <a href="/fir-management" class="btn btn-primary fw-semibold">FIR Management System</a>
                         <a href="/crime-statistics" class="btn btn-outline-secondary fw-semibold">Safety Trends</a>
-                        <a href="/dataset-overview" class="btn btn-warning fw-semibold">National Overview</a>
+                        <a href="/dataset-overview" class="btn btn-outline-secondary fw-semibold">National Overview</a>
                     </div>
                 </div>
             </div>
@@ -2034,8 +2324,14 @@ def api_police_location_cases():
                 'source_key':  'cbi',
             })
 
-    # 2. Portal registered cases
-    portal_rows = cur.execute("""
+    # 2. Portal registered cases (strictly scoped to officer's current station for Police role)
+    role = session.get('role')
+    officer_station_id = None
+    if role == 'Police':
+        posting = get_officer_current_posting(conn, user_id=session.get('user_id'), email=session.get('email'))
+        officer_station_id = posting['station_id'] if posting else session.get('police_station_id')
+
+    portal_sql = """
         SELECT
             c.case_number,
             f.fir_number,
@@ -2050,13 +2346,20 @@ def api_police_location_cases():
         LEFT JOIN FIR f            ON c.fir_id    = f.fir_id
         LEFT JOIN crimes cr        ON f.crime_id  = cr.crime_id
         LEFT JOIN police_stations ps ON f.station_id = ps.station_id
-        WHERE COALESCE(cr.city, '') LIKE ?
+        WHERE (COALESCE(cr.city, '') LIKE ?
            OR COALESCE(cr.state, '') LIKE ?
            OR COALESCE(ps.city, '') LIKE ?
-           OR COALESCE(ps.state, '') LIKE ?
-        ORDER BY c.case_id DESC
-        LIMIT 100
-    """, (q_pat, q_pat, q_pat, q_pat)).fetchall()
+           OR COALESCE(ps.state, '') LIKE ?)
+    """
+    portal_params = [q_pat, q_pat, q_pat, q_pat]
+    if role == 'Police':
+        if officer_station_id:
+            portal_sql += " AND f.station_id = ?"
+            portal_params.append(officer_station_id)
+        else:
+            portal_sql += " AND 1 = 0"
+    portal_sql += " ORDER BY c.case_id DESC LIMIT 100"
+    portal_rows = cur.execute(portal_sql, portal_params).fetchall()
     for r in portal_rows:
         results.append({
             'case_number': r['case_number'],
@@ -2117,7 +2420,14 @@ def api_police_station_cases():
     ]
 
     # --- Requesting officer's own station context ---
-    officer_station_id = session.get('police_station_id')
+    role = session.get('role')
+    officer_station_id = None
+    if role == 'Police':
+        posting = get_officer_current_posting(conn, user_id=session.get('user_id'), email=session.get('email'))
+        officer_station_id = posting['station_id'] if posting else session.get('police_station_id')
+        if not officer_station_id:
+            conn.close()
+            return jsonify({'searched_query': query, 'matched_station_names': [], 'portal_fir_count': 0, 'portal_case_count': 0, 'cbi_count': 0, 'cbi_note': '', 'total_results': 0, 'fir_results': [], 'case_results': [], 'cbi_results': [], 'restricted': True})
 
     # --- Portal FIR results ---
     fir_results = []
@@ -2126,11 +2436,8 @@ def api_police_station_cases():
     for st in matched_stations:
         sid = st['station_id']
 
-        # Access control: if officer has an assigned station, they may only
-        # view portal operational records for their own station.
-        # Public CBI records have no such restriction (see below).
-        if officer_station_id and sid != officer_station_id:
-            # Officer is not authorised to view another station's operational records
+        # Access control: an officer may only view records for their current assigned station
+        if role == 'Police' and sid != officer_station_id:
             continue
 
         firs = conn.execute("""
@@ -2199,6 +2506,7 @@ def api_police_station_cases():
     if _table_exists(get_db_connection(), 'cbi_firs'):
         conn_cbi = get_db_connection()
         for st in matched_stations:
+            city_val = st['city'] if 'city' in st.keys() and st['city'] else ''
             rows = conn_cbi.execute(
                 """
                 SELECT id, rc_number, fir_number, title_or_subject AS offence, fir_date,
@@ -2206,8 +2514,10 @@ def api_police_station_cases():
                 FROM cbi_firs
                 WHERE (branch IS NOT NULL AND LOWER(branch) = LOWER(?))
                    OR (location IS NOT NULL AND LOWER(location) = LOWER(?))
+                   OR (? != '' AND branch IS NOT NULL AND LOWER(branch) LIKE '%' || LOWER(?) || '%')
+                   OR (? != '' AND location IS NOT NULL AND LOWER(location) LIKE '%' || LOWER(?) || '%')
                 """,
-                (st['station_name'], st['station_name'])
+                (st['station_name'], st['station_name'], city_val, city_val, city_val, city_val)
             ).fetchall()
             for r in rows:
                 cbi_results.append({
@@ -2271,7 +2581,28 @@ def api_police_stations_list():
 @roles_required('Police', 'District Magistrate')
 def police_dashboard():
     conn = get_db_connection()
-    station_id = session.get('police_station_id')
+    user_id = session.get('user_id')
+    user_email = session.get('email')
+    posting = get_officer_current_posting(conn, user_id=user_id, email=user_email)
+    station_id = posting['station_id'] if posting else session.get('police_station_id')
+    if station_id:
+        session['police_station_id'] = station_id
+
+    # Officer profile details
+    officer_info = None
+    if user_id:
+        officer_info = conn.execute("SELECT * FROM police_officers WHERE user_id = ?", (user_id,)).fetchone()
+    if not officer_info and user_email:
+        officer_info = conn.execute("SELECT * FROM police_officers WHERE lower(email) = ?", (user_email.lower(),)).fetchone()
+
+    officer_name_disp = officer_info['name'] if officer_info and officer_info['name'] else (session.get('full_name') or 'Police Officer')
+    officer_rank_disp = officer_info['rank'] if officer_info and officer_info['rank'] else session.get('role', 'Police')
+    badge_disp = officer_info['badge_number'] if officer_info and officer_info['badge_number'] else ''
+    officer_photo_disp = None
+    if officer_info and ('photo_url' in officer_info.keys()) and officer_info['photo_url']:
+        officer_photo_disp = officer_info['photo_url']
+    elif officer_info and officer_info['name'].lower() in ('riya', 'pari'):
+        officer_photo_disp = '/static/uploads/officer_riya.png'
 
     if station_id:
         total_firs = conn.execute("SELECT COUNT(*) FROM FIR WHERE station_id = ?", (station_id,)).fetchone()[0]
@@ -2300,117 +2631,447 @@ def police_dashboard():
             ORDER BY c.start_date DESC LIMIT 5
         """, (station_id,)).fetchall()
     else:
-        total_firs = conn.execute("SELECT COUNT(*) FROM FIR").fetchone()[0]
-        pending_firs = conn.execute("SELECT COUNT(*) FROM FIR WHERE status != 'Closed'").fetchone()[0]
-        active_cases = conn.execute("SELECT COUNT(*) FROM cases WHERE case_status = 'Active'").fetchone()[0]
+        total_firs = 0
+        pending_firs = 0
+        active_cases = 0
         wanted_criminals = conn.execute("SELECT COUNT(*) FROM criminals WHERE status = 'Wanted'").fetchone()[0]
         total_stations = conn.execute("SELECT COUNT(*) FROM police_stations").fetchone()[0]
-
-        recent_firs = conn.execute("""
-            SELECT f.fir_id, f.fir_number, f.filing_date, f.status, f.description,
-                   c.crime_type, ps.station_name
-            FROM FIR f
-            LEFT JOIN crimes c ON f.crime_id = c.crime_id
-            LEFT JOIN police_stations ps ON f.station_id = ps.station_id
-            ORDER BY f.filing_date DESC LIMIT 5
-        """).fetchall()
-
-        active_cases_list = conn.execute("""
-            SELECT c.case_id, c.case_number, c.priority, c.case_status, c.start_date,
-                   po.name as officer_name, po.badge_number
-            FROM cases c
-            LEFT JOIN police_officers po ON c.investigating_officer_id = po.officer_id
-            WHERE c.case_status = 'Active'
-            ORDER BY c.start_date DESC LIMIT 5
-        """).fetchall()
+        recent_firs = []
+        active_cases_list = []
 
     wanted_suspects = conn.execute("""
-        SELECT criminal_id, name, alias, status, identification_details
+        SELECT criminal_id, name, alias, notice_reference, case_rc_number,
+               branch, location, source, cbi_source_url, notice_dossier_url, status
         FROM criminals
         WHERE status = 'Wanted'
-        LIMIT 5
+        ORDER BY criminal_id ASC
+        LIMIT 6
     """).fetchall()
 
-    cbi_count = 0
-    if _table_exists(conn, 'cbi_firs'):
-        cbi_count = conn.execute("SELECT COUNT(*) FROM cbi_firs").fetchone()[0]
-
     conn.close()
+
+    # Build Recent FIRs table rows
+    recent_firs_rows = ""
+    for rf in recent_firs:
+        st_badge = 'gov-badge-green' if rf['status'] == 'Closed' else ('gov-badge-amber' if rf['status'] == 'Pending' else 'gov-badge-navy')
+        recent_firs_rows += f"""
+        <tr>
+            <td class="fw-semibold"><a href="/fir/{escape(rf['fir_number'])}" style="color: #1E3A8A; text-decoration: none;">{escape(rf['fir_number'])}</a></td>
+            <td class="text-muted">{escape(str(rf['filing_date']))}</td>
+            <td>{escape(rf['crime_type'] or 'General')}</td>
+            <td><span class="gov-badge {st_badge}">{escape(rf['status'] or 'Pending')}</span></td>
+            <td><a href="/fir/{escape(rf['fir_number'])}" class="gov-btn-sm">View</a></td>
+        </tr>
+        """
+
+    # Build Wanted Suspects (Official CBI data) table rows
+    wanted_suspects_rows = ""
+    for ws in wanted_suspects:
+        case_no_html = escape(ws['case_rc_number']) if ws['case_rc_number'] else "<span class='text-muted'>—</span>"
+        branch_html = escape(ws['branch']) if ws['branch'] else "<span class='text-muted'>—</span>"
+        loc_html = escape(ws['location']) if ws['location'] else "<span class='text-muted'>—</span>"
+        source_disp = escape(ws['source'] or 'Central Bureau of Investigation (cbi.gov.in)')
+        view_url = ws['notice_dossier_url'] or ws['cbi_source_url'] or 'https://cbi.gov.in/interpol-red-notice'
+        wanted_suspects_rows += f"""
+        <tr>
+            <td class="fw-semibold">{escape(ws['name'])}</td>
+            <td>{case_no_html}</td>
+            <td>{branch_html}</td>
+            <td>{loc_html}</td>
+            <td><span class="gov-badge gov-badge-navy">{source_disp}</span></td>
+            <td>
+                <a href="{escape(view_url)}" target="_blank" rel="noopener noreferrer" class="gov-btn-sm" title="View Details">View</a>
+            </td>
+        </tr>
+        """
+
+    # Build Active Cases table rows
+    active_cases_rows = ""
+    for ac in active_cases_list:
+        p_badge = 'gov-badge-red' if ac['priority'] == 'High' else ('gov-badge-amber' if ac['priority'] == 'Medium' else 'gov-badge-gray')
+        off_display = escape(ac['officer_name'] or 'Assigned Staff')
+        if ac['badge_number']:
+            off_display += f" <span class='text-muted' style='font-size: 0.72rem;'>({escape(ac['badge_number'])})</span>"
+        active_cases_rows += f"""
+        <tr>
+            <td class="fw-semibold"><a href="/case-files?q={escape(ac['case_number'])}" style="color: #1E3A8A; text-decoration: none;">{escape(ac['case_number'])}</a></td>
+            <td><span class="gov-badge {p_badge}">{escape(ac['priority'] or 'Medium')}</span></td>
+            <td class="text-muted">{escape(str(ac['start_date']))}</td>
+            <td>{off_display}</td>
+            <td><a href="/case-files?q={escape(ac['case_number'])}" class="gov-btn-sm">View</a></td>
+        </tr>
+        """
+
+    # Current Posting Block
+    if posting:
+        posting_box = f"""
+        <div class="gov-posting-box">
+            <div class="gov-posting-item">
+                <span class="gov-posting-label">Police Station:</span>
+                <span class="gov-posting-value">{escape(posting['station_name'])}</span>
+            </div>
+            <div class="gov-posting-item">
+                <span class="gov-posting-label">District:</span>
+                <span class="gov-posting-value">{escape(posting['district'])}</span>
+            </div>
+            <div class="gov-posting-item">
+                <span class="gov-posting-label">State:</span>
+                <span class="gov-posting-value">{escape(posting['state'])}</span>
+            </div>
+        </div>
+        """
+    else:
+        posting_box = """
+        <div class="gov-posting-box" style="border-left-color: #64748B;">
+            <span class="text-muted">No active police station precinct assigned to this officer account.</span>
+        </div>
+        """
+
+    badge_meta = f" &middot; Badge: <strong>{escape(badge_disp)}</strong>" if badge_disp else ""
+    rank_meta = f" &middot; Rank: <strong>{escape(officer_rank_disp)}</strong>" if officer_rank_disp else ""
+
     body = f"""
-    <div class="row g-4 mb-4">
-        <div class="col-12">
-            <div class="p-4 rounded-3 card shadow-sm" style="background: #f9fafb; border: 2px solid #D6cfc4;">
-                <div class="d-flex flex-wrap justify-content-between align-items-center gap-3">
-                    <div>
-                        <span class="badge bg-secondary mb-2">Law Enforcement Command</span>
-                        <h2 class="fw-bold mb-1" style="color: #1f2937;">Police Operations Dashboard</h2>
-                        <p class="text-muted mb-0">Operational control for FIR registration, investigative case tracking, suspect identification, and station management.</p>
-                    </div>
-                    <div class="d-flex flex-wrap gap-2">
-                        <a href="/fir-management" class="btn btn-primary fw-semibold">FIR Management System</a>
-                        <a href="/criminal-records" class="btn btn-outline-primary fw-semibold">Criminal Records</a>
-                        <a href="/case-files" class="btn btn-outline-primary fw-semibold">Case Files</a>
-                        <a href="/crime-patterns" class="btn btn-warning fw-semibold">Pattern Detector</a>
-                    </div>
+    <style>
+    .gov-dashboard {{
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
+        color: #1F2937;
+        background-color: #F5F6F8;
+        margin: -1.5rem -1rem;
+        padding: 1.5rem;
+    }}
+    .gov-header-bar {{
+        background: #FFFFFF;
+        border: 1px solid #D1D5DB;
+        border-radius: 4px;
+        padding: 1rem 1.25rem;
+        margin-bottom: 1.25rem;
+    }}
+    .gov-title-main {{
+        font-size: 1.25rem;
+        font-weight: 700;
+        color: #0F172A;
+        letter-spacing: -0.01em;
+        margin: 0;
+        line-height: 1.2;
+    }}
+    .gov-title-sub {{
+        font-size: 0.8125rem;
+        color: #475569;
+        margin-top: 3px;
+        font-weight: 500;
+    }}
+    .gov-user-meta {{
+        font-size: 0.8125rem;
+        color: #334155;
+        text-align: right;
+        line-height: 1.4;
+    }}
+    .gov-card {{
+        background: #FFFFFF;
+        border: 1px solid #D1D5DB;
+        border-radius: 4px;
+        padding: 1rem 1.25rem;
+        margin-bottom: 1.25rem;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+    }}
+    .gov-section-header {{
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        border-bottom: 1px solid #E2E8F0;
+        padding-bottom: 0.5rem;
+        margin-bottom: 0.75rem;
+    }}
+    .gov-section-title {{
+        font-size: 0.875rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+        color: #1E293B;
+        margin: 0;
+    }}
+    .gov-nav-grid {{
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 0.875rem;
+        margin-bottom: 1.25rem;
+    }}
+    .gov-nav-btn {{
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        background: #FFFFFF;
+        border: 1px solid #CBD5E1;
+        border-radius: 4px;
+        padding: 1rem 0.75rem;
+        color: #0F172A !important;
+        text-decoration: none !important;
+        font-weight: 600;
+        font-size: 0.8125rem;
+        letter-spacing: 0.03em;
+        text-transform: uppercase;
+        transition: background-color 0.15s ease, border-color 0.15s ease;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+        min-height: 56px;
+    }}
+    .gov-nav-btn:hover {{
+        background: #F8FAFC;
+        border-color: #94A3B8;
+        color: #0F172A !important;
+    }}
+    .gov-nav-btn:active {{
+        background: #E2E8F0;
+    }}
+    .gov-posting-box {{
+        background: #F8FAFC;
+        border: 1px solid #E2E8F0;
+        border-left: 3px solid #1E3A8A;
+        border-radius: 4px;
+        padding: 0.75rem 1rem;
+        font-size: 0.8125rem;
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 1.5rem;
+    }}
+    .gov-posting-item {{
+        display: flex;
+        align-items: center;
+        gap: 0.35rem;
+    }}
+    .gov-posting-label {{
+        color: #64748B;
+        font-weight: 500;
+    }}
+    .gov-posting-value {{
+        color: #0F172A;
+        font-weight: 600;
+    }}
+    .gov-table {{
+        width: 100%;
+        margin-bottom: 0;
+        font-size: 0.8125rem;
+        border-collapse: collapse;
+    }}
+    .gov-table th {{
+        background-color: #F8FAFC;
+        color: #334155;
+        font-weight: 600;
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+        border-bottom: 1px solid #CBD5E1;
+        border-top: none;
+        padding: 0.55rem 0.75rem;
+        white-space: nowrap;
+    }}
+    .gov-table td {{
+        padding: 0.55rem 0.75rem;
+        vertical-align: middle;
+        border-bottom: 1px solid #E2E8F0;
+        color: #1E293B;
+    }}
+    .gov-table tbody tr:hover {{
+        background-color: #F8FAFC;
+    }}
+    .gov-badge {{
+        display: inline-block;
+        padding: 0.2rem 0.5rem;
+        font-size: 0.7rem;
+        font-weight: 600;
+        border-radius: 3px;
+        line-height: 1;
+        text-transform: uppercase;
+        letter-spacing: 0.02em;
+    }}
+    .gov-badge-green {{ background: #DCFCE7; color: #166534; border: 1px solid #BBF7D0; }}
+    .gov-badge-amber {{ background: #FEF3C7; color: #92400E; border: 1px solid #FDE68A; }}
+    .gov-badge-red   {{ background: #FEE2E2; color: #991B1B; border: 1px solid #FECACA; }}
+    .gov-badge-gray  {{ background: #F1F5F9; color: #475569; border: 1px solid #E2E8F0; }}
+    .gov-badge-navy  {{ background: #EFF6FF; color: #1E40AF; border: 1px solid #DBEAFE; }}
+
+    .gov-btn-sm {{
+        padding: 0.25rem 0.55rem;
+        font-size: 0.75rem;
+        font-weight: 500;
+        border-radius: 3px;
+        border: 1px solid #CBD5E1;
+        background: #FFFFFF;
+        color: #1E293B;
+        text-decoration: none !important;
+        display: inline-block;
+    }}
+    .gov-btn-sm:hover {{
+        background: #F1F5F9;
+        color: #0F172A;
+        border-color: #94A3B8;
+    }}
+    .gov-search-input {{
+        border: 1px solid #CBD5E1;
+        border-radius: 4px;
+        font-size: 0.8125rem;
+        padding: 0.45rem 0.75rem;
+    }}
+    .gov-search-input:focus {{
+        border-color: #1E3A8A;
+        outline: none;
+        box-shadow: 0 0 0 1px #1E3A8A;
+    }}
+    .gov-search-btn {{
+        background: #1E293B;
+        color: #FFFFFF;
+        border: 1px solid #1E293B;
+        border-radius: 4px;
+        font-size: 0.8125rem;
+        font-weight: 500;
+        padding: 0.45rem 1rem;
+    }}
+    .gov-search-btn:hover {{
+        background: #0F172A;
+        color: #FFFFFF;
+    }}
+
+    @media (max-width: 992px) {{
+        .gov-nav-grid {{
+            grid-template-columns: repeat(2, 1fr);
+        }}
+    }}
+    @media (max-width: 576px) {{
+        .gov-nav-grid {{
+            grid-template-columns: 1fr;
+        }}
+        .gov-posting-box {{
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 0.5rem;
+        }}
+        .gov-user-meta {{
+            text-align: left;
+        }}
+    }}
+    </style>
+
+    <div class="gov-dashboard">
+        <!-- HEADER -->
+        <div class="gov-header-bar d-flex flex-wrap justify-content-between align-items-center gap-3">
+            <div>
+                <h1 class="gov-title-main">Crime Management Portal</h1>
+                <div class="gov-title-sub">Police Department / Officer Operations Dashboard</div>
+            </div>
+            <div class="d-flex align-items-center gap-3">
+                {f'<a href="/information" title="Officer Personnel Dossier"><img src="{escape(officer_photo_disp)}" alt="Officer Photo" style="width: 44px; height: 44px; border-radius: 50%; object-fit: cover; object-position: top; border: 2px solid #CBD5E1; box-shadow: 0 1px 2px rgba(0,0,0,0.1);"></a>' if officer_photo_disp else ''}
+                <div class="gov-user-meta">
+                    <div>Logged-in Officer: <strong>{escape(officer_name_disp)}</strong>{badge_meta}{rank_meta} &middot; <a href="/information" class="text-primary text-decoration-underline fw-semibold">Information</a></div>
+                    <div class="text-muted">Posting: <strong>{escape(posting['station_name']) if posting else 'Unassigned'}</strong> &middot; <a href="/logout" class="text-secondary text-decoration-underline">Sign Out</a></div>
                 </div>
             </div>
         </div>
-    </div>
 
-    <div class="row g-4 mb-4">
-        <div class="col-md-3">
-            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #d97706;">
-                <h6 class="text-uppercase text-secondary small">Open / Pending FIRs</h6>
-                <span class="fs-2 fw-bold text-warning">{pending_firs}</span>
-                <small class="text-muted">Out of {total_firs} total registered</small>
+        <!-- CURRENT POSTING -->
+        <div class="gov-card p-3 mb-3">
+            <div class="d-flex justify-content-between align-items-center mb-2">
+                <span class="text-uppercase fw-bold text-secondary" style="font-size: 0.72rem; letter-spacing: 0.05em;">Current Posting</span>
+                <span class="text-muted" style="font-size: 0.75rem;">Jurisdiction &amp; Precinct Authority</span>
             </div>
+            {posting_box}
         </div>
-        <div class="col-md-3">
-            <div class="card stats-card p-3 shadow-sm text-center">
-                <h6 class="text-uppercase text-secondary small">Active Cases</h6>
-                <span class="fs-2 fw-bold text-info">{active_cases}</span>
-                <small class="text-muted">Under investigation</small>
-            </div>
-        </div>
-        <div class="col-md-3">
-            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #991b1b;">
-                <h6 class="text-uppercase text-secondary small">Wanted Suspects</h6>
-                <span class="fs-2 fw-bold text-danger">{wanted_criminals}</span>
-                <small class="text-muted">Active warrants logged</small>
-            </div>
-        </div>
-        <div class="col-md-3">
-            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #2d6a4f;">
-                <h6 class="text-uppercase text-secondary small">Police Stations</h6>
-                <span class="fs-2 fw-bold text-success">{total_stations}</span>
-                <small class="text-muted">Operational network</small>
-            </div>
-        </div>
-    </div>
 
-    <!-- LOCATION CASE SEARCH -->
-    <div class="row g-4 mb-4">
-        <div class="col-12">
-            <div class="card shadow-sm p-4" style="border-left: 4px solid #0d6efd;">
-                <h5 class="fw-bold mb-3" style="color: #1f2937;">
-                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="#0d6efd" class="bi bi-search me-2" viewBox="0 0 16 16"><path d="M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85zm-5.598 1.1a5.5 5.5 0 1 1 0-11 5.5 5.5 0 0 1 0 11z"/></svg>
-                    Search Cases by Location
-                </h5>
-                <div class="row g-2 align-items-end">
-                    <div class="col-md-8">
-                        <label for="locationSearchInput" class="form-label text-muted small mb-1">Enter Location</label>
-                        <input type="text" class="form-control" id="locationSearchInput"
-                               placeholder="e.g. Mumbai, Shimla, New Delhi" autocomplete="off">
-                    </div>
-                    <div class="col-md-4 d-grid">
-                        <button class="btn btn-primary fw-semibold" onclick="searchByLocation()">
-                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-search me-1" viewBox="0 0 16 16"><path d="M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85zm-5.598 1.1a5.5 5.5 0 1 1 0-11 5.5 5.5 0 0 1 0 11z"/></svg>
-                            Search
-                        </button>
-                    </div>
+        <!-- MAIN NAVIGATION MODULES -->
+        <div class="gov-nav-grid" style="grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));">
+            <a href="/information" class="gov-nav-btn" style="border-left: 3px solid #1E3A8A; font-weight: 700; color: #1E3A8A !important;">
+                INFORMATION
+            </a>
+            <a href="/file-fir" class="gov-nav-btn" style="border-left: 3px solid #F59E0B; font-weight: 700; color: #1E3A8A !important;">
+                + FILE / REGISTER FIR
+            </a>
+            <a href="{url_for('fir_management')}" class="gov-nav-btn">
+                OPEN / PENDING FIRs
+            </a>
+            <a href="{url_for('case_files')}" class="gov-nav-btn">
+                ACTIVE CASES
+            </a>
+            <a href="{url_for('criminal_records')}" class="gov-nav-btn">
+                WANTED SUSPECTS
+            </a>
+            <a href="{url_for('police_stations')}" class="gov-nav-btn">
+                POLICE STATIONS
+            </a>
+        </div>
+
+        <!-- RECENT FIR REGISTRATIONS -->
+        <div class="gov-card mb-3">
+            <div class="gov-section-header">
+                <span class="gov-section-title">Recent FIR Registrations</span>
+                <div class="d-flex gap-2">
+                    <a href="/file-fir" class="gov-btn-sm" style="background: #F59E0B; color: #000; font-weight: 700; border: none;">+ File FIR</a>
+                    <a href="/fir-management" class="gov-btn-sm">FIR Management &rarr;</a>
                 </div>
-                <div id="locationSearchResults" class="mt-3"></div>
             </div>
+            <div class="table-responsive">
+                <table class="gov-table">
+                    <thead>
+                        <tr>
+                            <th>FIR Number</th>
+                            <th>Filing Date</th>
+                            <th>Offence</th>
+                            <th>Status</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {recent_firs_rows or "<tr><td colspan='5' class='text-center py-3 text-muted'>No FIR records registered for this station precinct.</td></tr>"}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- WANTED SUSPECTS (OFFICIAL CBI DATA) -->
+        <div class="gov-card mb-3">
+            <div class="gov-section-header">
+                <div>
+                    <span class="gov-section-title">Wanted Suspects</span>
+                    <span class="text-muted ms-2" style="font-size: 0.75rem;">Official CBI Red Notice Fugitives ({wanted_criminals:,} Published Records)</span>
+                </div>
+                <a href="/criminal-records" class="gov-btn-sm">All Wanted Records &rarr;</a>
+            </div>
+            <div class="table-responsive">
+                <table class="gov-table">
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>Case/RC No.</th>
+                            <th>Branch</th>
+                            <th>Location</th>
+                            <th>Source</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {wanted_suspects_rows or "<tr><td colspan='6' class='text-center py-3 text-muted'>CBI wanted-person data is currently unavailable.</td></tr>"}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- SEARCH CASES BY LOCATION -->
+        <div class="gov-card mb-0">
+            <div class="gov-section-header">
+                <span class="gov-section-title">Search Cases by Location</span>
+                <span class="text-muted" style="font-size: 0.75rem;">Jurisdiction &amp; Registry Search</span>
+            </div>
+            <div class="row g-2 align-items-end mb-2">
+                <div class="col-md-9">
+                    <input type="text" class="form-control gov-search-input" id="locationSearchInput"
+                           placeholder="Enter district, city, or jurisdiction name (e.g. Nicobar, Ghaziabad, Delhi)..." autocomplete="off">
+                </div>
+                <div class="col-md-3">
+                    <button class="btn gov-search-btn w-100" onclick="searchByLocation()">
+                        Search Records
+                    </button>
+                </div>
+            </div>
+            <div id="locationSearchResults" class="mt-2"></div>
         </div>
     </div>
 
@@ -2419,16 +3080,16 @@ def police_dashboard():
         var query = document.getElementById('locationSearchInput').value.trim();
         var resultsDiv = document.getElementById('locationSearchResults');
         if (!query) {{
-            resultsDiv.innerHTML = '<div class="alert alert-warning py-2">Please enter a location to search.</div>';
+            resultsDiv.innerHTML = '<div class="alert alert-warning py-2 small mb-0">Please enter a location to search.</div>';
             return;
         }}
-        resultsDiv.innerHTML = '<div class="text-center py-3"><div class="spinner-border text-primary" role="status"><span class="visually-hidden">Searching...</span></div><p class="text-muted mt-2">Searching records...</p></div>';
+        resultsDiv.innerHTML = '<div class="text-center py-3"><p class="text-muted small mb-0">Searching jurisdiction records...</p></div>';
 
         fetch('/api/police/location-cases?location=' + encodeURIComponent(query))
         .then(function(resp) {{ return resp.json(); }})
         .then(function(data) {{
             if (data.error) {{
-                resultsDiv.innerHTML = '<div class="alert alert-danger py-2">' + data.error + '</div>';
+                resultsDiv.innerHTML = '<div class="alert alert-danger py-2 small mb-0">' + escapeHtml(data.error) + '</div>';
                 return;
             }}
 
@@ -2436,29 +3097,29 @@ def police_dashboard():
             var html = '';
 
             if (results.length === 0) {{
-                html = '<div class="alert alert-info py-2">No cases found for this location.</div>';
+                html = '<div class="alert alert-info py-2 small mb-0">No cases found for this location.</div>';
             }} else {{
-                html += '<div class="d-flex justify-content-between align-items-center mb-2"><span class="text-muted small"><strong>' + results.length + '</strong> result(s) for location: <strong>' + escapeHtml(query) + '</strong></span><a href="/case-files?q=' + encodeURIComponent(query) + '" class="btn btn-sm btn-outline-secondary">View All in Case Files</a></div>';
-                html += '<div class="table-responsive"><table class="table table-hover align-middle mb-0">';
-                html += '<thead><tr><th>Case / RC Number</th><th>FIR / Registration Date</th><th>Crime / Offence</th><th>Agency / Station</th><th>Location</th><th>Status</th><th>Source</th><th>Action</th></tr></thead><tbody>';
+                html += '<div class="d-flex justify-content-between align-items-center mb-2 pt-2 border-top"><span class="text-muted small"><strong>' + results.length + '</strong> record(s) found for: <strong>' + escapeHtml(query) + '</strong></span><a href="/case-files?q=' + encodeURIComponent(query) + '" class="gov-btn-sm">Open in Case Files</a></div>';
+                html += '<div class="table-responsive"><table class="gov-table">';
+                html += '<thead><tr><th>Case / RC Number</th><th>Date</th><th>Offence</th><th>Agency / Station</th><th>Location</th><th>Status</th><th>Source</th><th>Action</th></tr></thead><tbody>';
 
                 for (var i = 0; i < results.length; i++) {{
                     var r = results[i];
                     var srcBadge = r.source_key === 'cbi'
-                        ? '<span class="badge bg-primary">Public CBI Case</span>'
-                        : '<span class="badge bg-secondary">Portal Registered</span>';
+                        ? '<span class="gov-badge gov-badge-navy">CBI Record</span>'
+                        : '<span class="gov-badge gov-badge-gray">Precinct Registered</span>';
                     var actionBtn = '';
                     if (r.pdf_url) {{
-                        actionBtn = '<a href="' + escapeHtml(r.pdf_url) + '" target="_blank" rel="noopener noreferrer" class="btn btn-sm btn-outline-danger me-1">View PDF</a>';
+                        actionBtn = '<a href="' + escapeHtml(r.pdf_url) + '" target="_blank" rel="noopener noreferrer" class="gov-btn-sm me-1">PDF</a>';
                     }}
-                    actionBtn += '<a href="/case-files?q=' + encodeURIComponent(r.case_number) + '" class="btn btn-sm btn-outline-primary">View Case</a>';
+                    actionBtn += '<a href="/case-files?q=' + encodeURIComponent(r.case_number) + '" class="gov-btn-sm">View</a>';
                     html += '<tr>';
-                    html += '<td class="fw-bold">' + escapeHtml(r.case_number || 'N/A') + '</td>';
-                    html += '<td>' + escapeHtml(r.date || 'Not available') + '</td>';
+                    html += '<td class="fw-semibold">' + escapeHtml(r.case_number || 'N/A') + '</td>';
+                    html += '<td class="text-muted">' + escapeHtml(r.date || 'Not available') + '</td>';
                     html += '<td>' + escapeHtml(r.offence || 'Not available') + '</td>';
                     html += '<td>' + escapeHtml(r.agency || 'Not available') + '</td>';
                     html += '<td>' + escapeHtml(r.location || 'Not available') + '</td>';
-                    html += '<td><span class="badge bg-info text-dark">' + escapeHtml(r.status || 'N/A') + '</span></td>';
+                    html += '<td><span class="gov-badge gov-badge-amber">' + escapeHtml(r.status || 'N/A') + '</span></td>';
                     html += '<td>' + srcBadge + '</td>';
                     html += '<td>' + actionBtn + '</td>';
                     html += '</tr>';
@@ -2468,7 +3129,7 @@ def police_dashboard():
             resultsDiv.innerHTML = html;
         }})
         .catch(function(err) {{
-            resultsDiv.innerHTML = '<div class="alert alert-danger py-2">Error searching: ' + err.message + '</div>';
+            resultsDiv.innerHTML = '<div class="alert alert-danger py-2 small mb-0">Error searching: ' + escapeHtml(err.message) + '</div>';
         }});
     }}
 
@@ -2485,183 +3146,449 @@ def police_dashboard():
     return render_page(body)
 
 
-# ROLE DASHBOARD: COURT
-@app.route('/dashboard/court')
-@roles_required('Police', 'Court', 'District Magistrate')
-def court_dashboard():
-    return redirect(url_for('police_dashboard'))
+# OFFICER INFORMATION: CONFIDENTIAL PERSONNEL SERVICE DOSSIER
+@app.route('/information')
+@app.route('/police/information')
+@login_required
+@roles_required('Police')
+def police_information():
+    """
+    Officer Information Page.
+    Strictly displays complete existing personnel, posting, and service
+    records for the currently authenticated police officer.
+    Disallows query parameter overrides to prevent viewing another officer's profile.
+    """
     conn = get_db_connection()
-    total_cases = conn.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
-    active_trials = conn.execute("SELECT COUNT(*) FROM cases WHERE case_status = 'Active'").fetchone()[0]
-    closed_cases = conn.execute("SELECT COUNT(*) FROM cases WHERE case_status = 'Closed'").fetchone()[0]
+    user_id = session.get('user_id')
+    user_email = session.get('email')
 
-    arrest_summary = conn.execute("""
-        SELECT SUM(persons_arrested) as arrested,
-               SUM(persons_convicted) as convicted,
-               SUM(persons_acquitted) as acquitted
-        FROM arrest_statistics
-    """).fetchone()
+    # Security: Authenticated officer lookup ONLY (never from request.args)
+    user = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    officer = None
+    if user_id:
+        officer = conn.execute("SELECT * FROM police_officers WHERE user_id = ?", (user_id,)).fetchone()
+    if not officer and user_email:
+        officer = conn.execute("SELECT * FROM police_officers WHERE lower(email) = ?", (user_email.lower(),)).fetchone()
 
-    total_convicted = arrest_summary['convicted'] or 0
-    total_acquitted = arrest_summary['acquitted'] or 0
-    total_disposed = total_convicted + total_acquitted
-    conviction_pct = round((total_convicted / total_disposed * 100), 1) if total_disposed > 0 else 0.0
+    # Dynamic current posting resolution (same logic as Police Dashboard)
+    posting = get_officer_current_posting(conn, user_id=user_id, email=user_email)
 
-    pending_cases = conn.execute("""
-        SELECT c.case_id, c.case_number, c.case_status, c.priority, c.start_date, c.remarks,
-               f.fir_number, po.name as officer_name
-        FROM cases c
-        LEFT JOIN FIR f ON c.fir_id = f.fir_id
-        LEFT JOIN police_officers po ON c.investigating_officer_id = po.officer_id
-        ORDER BY c.start_date DESC LIMIT 8
-    """).fetchall()
+    # Active station details
+    station_info = None
+    if posting and posting.get('station_id'):
+        station_info = conn.execute("SELECT * FROM police_stations WHERE station_id = ?", (posting['station_id'],)).fetchone()
 
-    top_charges = conn.execute("""
-        SELECT crime_head, persons_arrested, persons_convicted, persons_acquitted
-        FROM arrest_statistics
-        ORDER BY (persons_convicted + persons_acquitted) DESC LIMIT 5
-    """).fetchall()
+    # Transfer records from police_transfers table
+    current_transfer = None
+    transfers_history = []
+    if officer:
+        current_transfer = conn.execute(
+            "SELECT * FROM police_transfers WHERE officer_id = ? AND posting_status = 'Current' ORDER BY transfer_id DESC LIMIT 1",
+            (officer['officer_id'],)
+        ).fetchone()
+        transfers_history = conn.execute(
+            """SELECT t.*, ps.station_name, ps.city, ps.state
+               FROM police_transfers t
+               LEFT JOIN police_stations ps ON t.station_id = ps.station_id
+               WHERE t.officer_id = ?
+               ORDER BY t.transfer_id DESC""",
+            (officer['officer_id'],)
+        ).fetchall()
+
     conn.close()
 
-    case_rows = ""
-    for c in pending_cases:
-        p_badge = "bg-danger" if c['priority'] == 'High' else ("bg-warning text-dark" if c['priority'] == 'Medium' else "bg-secondary")
-        status_badge = "bg-info" if c['case_status'] == 'Active' else ("bg-success" if c['case_status'] == 'Closed' else "bg-secondary")
-        case_rows += f"""
-        <tr>
-            <td class="fw-bold"><a href="/case-files">{escape(c['case_number'] or '')}</a></td>
-            <td><a href="/fir-management">{escape(c['fir_number'] or 'N/A')}</a></td>
-            <td><span class="badge {p_badge}">{escape(c['priority'] or 'Normal')}</span></td>
-            <td><span class="badge {status_badge}">{escape(c['case_status'] or 'Active')}</span></td>
-            <td>{escape(c['officer_name'] or 'Unassigned')}</td>
-            <td>{escape(c['start_date'] or '')}</td>
-            <td><small class="text-muted">{escape(c['remarks'] or 'Under Judicial Review')}</small></td>
-        </tr>
-        """
+    # Personal Information fields (from actual DB columns)
+    officer_name = officer['name'] if officer else (user['full_name'] if user else 'Police Officer')
+    officer_badge = officer['badge_number'] if officer else 'Not assigned'
+    officer_system_id = f"POL-{officer['officer_id']:04d}" if officer else (f"USR-{user_id}" if user_id else 'N/A')
+    officer_rank = officer['rank'] if officer else session.get('role', 'Police Officer')
+    officer_email = officer['email'] if officer else (user['email'] if user else session.get('email', 'N/A'))
+    officer_phone = officer['phone'] if (officer and officer['phone']) else 'Not recorded'
+    joining_date = officer['created_at'] if officer else (user['created_at'] if user else 'Not recorded')
 
-    disposition_rows = ""
-    for ch in top_charges:
-        tot = (ch['persons_convicted'] or 0) + (ch['persons_acquitted'] or 0)
-        c_rate = round((ch['persons_convicted'] / tot * 100), 1) if tot > 0 else 0.0
-        disposition_rows += f"""
-        <tr>
-            <td class="fw-semibold">{escape(ch['crime_head'])}</td>
-            <td class="text-end">{ch['persons_arrested']:,}</td>
-            <td class="text-end text-success fw-bold">{ch['persons_convicted']:,}</td>
-            <td class="text-end text-secondary">{ch['persons_acquitted']:,}</td>
-            <td class="text-end"><span class="badge bg-secondary">{c_rate}%</span></td>
-        </tr>
-        """
+    # Profile Photo resolution
+    officer_photo = None
+    if officer and ('photo_url' in officer.keys()) and officer['photo_url']:
+        officer_photo = officer['photo_url']
+    elif user and ('photo_url' in user.keys()) and user['photo_url']:
+        officer_photo = user['photo_url']
+    elif officer and officer['name'].lower() in ('riya', 'pari'):
+        officer_photo = '/static/uploads/officer_riya.png'
+
+    if officer_photo:
+        photo_box_html = f'''<div class="officer-photo-box flex-shrink-0" style="overflow: hidden; padding: 0; background: #E2E8F0; border: 1.5px solid #94A3B8; box-shadow: 0 1px 3px rgba(0,0,0,0.12);">
+                    <img src="{escape(officer_photo)}" alt="{escape(officer_name)}" style="width: 100%; height: 100%; object-fit: cover; object-position: top center;">
+                </div>'''
+        photo_status_row = f'''<tr>
+                        <td class="gov-info-label">Profile Photo</td>
+                        <td class="gov-info-value">
+                            <span class="gov-badge gov-badge-green">Official Photograph Attached</span>
+                            <span class="text-muted small ms-2">&middot; Verified Personnel Image On Record</span>
+                        </td>
+                    </tr>'''
+    else:
+        photo_box_html = '''<div class="officer-photo-box flex-shrink-0">
+                    <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#64748B" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                        <circle cx="12" cy="7" r="4"></circle>
+                    </svg>
+                    <span style="font-size: 0.62rem; text-transform: uppercase; margin-top: 4px; font-weight: 600; color: #475569;">OFFICER</span>
+                </div>'''
+        photo_status_row = '''<tr>
+                        <td class="gov-info-label">Profile Photo</td>
+                        <td class="gov-info-value text-muted small">
+                            Standard Department Silhouette Active (Official Photo Pending)
+                        </td>
+                    </tr>'''
+
+    # Current Posting fields (strictly dynamic)
+    station_name = posting['station_name'] if posting else 'Unassigned'
+    district_name = posting['district'] if posting else 'Unassigned'
+    state_name = posting['state'] if posting else 'Unassigned'
+    station_address = station_info['address'] if station_info else (posting['address'] if posting else 'Not recorded')
+    station_contact = station_info['contact_number'] if station_info else 'Not recorded'
+    posting_date = current_transfer['transfer_date'] if current_transfer else (joining_date or 'Not recorded')
+
+    # Build Career Transfer History rows
+    transfer_rows = ""
+    if transfers_history:
+        for t in transfers_history:
+            st_badge = 'gov-badge-green' if t['posting_status'] == 'Current' else 'gov-badge-gray'
+            transfer_rows += f"""
+            <tr>
+                <td class="font-monospace text-muted">{escape(str(t['transfer_id']))}</td>
+                <td class="fw-semibold">{escape(t['station_name'] or f"Station #{t['station_id']}")}</td>
+                <td>{escape(t['district'] or 'N/A')}, {escape(t['state'] or 'N/A')}</td>
+                <td><span class="gov-badge {st_badge}">{escape(t['posting_status'] or 'N/A')}</span></td>
+                <td class="text-muted">{escape(str(t['transfer_date']))}</td>
+            </tr>
+            """
+    else:
+        transfer_rows = "<tr><td colspan='5' class='text-center py-2 text-muted'>No prior transfer records found.</td></tr>"
 
     body = f"""
-    <div class="row g-4 mb-4">
-        <div class="col-12">
-            <div class="p-4 rounded-3 card shadow-sm" style="background: #f9fafb; border: 2px solid #D6cfc4;">
-                <div class="d-flex flex-wrap justify-content-between align-items-center gap-3">
-                    <div>
-                        <span class="badge bg-secondary mb-2">Judicial Administration</span>
-                        <h2 class="fw-bold mb-1" style="color: #1f2937;">District Court Case Proceedings Dashboard</h2>
-                        <p class="text-muted mb-0">Court docket tracking, hearing status management, prosecution evidence review, and judicial disposition metrics.</p>
+    <style>
+    .gov-dashboard {{
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
+        color: #1F2937;
+        background-color: #F5F6F8;
+        margin: -1.5rem -1rem;
+        padding: 1.5rem;
+    }}
+    .gov-header-bar {{
+        background: #FFFFFF;
+        border: 1px solid #D1D5DB;
+        border-radius: 4px;
+        padding: 1rem 1.25rem;
+        margin-bottom: 1.25rem;
+    }}
+    .gov-card {{
+        background: #FFFFFF;
+        border: 1px solid #CBD5E1;
+        border-radius: 4px;
+        margin-bottom: 1rem;
+    }}
+    .gov-section-header {{
+        background: #F8FAFC;
+        border-bottom: 1px solid #CBD5E1;
+        padding: 0.65rem 1rem;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }}
+    .gov-section-title {{
+        font-weight: 700;
+        font-size: 0.8125rem;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: #1E293B;
+    }}
+    .gov-info-table {{
+        width: 100%;
+        margin-bottom: 0;
+        border-collapse: collapse;
+        font-size: 0.84rem;
+    }}
+    .gov-info-table tr {{
+        border-bottom: 1px solid #E2E8F0;
+    }}
+    .gov-info-table tr:last-child {{
+        border-bottom: none;
+    }}
+    .gov-info-label {{
+        width: 220px;
+        background-color: #F8FAFC;
+        color: #475569;
+        font-weight: 600;
+        padding: 0.6rem 0.85rem;
+        border-right: 1px solid #E2E8F0;
+        vertical-align: middle;
+        font-size: 0.8125rem;
+        text-transform: uppercase;
+        letter-spacing: 0.02em;
+    }}
+    .gov-info-value {{
+        padding: 0.6rem 0.85rem;
+        color: #0F172A;
+        background-color: #FFFFFF;
+        vertical-align: middle;
+    }}
+    .gov-table {{
+        width: 100%;
+        margin-bottom: 0;
+        border-collapse: collapse;
+        font-size: 0.8125rem;
+    }}
+    .gov-table th {{
+        background-color: #F8FAFC;
+        color: #334155;
+        font-weight: 600;
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+        border-bottom: 1px solid #CBD5E1;
+        padding: 0.55rem 0.75rem;
+        white-space: nowrap;
+    }}
+    .gov-table td {{
+        padding: 0.55rem 0.75rem;
+        vertical-align: middle;
+        border-bottom: 1px solid #E2E8F0;
+        color: #1E293B;
+    }}
+    .gov-badge {{
+        display: inline-block;
+        padding: 0.2rem 0.5rem;
+        font-size: 0.7rem;
+        font-weight: 600;
+        border-radius: 3px;
+        line-height: 1;
+        text-transform: uppercase;
+        letter-spacing: 0.02em;
+    }}
+    .gov-badge-green {{ background: #DCFCE7; color: #166534; border: 1px solid #BBF7D0; }}
+    .gov-badge-navy  {{ background: #EFF6FF; color: #1E40AF; border: 1px solid #DBEAFE; }}
+    .gov-badge-gray  {{ background: #F1F5F9; color: #475569; border: 1px solid #E2E8F0; }}
+    .gov-btn-sm {{
+        padding: 0.25rem 0.55rem;
+        font-size: 0.75rem;
+        font-weight: 500;
+        border-radius: 3px;
+        text-decoration: none !important;
+        border: 1px solid #CBD5E1;
+        background: #FFFFFF;
+        color: #1E293B !important;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.25rem;
+    }}
+    .gov-btn-sm:hover {{
+        background: #F1F5F9;
+        border-color: #94A3B8;
+    }}
+    .officer-photo-box {{
+        width: 88px;
+        height: 104px;
+        border: 1px solid #CBD5E1;
+        background: #F1F5F9;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        border-radius: 3px;
+        color: #64748B;
+        text-align: center;
+        padding: 4px;
+    }}
+    </style>
+
+    <div class="gov-dashboard">
+        <!-- HEADER BAR -->
+        <div class="gov-header-bar d-flex flex-wrap justify-content-between align-items-center gap-3">
+            <div>
+                <h1 style="font-size: 1.15rem; font-weight: 700; color: #0F172A; text-transform: uppercase; letter-spacing: 0.04em; margin: 0 0 0.15rem 0;">
+                    Officer Information
+                </h1>
+                <div style="font-size: 0.8125rem; color: #64748B;">
+                    Police Department &middot; Official Personnel Service Record &middot; Confidential
+                </div>
+            </div>
+            <div class="d-flex align-items-center gap-2">
+                <a href="/dashboard/police" class="gov-btn-sm">&larr; Return to Dashboard</a>
+                <a href="/police-stations" class="gov-btn-sm">Station Directory</a>
+            </div>
+        </div>
+
+        <!-- OFFICER SUMMARY BADGE HEADER -->
+        <div class="gov-card p-3 mb-3">
+            <div class="d-flex flex-wrap align-items-center gap-3">
+                {photo_box_html}
+
+                <div class="flex-grow-1">
+                    <div class="d-flex flex-wrap align-items-center gap-2 mb-1">
+                        <h2 style="font-size: 1.25rem; font-weight: 700; color: #0F172A; margin: 0;">
+                            {escape(officer_name)}
+                        </h2>
+                        <span class="gov-badge gov-badge-navy">{escape(officer_rank)}</span>
+                        <span class="gov-badge gov-badge-green">Active (On Duty)</span>
                     </div>
-                    <div class="d-flex flex-wrap gap-2">
-                        <a href="/case-files" class="btn btn-primary fw-semibold">Case File Proceedings</a>
-                        <a href="/fir-management" class="btn btn-outline-primary fw-semibold">FIR Management System</a>
-                        <a href="/criminal-records" class="btn btn-outline-primary fw-semibold">Criminal Records</a>
-                        <a href="/property-arrest-analytics" class="btn btn-warning fw-semibold">Arrests &amp; Convictions</a>
+                    <div style="font-size: 0.8125rem; color: #475569;" class="mb-2">
+                        Badge Number: <strong class="text-dark font-monospace">{escape(officer_badge)}</strong> &middot; 
+                        Department: <strong>State Police Department</strong> &middot;
+                        Current Posting: <strong>{escape(station_name)}</strong>
+                    </div>
+                    <div style="font-size: 0.75rem; color: #64748B;">
+                        Authenticated Session: <strong>{escape(officer_email)}</strong> &middot; Authorized Access Only (Official Police Docket)
                     </div>
                 </div>
             </div>
         </div>
-    </div>
 
-    <div class="row g-4 mb-4">
-        <div class="col-md-3">
-            <div class="card stats-card p-3 shadow-sm text-center">
-                <h6 class="text-uppercase text-secondary small">Cases Pending Hearing / Trial</h6>
-                <span class="fs-2 fw-bold text-info">{active_trials}</span>
-                <small class="text-muted">Active in court proceedings</small>
+        <!-- SECTION 1: PERSONAL INFORMATION -->
+        <div class="gov-card mb-3">
+            <div class="gov-section-header">
+                <span class="gov-section-title">Personal Information</span>
+                <span class="text-muted" style="font-size: 0.72rem;">Identity &amp; Contact Records</span>
             </div>
+            <table class="gov-info-table">
+                <tbody>
+                    <tr>
+                        <td class="gov-info-label">Full Name</td>
+                        <td class="gov-info-value fw-semibold">{escape(officer_name)}</td>
+                    </tr>
+                    <tr>
+                        <td class="gov-info-label">Employee / Officer ID</td>
+                        <td class="gov-info-value">
+                            <span class="font-monospace fw-bold">{escape(officer_badge)}</span>
+                            <span class="text-muted ms-2 small">({escape(officer_system_id)})</span>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td class="gov-info-label">Rank / Designation</td>
+                        <td class="gov-info-value fw-semibold text-primary">{escape(officer_rank)}</td>
+                    </tr>
+                    <tr>
+                        <td class="gov-info-label">Official Email Address</td>
+                        <td class="gov-info-value font-monospace">{escape(officer_email)}</td>
+                    </tr>
+                    <tr>
+                        <td class="gov-info-label">Contact Number</td>
+                        <td class="gov-info-value font-monospace">{escape(officer_phone)}</td>
+                    </tr>
+                    {photo_status_row}
+                </tbody>
+            </table>
         </div>
-        <div class="col-md-3">
-            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #2d6a4f;">
-                <h6 class="text-uppercase text-secondary small">Disposed / Closed Cases</h6>
-                <span class="fs-2 fw-bold text-success">{closed_cases}</span>
-                <small class="text-muted">Final judgements rendered</small>
-            </div>
-        </div>
-        <div class="col-md-3">
-            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #4b5563;">
-                <h6 class="text-uppercase text-secondary small">Total Docketed Cases</h6>
-                <span class="fs-2 fw-bold text-secondary">{total_cases}</span>
-                <small class="text-muted">Total judicial registry</small>
-            </div>
-        </div>
-        <div class="col-md-3">
-            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #d97706;">
-                <h6 class="text-uppercase text-secondary small">National Conviction Rate</h6>
-                <span class="fs-2 fw-bold text-warning">{conviction_pct}%</span>
-                <small class="text-muted">Based on official trial records</small>
-            </div>
-        </div>
-    </div>
 
-    <div class="row g-4 mb-4">
-        <div class="col-12">
-            <div class="card shadow-sm p-3">
-                <div class="d-flex justify-content-between align-items-center mb-3">
-                    <h5 class="fw-bold mb-0" style="color: #1f2937;">Active Judicial Case Files</h5>
-                    <a href="/case-files" class="btn btn-sm btn-outline-primary">Manage Case Dockets</a>
-                </div>
-                <div class="table-responsive">
-                    <table class="table table-hover align-middle mb-0">
-                        <thead>
-                            <tr>
-                                <th>Case Number</th>
-                                <th>Associated FIR</th>
-                                <th>Priority</th>
-                                <th>Status</th>
-                                <th>Investigator</th>
-                                <th>Initiated</th>
-                                <th>Remarks / Notes</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {case_rows if case_rows else '<tr><td colspan="7" class="text-center text-muted">No judicial cases on docket.</td></tr>'}
-                        </tbody>
-                    </table>
-                </div>
+        <!-- SECTION 2: CURRENT POSTING -->
+        <div class="gov-card mb-3">
+            <div class="gov-section-header">
+                <span class="gov-section-title">Current Posting</span>
+                <span class="gov-badge gov-badge-green">Current Assigned Precinct</span>
             </div>
+            <table class="gov-info-table">
+                <tbody>
+                    <tr>
+                        <td class="gov-info-label">Police Station</td>
+                        <td class="gov-info-value fw-bold text-dark">{escape(station_name)}</td>
+                    </tr>
+                    <tr>
+                        <td class="gov-info-label">District</td>
+                        <td class="gov-info-value">{escape(district_name)}</td>
+                    </tr>
+                    <tr>
+                        <td class="gov-info-label">State / Union Territory</td>
+                        <td class="gov-info-value">{escape(state_name)}</td>
+                    </tr>
+                    <tr>
+                        <td class="gov-info-label">Station Address</td>
+                        <td class="gov-info-value">{escape(station_address)}</td>
+                    </tr>
+                    <tr>
+                        <td class="gov-info-label">Station Contact</td>
+                        <td class="gov-info-value font-monospace">{escape(station_contact)}</td>
+                    </tr>
+                    <tr>
+                        <td class="gov-info-label">Current Posting Status</td>
+                        <td class="gov-info-value"><span class="gov-badge gov-badge-green">Active &middot; Current Posting</span></td>
+                    </tr>
+                    <tr>
+                        <td class="gov-info-label">Date of Current Posting</td>
+                        <td class="gov-info-value">{escape(str(posting_date))}</td>
+                    </tr>
+                </tbody>
+            </table>
         </div>
-    </div>
 
-    <div class="row g-4">
-        <div class="col-12">
-            <div class="card shadow-sm p-3">
-                <div class="d-flex justify-content-between align-items-center mb-3">
-                    <h5 class="fw-bold mb-0" style="color: #1f2937;">Trial &amp; Disposition Trends by Crime Category</h5>
-                    <a href="/property-arrest-analytics" class="small">Full Analytics</a>
-                </div>
-                <div class="table-responsive">
-                    <table class="table table-sm table-hover align-middle mb-0">
-                        <thead>
-                            <tr>
-                                <th>Crime Category</th>
-                                <th class="text-end">Arrested</th>
-                                <th class="text-end">Convicted</th>
-                                <th class="text-end">Acquitted</th>
-                                <th class="text-end">Conviction Rate</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {disposition_rows}
-                        </tbody>
-                    </table>
-                </div>
+        <!-- SECTION 3: SERVICE INFORMATION -->
+        <div class="gov-card mb-3">
+            <div class="gov-section-header">
+                <span class="gov-section-title">Service Information</span>
+                <span class="text-muted" style="font-size: 0.72rem;">Departmental Administration Records</span>
+            </div>
+            <table class="gov-info-table">
+                <tbody>
+                    <tr>
+                        <td class="gov-info-label">Department / Agency</td>
+                        <td class="gov-info-value">State Police Department &middot; Crime &amp; Criminal Tracking Network (CCTNS)</td>
+                    </tr>
+                    <tr>
+                        <td class="gov-info-label">Cadre / Rank</td>
+                        <td class="gov-info-value">{escape(officer_rank)}</td>
+                    </tr>
+                    <tr>
+                        <td class="gov-info-label">Badge / Employee ID</td>
+                        <td class="gov-info-value font-monospace">{escape(officer_badge)}</td>
+                    </tr>
+                    <tr>
+                        <td class="gov-info-label">Date of Joining / Appointment</td>
+                        <td class="gov-info-value">{escape(str(joining_date))}</td>
+                    </tr>
+                    <tr>
+                        <td class="gov-info-label">Service Status</td>
+                        <td class="gov-info-value"><span class="gov-badge gov-badge-green">Active (On Duty)</span></td>
+                    </tr>
+                    <tr>
+                        <td class="gov-info-label">Portal Authorization Role</td>
+                        <td class="gov-info-value fw-semibold">{escape(user['role'] if user else 'Police')}</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- SECTION 4: POSTING & TRANSFER HISTORY -->
+        <div class="gov-card mb-3">
+            <div class="gov-section-header">
+                <span class="gov-section-title">Posting &amp; Transfer History</span>
+                <span class="text-muted" style="font-size: 0.72rem;">Official Career Transfer Register</span>
+            </div>
+            <div class="table-responsive">
+                <table class="gov-table">
+                    <thead>
+                        <tr>
+                            <th>Ref #</th>
+                            <th>Station Name</th>
+                            <th>District / State</th>
+                            <th>Posting Status</th>
+                            <th>Transfer / Effective Date</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {transfer_rows}
+                    </tbody>
+                </table>
             </div>
         </div>
     </div>
     """
     return render_page(body)
+
+
+# ROLE DASHBOARD: COURT
+@app.route('/dashboard/court')
+@roles_required('Police', 'Court', 'District Magistrate')
+def court_dashboard():
+    return redirect(url_for('police_dashboard'))
 
 
 # ROLE DASHBOARD: DISTRICT MAGISTRATE
@@ -2669,184 +3596,6 @@ def court_dashboard():
 @roles_required('Police', 'Court', 'District Magistrate')
 def magistrate_dashboard():
     return redirect(url_for('police_dashboard'))
-    conn = get_db_connection()
-    total_firs = conn.execute("SELECT COUNT(*) FROM FIR").fetchone()[0]
-    total_cases = conn.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
-    total_criminals = conn.execute("SELECT COUNT(*) FROM criminals").fetchone()[0]
-    total_stations = conn.execute("SELECT COUNT(*) FROM police_stations").fetchone()[0]
-    active_cases = conn.execute("SELECT COUNT(*) FROM cases WHERE case_status = 'Active'").fetchone()[0]
-    pending_firs = conn.execute("SELECT COUNT(*) FROM FIR WHERE status != 'Closed'").fetchone()[0]
-
-    arrest_summary = conn.execute("""
-        SELECT SUM(persons_arrested) as arrested,
-               SUM(persons_convicted) as convicted,
-               SUM(persons_acquitted) as acquitted
-        FROM arrest_statistics
-    """).fetchone()
-
-    total_convicted = arrest_summary['convicted'] or 0
-    total_acquitted = arrest_summary['acquitted'] or 0
-    total_disposed = total_convicted + total_acquitted
-    conviction_pct = round((total_convicted / total_disposed * 100), 1) if total_disposed > 0 else 0.0
-
-    recent_firs = conn.execute("""
-        SELECT f.fir_id, f.fir_number, f.filing_date, f.status, f.description,
-               c.crime_type, ps.station_name
-        FROM FIR f
-        LEFT JOIN crimes c ON f.crime_id = c.crime_id
-        LEFT JOIN police_stations ps ON f.station_id = ps.station_id
-        ORDER BY f.filing_date DESC LIMIT 5
-    """).fetchall()
-
-    recent_cases = conn.execute("""
-        SELECT c.case_number, c.case_status, c.priority, c.start_date,
-               po.name as officer_name
-        FROM cases c
-        LEFT JOIN police_officers po ON c.investigating_officer_id = po.officer_id
-        ORDER BY c.start_date DESC LIMIT 5
-    """).fetchall()
-
-    conn.close()
-
-    fir_rows = ""
-    for f in recent_firs:
-        status_badge = "bg-warning text-dark" if f['status'] == 'Pending' else ("bg-success" if f['status'] == 'Closed' else "bg-secondary")
-        fir_rows += f"""
-        <tr>
-            <td class="fw-bold"><a href="/fir-management">{escape(f['fir_number'] or '')}</a></td>
-            <td>{escape(f['filing_date'] or '')}</td>
-            <td>{escape(f['crime_type'] or 'N/A')}</td>
-            <td>{escape(f['station_name'] or 'Station')}</td>
-            <td><span class="badge {status_badge}">{escape(f['status'] or 'Pending')}</span></td>
-        </tr>
-        """
-
-    case_rows = ""
-    for c in recent_cases:
-        p_badge = "bg-danger" if c['priority'] == 'High' else ("bg-warning text-dark" if c['priority'] == 'Medium' else "bg-secondary")
-        case_rows += f"""
-        <tr>
-            <td class="fw-bold"><a href="/case-files">{escape(c['case_number'] or '')}</a></td>
-            <td><span class="badge {p_badge}">{escape(c['priority'] or 'Normal')}</span></td>
-            <td>{escape(c['case_status'] or 'Active')}</td>
-            <td>{escape(c['officer_name'] or 'Unassigned')}</td>
-            <td>{escape(c['start_date'] or '')}</td>
-        </tr>
-        """
-
-    body = f"""
-    <div class="row g-4 mb-4">
-        <div class="col-12">
-            <div class="p-4 rounded-3 card shadow-sm" style="background: #f9fafb; border: 2px solid #D6cfc4;">
-                <div class="d-flex flex-wrap justify-content-between align-items-center gap-3">
-                    <div>
-                        <span class="badge bg-secondary mb-2">Executive Law &amp; Order Oversight</span>
-                        <h2 class="fw-bold mb-1" style="color: #1f2937;">District Magistrate Command Console</h2>
-                        <p class="text-muted mb-0">District administrative authority: cross-departmental supervision across Police Stations, FIR Registrations, Criminal Surveillance, and Court Proceedings.</p>
-                    </div>
-                    <div class="d-flex flex-wrap gap-2">
-                        <a href="/fir-management" class="btn btn-primary fw-semibold">FIR Management System</a>
-                        <a href="/case-files" class="btn btn-outline-primary fw-semibold">Case Dockets</a>
-                        <a href="/criminal-records" class="btn btn-outline-primary fw-semibold">Criminal Profiles</a>
-                        <a href="/crime-patterns" class="btn btn-outline-primary fw-semibold">Pattern Detector</a>
-                        <a href="/dataset-overview" class="btn btn-warning fw-semibold">National Overview</a>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <div class="row g-4 mb-4">
-        <div class="col-md">
-            <div class="card stats-card p-3 shadow-sm text-center">
-                <h6 class="text-uppercase text-secondary small">Police Stations</h6>
-                <span class="fs-2 fw-bold text-info">{total_stations}</span>
-                <small class="text-muted">In district jurisdiction</small>
-            </div>
-        </div>
-        <div class="col-md">
-            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #d97706;">
-                <h6 class="text-uppercase text-secondary small">Total Registered FIRs</h6>
-                <span class="fs-2 fw-bold text-warning">{total_firs}</span>
-                <small class="text-muted">{pending_firs} pending resolution</small>
-            </div>
-        </div>
-        <div class="col-md">
-            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #4b5563;">
-                <h6 class="text-uppercase text-secondary small">Active Cases</h6>
-                <span class="fs-2 fw-bold text-secondary">{active_cases}</span>
-                <small class="text-muted">Under active inquiry</small>
-            </div>
-        </div>
-        <div class="col-md">
-            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #991b1b;">
-                <h6 class="text-uppercase text-secondary small">Known Criminals</h6>
-                <span class="fs-2 fw-bold text-danger">{total_criminals}</span>
-                <small class="text-muted">On judicial watch</small>
-            </div>
-        </div>
-        <div class="col-md">
-            <div class="card stats-card p-3 shadow-sm text-center" style="border-left-color: #2d6a4f;">
-                <h6 class="text-uppercase text-secondary small">Conviction Rate</h6>
-                <span class="fs-2 fw-bold text-success">{conviction_pct}%</span>
-                <small class="text-muted">Judicial conviction metric</small>
-            </div>
-        </div>
-    </div>
-
-    <div class="row g-4">
-        <div class="col-lg-6">
-            <div class="card shadow-sm p-3">
-                <div class="d-flex justify-content-between align-items-center mb-3">
-                    <h5 class="fw-bold mb-0" style="color: #1f2937;">Jurisdictional FIR Registrations</h5>
-                    <a href="/fir-management" class="btn btn-sm btn-outline-primary">FIR Management System</a>
-                </div>
-                <div class="table-responsive">
-                    <table class="table table-hover align-middle mb-0">
-                        <thead>
-                            <tr>
-                                <th>FIR Number</th>
-                                <th>Filing Date</th>
-                                <th>Crime Head</th>
-                                <th>Station</th>
-                                <th>Status</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {fir_rows if fir_rows else '<tr><td colspan="5" class="text-center text-muted">No FIRs logged yet.</td></tr>'}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-
-        <div class="col-lg-6">
-            <div class="card shadow-sm p-3">
-                <div class="d-flex justify-content-between align-items-center mb-3">
-                    <h5 class="fw-bold mb-0" style="color: #1f2937;">Case Investigation Oversight</h5>
-                    <a href="/case-files" class="btn btn-sm btn-outline-primary">All Cases</a>
-                </div>
-                <div class="table-responsive">
-                    <table class="table table-hover align-middle mb-0">
-                        <thead>
-                            <tr>
-                                <th>Case Number</th>
-                                <th>Priority</th>
-                                <th>Status</th>
-                                <th>Investigator</th>
-                                <th>Initiated</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {case_rows if case_rows else '<tr><td colspan="5" class="text-center text-muted">No active cases.</td></tr>'}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-    </div>
-    """
-    return render_page(body)
 
 
 # CRIME STATISTICS & FILTER ROUTE
@@ -3294,10 +4043,16 @@ CRIMINAL_STATUSES = ["Wanted", "Arrested", "Convicted", "Released", "Absconding"
 
 
 def _options_html(items, current):
-    return "".join(
-        f'<option value="{item}"{" selected" if item == current else ""}>{item}</option>'
-        for item in items
-    )
+    options = []
+    for item in items:
+        if isinstance(item, (tuple, list)) and len(item) == 2:
+            val, label = item
+        else:
+            val = label = item
+        selected = ' selected' if current is not None and str(val) == str(current) else ''
+        options.append(f'<option value="{escape(str(val))}"{selected}>{escape(str(label))}</option>')
+    return "".join(options)
+
 
 
 def _table_exists(conn, table_name):
@@ -3417,7 +4172,7 @@ def police_stations():
     conn = get_db_connection()
     stations = conn.execute("SELECT * FROM police_stations ORDER BY station_id DESC").fetchall()
     officers = conn.execute("""
-        SELECT o.*, s.station_name 
+        SELECT o.*, s.station_name, s.city AS station_city, s.state AS station_state 
         FROM police_officers o 
         LEFT JOIN police_stations s ON o.station_id = s.station_id
         ORDER BY o.officer_id DESC
@@ -3446,14 +4201,25 @@ def police_stations():
 
     officers_html = "".join([f"""
     <tr>
-        <td><span class="badge bg-secondary">{o['badge_number']}</span></td>
-        <td class="fw-bold">{o['name']}</td>
-        <td><span class="badge bg-info text-dark">{o['rank']}</span></td>
-        <td>{o['station_name'] or 'Unassigned'}</td>
-        <td>{o['phone']}</td>
-        <td>{o['email']}</td>
+        <td><span class="badge bg-secondary">{escape(o['badge_number'])}</span></td>
+        <td class="fw-bold">{escape(o['name'])}</td>
+        <td><span class="badge bg-info text-dark">{escape(o['rank'])}</span></td>
+        <td>
+            <div class="fw-semibold text-warning">{escape(o['station_name'] or 'Unassigned')}</div>
+            <small class="text-muted">{escape(o['station_city'] or 'N/A')}, {escape(o['station_state'] or 'N/A')}</small>
+        </td>
+        <td>{escape(o['phone'])}</td>
+        <td>{escape(o['email'])}</td>
+        <td>
+            <form method="POST" action="/police-officers/{o['officer_id']}/transfer" class="d-flex gap-1 align-items-center">
+                <select name="new_station_id" class="form-select form-select-sm" style="min-width: 160px;">
+                    {_options_html([(st['station_id'], f"{st['station_name'][:24]} ({st['city']})") for st in stations], o['station_id'])}
+                </select>
+                <button type="submit" class="btn btn-sm btn-outline-warning text-nowrap">Transfer</button>
+            </form>
+        </td>
     </tr>
-    """ for o in officers]) or "<tr><td colspan='6' class='text-center text-muted py-4'>No operational police officers registered yet.</td></tr>"
+    """ for o in officers]) or "<tr><td colspan='7' class='text-center text-muted py-4'>No operational police officers registered yet.</td></tr>"
 
     dataset_rows = "".join([f"""
     <tr><td class="fw-bold text-warning">{s['state']}</td><td>{s['districts']}</td>
@@ -3514,7 +4280,7 @@ def police_stations():
         <div class="d-flex justify-content-between align-items-center mb-3"><h4 class="text-info m-0">Deputed Police Officers</h4><a href="/police-stations#add-officer" class="btn btn-warning btn-sm">Add Officer</a></div>
         <div class="table-responsive">
             <table class="table table-dark table-hover align-middle">
-                <thead><tr><th>Badge No</th><th>Officer Name</th><th>Rank</th><th>Station</th><th>Phone</th><th>Email</th></tr></thead>
+                <thead><tr><th>Badge No</th><th>Officer Name</th><th>Rank</th><th>Current Station &amp; District</th><th>Phone</th><th>Email</th><th>Transfer Posting</th></tr></thead>
                 <tbody>{officers_html}</tbody>
             </table>
         </div>
@@ -3552,11 +4318,47 @@ def add_police_station():
 def add_police_officer():
     conn = get_db_connection()
     station_id = _resolve_station_id(conn, request.form['station_id'])
-    conn.execute("INSERT INTO police_officers (name, rank, badge_number, phone, email, station_id) VALUES (?, ?, ?, ?, ?, ?)",
+    cur = conn.cursor()
+    cur.execute("INSERT INTO police_officers (name, rank, badge_number, phone, email, station_id) VALUES (?, ?, ?, ?, ?, ?)",
                  (request.form['name'], request.form['rank'], request.form['badge_number'], request.form['phone'], request.form['email'], station_id))
+    officer_id = cur.lastrowid
+    st = conn.execute("SELECT city, state FROM police_stations WHERE station_id = ?", (station_id,)).fetchone()
+    if st:
+        conn.execute("INSERT INTO police_transfers (officer_id, station_id, district, state, posting_status) VALUES (?, ?, ?, ?, 'Current')",
+                     (officer_id, station_id, st['city'], st['state']))
     conn.commit()
     conn.close()
     return redirect('/police-stations')
+
+
+@app.route('/police-officers/<int:officer_id>/transfer', methods=['POST'])
+@roles_required('Police', 'District Magistrate')
+def transfer_police_officer(officer_id):
+    conn = get_db_connection()
+    raw_station = request.form.get('new_station_id')
+    new_station_id = _resolve_station_id(conn, raw_station)
+    try:
+        if isinstance(new_station_id, str) and new_station_id.startswith('('):
+            import ast
+            try:
+                parsed = ast.literal_eval(new_station_id)
+                if isinstance(parsed, (tuple, list)) and len(parsed) > 0:
+                    new_station_id = parsed[0]
+            except Exception:
+                pass
+        new_station_id = int(new_station_id)
+        record_officer_transfer(conn, officer_id, new_station_id)
+        # If the transferred officer is currently logged in, update session
+        if session.get('user_id'):
+            cur_posting = get_officer_current_posting(conn, user_id=session.get('user_id'), email=session.get('email'))
+            if cur_posting and cur_posting['officer_id'] == officer_id:
+                session['police_station_id'] = cur_posting['station_id']
+        flash("Officer transferred successfully.", "success")
+    except Exception as e:
+        flash(f"Transfer failed: {str(e)}", "danger")
+    finally:
+        conn.close()
+    return redirect(request.referrer or '/police-stations')
 
 
 @app.route('/fir-management')
@@ -3600,6 +4402,80 @@ def fir_management():
     # Global totals (unfiltered)
     total_all = cur.execute("SELECT COUNT(*) FROM ncrb_raw_data").fetchone()[0]
     distinct_files = cur.execute("SELECT COUNT(DISTINCT source_file) FROM ncrb_raw_data").fetchone()[0]
+
+    # For Police officers, display their current station's operational FIRs
+    station_firs_html = ""
+    role = session.get('role')
+    if role == 'Police':
+        posting = get_officer_current_posting(conn, user_id=session.get('user_id'), email=session.get('email'))
+        officer_station_id = posting['station_id'] if posting else session.get('police_station_id')
+        station_firs = cur.execute("""
+            SELECT f.fir_id, f.fir_number, f.filing_date, f.status, f.description,
+                   c.crime_type, c.location, v.name AS victim_name
+            FROM FIR f
+            LEFT JOIN crimes c ON f.crime_id = c.crime_id
+            LEFT JOIN victims v ON f.victim_id = v.victim_id
+            WHERE f.station_id = ?
+            ORDER BY f.filing_date DESC, f.fir_id DESC
+        """, (officer_station_id,)).fetchall() if officer_station_id else []
+
+        fir_rows = "".join([f"""
+        <tr>
+            <td class="fw-bold"><a href="/fir/{escape(f['fir_number'])}">{escape(f['fir_number'])}</a></td>
+            <td>{escape(str(f['filing_date']))}</td>
+            <td>{escape(f['crime_type'] or 'N/A')}</td>
+            <td>{escape(f['victim_name'] or 'N/A')}</td>
+            <td>{escape(f['location'] or 'N/A')}</td>
+            <td>
+                <span class="badge {'bg-success' if f['status'] == 'Closed' else ('bg-warning text-dark' if f['status'] == 'Under Investigation' else 'bg-secondary')}">{escape(f['status'])}</span>
+            </td>
+            <td>
+                <form method="POST" action="/fir-management/{f['fir_id']}/status" class="d-flex gap-1">
+                    <select name="status" class="form-select form-select-sm">
+                        {_options_html(FIR_STATUSES, f['status'])}
+                    </select>
+                    <button class="btn btn-sm btn-outline-primary">Update</button>
+                </form>
+            </td>
+        </tr>
+        """ for f in station_firs])
+
+        st_name = escape(posting['station_name']) if posting else 'Your Station'
+        st_dist = escape(posting['district']) if posting else ''
+        st_state = escape(posting['state']) if posting else ''
+        station_firs_html = f"""
+        <div class="card shadow-sm mb-4" style="border: 2px solid #374151;">
+            <div class="card-header d-flex justify-content-between align-items-center" style="background-color: #f3f4f6; color: #1f2937;">
+                <div>
+                    <span class="badge bg-primary me-2">CURRENT PRECINCT</span>
+                    <strong class="fs-6">{st_name}</strong>
+                    <span class="text-muted small ms-2">({st_dist}, {st_state})</span>
+                </div>
+                <span class="badge bg-secondary">{len(station_firs)} Station FIRs</span>
+            </div>
+            <div class="card-body p-0">
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle mb-0" style="font-size: 0.88rem;">
+                        <thead style="background-color: #e5e7eb; color: #1f2937;">
+                            <tr>
+                                <th>FIR Number</th>
+                                <th>Filing Date</th>
+                                <th>Crime Type</th>
+                                <th>Complainant / Victim</th>
+                                <th>Location</th>
+                                <th>Status</th>
+                                <th>Action</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {fir_rows or "<tr><td colspan='7' class='text-center py-4 text-muted'>No FIR records registered for this police precinct.</td></tr>"}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        """
+
     conn.close()
 
     # Group rows by source_file
@@ -3806,8 +4682,9 @@ def fir_management():
               </p>
             </div>
             <div class="d-flex flex-wrap gap-2">
+              <a href="/file-fir" class="btn btn-warning fw-semibold btn-sm"><i class="bi bi-file-earmark-plus"></i> File New FIR</a>
               <a href="/fir-management" class="btn btn-outline-secondary btn-sm fw-semibold">Reset Filters</a>
-              <a href="/crime-statistics" class="btn btn-warning fw-semibold btn-sm">Crime Statistics</a>
+              <a href="/crime-statistics" class="btn btn-outline-secondary fw-semibold btn-sm">Crime Statistics</a>
             </div>
           </div>
         </div>
@@ -3846,6 +4723,8 @@ def fir_management():
       </div>
     </div>
 
+    {station_firs_html}
+
     <!-- Filter & Search card -->
     <div class="card shadow-sm p-3 mb-4">
       <form method="GET" class="row g-2 align-items-end">
@@ -3878,12 +4757,326 @@ def fir_management():
     return render_page(body)
 
 
+def _generate_fir_number(conn, station_id=None):
+    year = datetime.date.today().year
+    cur = conn.cursor()
+    cnt = cur.execute("SELECT COUNT(*) FROM FIR").fetchone()[0] + 1
+    prefix = "FIR"
+    if station_id:
+        st = cur.execute("SELECT city, station_name FROM police_stations WHERE station_id = ?", (station_id,)).fetchone()
+        if st and st['city']:
+            cleaned = re.sub(r'[^A-Za-z]', '', st['city']).upper()
+            if cleaned:
+                prefix = f"FIR-{cleaned[:3]}"
+    num = f"{prefix}-{year}-{cnt:04d}"
+    while cur.execute("SELECT 1 FROM FIR WHERE fir_number = ?", (num,)).fetchone():
+        cnt += 1
+        num = f"{prefix}-{year}-{cnt:04d}"
+    return num
+
+
+CRIME_CATEGORIES = [
+    "Cyber Crime / Online Fraud",
+    "Financial Scam / Embezzlement",
+    "Theft & Burglary",
+    "Robbery & Dacoity",
+    "Assault & Physical Violence",
+    "Harassment / Stalking",
+    "Extortion / Blackmail",
+    "Narcotics & Drug Offence",
+    "Property Damage / Vandalism",
+    "Missing Person",
+    "Vehicle Theft",
+    "Domestic Violence",
+    "General Public Complaint"
+]
+
+
+@app.route('/file-fir', methods=['GET', 'POST'])
+@login_required
+@roles_required(*ROLE_PERMISSIONS['file_fir'])
+def file_fir():
+    conn = get_db_connection()
+    role = session.get('role')
+    user_id = session.get('user_id')
+    user_email = session.get('email')
+
+    officer_posting = None
+    if role == 'Police':
+        officer_posting = get_officer_current_posting(conn, user_id=user_id, email=user_email)
+
+    if request.method == 'POST':
+        cur = conn.cursor()
+
+        # 1. Resolve station
+        if role == 'Police' and officer_posting:
+            station_id = officer_posting['station_id']
+        else:
+            raw_station = request.form.get('station_id')
+            station_id = _resolve_station_id(conn, raw_station)
+
+        if not station_id:
+            flash("Please select an operational police precinct.", "danger")
+            conn.close()
+            return redirect('/file-fir')
+        station_id = int(station_id)
+
+        # 2. Extract input fields
+        victim_name = request.form.get('victim_name', '').strip()
+        victim_age = request.form.get('victim_age', '').strip() or None
+        victim_gender = request.form.get('victim_gender', 'Other').strip()
+        victim_phone = request.form.get('victim_phone', '').strip()
+        victim_address = request.form.get('victim_address', '').strip()
+
+        crime_type = request.form.get('crime_type', '').strip() or "General Public Complaint"
+        crime_desc = request.form.get('crime_description', '').strip()
+        crime_date = request.form.get('crime_date', '').strip() or datetime.date.today().isoformat()
+        crime_time = request.form.get('crime_time', '').strip() or None
+        severity = request.form.get('severity', 'Moderate').strip()
+        location = request.form.get('location', '').strip()
+        city = request.form.get('city', '').strip()
+        state = request.form.get('state', '').strip()
+
+        fir_number = request.form.get('fir_number', '').strip()
+        filing_date = request.form.get('filing_date', '').strip() or datetime.date.today().isoformat()
+        fir_desc = request.form.get('fir_description', '').strip()
+
+        if not fir_number:
+            fir_number = _generate_fir_number(conn, station_id)
+
+        # Duplicate check
+        if cur.execute("SELECT 1 FROM FIR WHERE fir_number = ?", (fir_number,)).fetchone():
+            fir_number = f"{fir_number}-{secrets.randbelow(1000):03d}"
+
+        # 3. Aadhaar hash from user profile if linked
+        user_row = cur.execute("SELECT aadhaar_hash FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        aadhaar_hash = user_row['aadhaar_hash'] if user_row and user_row['aadhaar_hash'] else None
+
+        # 4. Insert into database
+        cur.execute(
+            """INSERT INTO crimes (crime_type, description, crime_date, crime_time, location, city, state, severity)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (crime_type, crime_desc, crime_date, crime_time, location, city, state, severity)
+        )
+        crime_id = cur.lastrowid
+
+        cur.execute(
+            """INSERT INTO victims (name, age, gender, address, phone)
+               VALUES (?, ?, ?, ?, ?)""",
+            (victim_name, victim_age, victim_gender, victim_address, victim_phone)
+        )
+        victim_id = cur.lastrowid
+
+        cur.execute(
+            """INSERT INTO FIR (fir_number, crime_id, victim_id, station_id, filing_date, description, aadhaar_hash, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending')""",
+            (fir_number, crime_id, victim_id, station_id, filing_date, fir_desc, aadhaar_hash)
+        )
+        conn.commit()
+
+        st = cur.execute("SELECT station_name FROM police_stations WHERE station_id = ?", (station_id,)).fetchone()
+        st_name = st['station_name'] if st else f"Station #{station_id}"
+        conn.close()
+
+        flash(f"First Information Report {fir_number} has been filed successfully at {st_name}!", "success")
+        return redirect(f"/fir/{fir_number}")
+
+    # GET: render FIR registration form
+    stations = conn.execute("SELECT station_id, station_name, city, state FROM police_stations ORDER BY station_name").fetchall()
+    suggested_station_id = officer_posting['station_id'] if officer_posting else (stations[0]['station_id'] if stations else None)
+    suggested_fir = _generate_fir_number(conn, suggested_station_id)
+
+    default_city = officer_posting['district'] if officer_posting else (stations[0]['city'] if stations else '')
+    default_state = officer_posting['state'] if officer_posting else (stations[0]['state'] if stations else '')
+    default_name = session.get('full_name', '') if role == 'Citizen' else ''
+
+    if role == 'Police' and officer_posting:
+        precinct_field = f"""
+        <input type="hidden" name="station_id" value="{officer_posting['station_id']}">
+        <div class="form-control bg-light fw-bold text-dark">
+            <i class="bi bi-shield-check text-primary me-1"></i> {escape(officer_posting['station_name'])}
+            <small class="text-muted ms-2">({escape(officer_posting['district'])}, {escape(officer_posting['state'])})</small>
+        </div>
+        <small class="text-muted">FIR will be recorded directly under your assigned police station precinct.</small>
+        """
+    else:
+        st_opts = "".join(f'<option value="{s["station_id"]}">{escape(s["station_name"])} &mdash; {escape(s["city"])}, {escape(s["state"])}</option>' for s in stations)
+        precinct_field = f"""
+        <select name="station_id" class="form-select" required>
+            <option value="" disabled selected>-- Select Police Station Jurisdiction --</option>
+            {st_opts}
+        </select>
+        <small class="text-muted">Select the police station precinct having jurisdiction over the occurrence location.</small>
+        """
+
+    crime_type_opts = "".join(f'<option value="{escape(c)}">{escape(c)}</option>' for c in CRIME_CATEGORIES)
+    today_str = datetime.date.today().isoformat()
+    conn.close()
+
+    body = f"""
+    <div class="container my-4" style="max-width: 940px;">
+        <div class="d-flex flex-wrap justify-content-between align-items-center mb-3 gap-2">
+            <div>
+                <span class="badge bg-secondary mb-1">Statutory Incident Registration</span>
+                <h2 style="color: #1f2937; font-family: 'Times New Roman', Times, serif; font-weight: bold; margin-bottom: 0.25rem;">
+                    <i class="bi bi-file-earmark-plus text-warning me-2"></i>File First Information Report (FIR)
+                </h2>
+                <p class="text-muted small mb-0">Statutory criminal incident filing portal under Criminal Procedure Code &amp; Bharatiya Nagarik Suraksha Sanhita.</p>
+            </div>
+            <a href="/fir-management" class="btn btn-outline-secondary btn-sm"><i class="bi bi-arrow-left"></i> FIR Management</a>
+        </div>
+
+        <form method="POST" action="/file-fir">
+            <!-- 1. JURISDICTION & REGISTRATION -->
+            <div class="card shadow-sm mb-4" style="border: 1px solid #D6cfc4;">
+                <div class="card-header bg-dark text-white d-flex justify-content-between align-items-center py-2 px-3">
+                    <span class="fw-bold"><i class="bi bi-building me-1 text-warning"></i> 1. Police Station Jurisdiction &amp; Filing Number</span>
+                    <span class="badge bg-secondary">Official Record</span>
+                </div>
+                <div class="card-body p-4">
+                    <div class="row g-3">
+                        <div class="col-md-6">
+                            <label class="form-label fw-semibold">Police Station Jurisdiction <span class="text-danger">*</span></label>
+                            {precinct_field}
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label fw-semibold">FIR Number <span class="text-danger">*</span></label>
+                            <input type="text" name="fir_number" value="{escape(suggested_fir)}" class="form-control font-monospace fw-bold" required>
+                            <small class="text-muted">Unique FIR reference number</small>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label fw-semibold">Filing Date <span class="text-danger">*</span></label>
+                            <input type="date" name="filing_date" value="{today_str}" class="form-control" required>
+                            <small class="text-muted">Date of registration</small>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 2. COMPLAINANT / VICTIM DETAILS -->
+            <div class="card shadow-sm mb-4" style="border: 1px solid #D6cfc4;">
+                <div class="card-header bg-dark text-white py-2 px-3">
+                    <span class="fw-bold"><i class="bi bi-person-fill me-1 text-warning"></i> 2. Complainant / Informant (Victim) Particulars</span>
+                </div>
+                <div class="card-body p-4">
+                    <div class="row g-3">
+                        <div class="col-md-6">
+                            <label class="form-label fw-semibold">Full Name of Informant / Victim <span class="text-danger">*</span></label>
+                            <input type="text" name="victim_name" value="{escape(default_name)}" class="form-control" placeholder="e.g. Ramesh Kumar" required>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label fw-semibold">Age</label>
+                            <input type="number" name="victim_age" min="1" max="120" class="form-control" placeholder="Age in years">
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label fw-semibold">Gender</label>
+                            <select name="victim_gender" class="form-select">
+                                <option value="Male">Male</option>
+                                <option value="Female">Female</option>
+                                <option value="Other">Other</option>
+                            </select>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label fw-semibold">Contact Phone Number</label>
+                            <input type="tel" name="victim_phone" class="form-control" placeholder="e.g. 9876543210">
+                        </div>
+                        <div class="col-md-8">
+                            <label class="form-label fw-semibold">Residential / Communication Address</label>
+                            <input type="text" name="victim_address" class="form-control" placeholder="Permanent or current residential address">
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 3. INCIDENT & OFFENCE PARTICULARS -->
+            <div class="card shadow-sm mb-4" style="border: 1px solid #D6cfc4;">
+                <div class="card-header bg-dark text-white py-2 px-3">
+                    <span class="fw-bold"><i class="bi bi-shield-slash-fill me-1 text-warning"></i> 3. Offence &amp; Incident Information</span>
+                </div>
+                <div class="card-body p-4">
+                    <div class="row g-3">
+                        <div class="col-md-6">
+                            <label class="form-label fw-semibold">Crime / Offence Category <span class="text-danger">*</span></label>
+                            <select name="crime_type" class="form-select" required>
+                                {crime_type_opts}
+                            </select>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label fw-semibold">Severity Classification</label>
+                            <select name="severity" class="form-select">
+                                <option value="Minor">Minor</option>
+                                <option value="Moderate" selected>Moderate</option>
+                                <option value="Major">Major</option>
+                                <option value="Critical">Critical</option>
+                            </select>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label fw-semibold">Date of Incident <span class="text-danger">*</span></label>
+                            <input type="date" name="crime_date" value="{today_str}" class="form-control" required>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label fw-semibold">Approx. Time</label>
+                            <input type="time" name="crime_time" class="form-control">
+                        </div>
+                        <div class="col-md-5">
+                            <label class="form-label fw-semibold">Specific Location / Landmark <span class="text-danger">*</span></label>
+                            <input type="text" name="location" class="form-control" placeholder="Premises, street name, or nearby landmark" required>
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label fw-semibold">City <span class="text-danger">*</span></label>
+                            <input type="text" name="city" value="{escape(default_city)}" class="form-control" required>
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label fw-semibold">State <span class="text-danger">*</span></label>
+                            <input type="text" name="state" value="{escape(default_state)}" class="form-control" required>
+                        </div>
+                        <div class="col-12">
+                            <label class="form-label fw-semibold">Incident Synopsis <span class="text-danger">*</span></label>
+                            <input type="text" name="crime_description" class="form-control" placeholder="Short one-line summary of what transpired" required>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 4. FORMAL STATEMENT OF FACTS -->
+            <div class="card shadow-sm mb-4" style="border: 1px solid #D6cfc4;">
+                <div class="card-header bg-dark text-white py-2 px-3">
+                    <span class="fw-bold"><i class="bi bi-file-earmark-text-fill me-1 text-warning"></i> 4. Formal Statement of Facts / Complaint</span>
+                </div>
+                <div class="card-body p-4">
+                    <div class="mb-2">
+                        <label class="form-label fw-semibold">Detailed Statement &amp; Narrative <span class="text-danger">*</span></label>
+                        <textarea name="fir_description" rows="5" class="form-control" placeholder="Describe the sequence of events chronologically. Mention known identities or descriptions of accused suspects, stolen valuables/money, witnesses, and damage or injuries sustained..." required></textarea>
+                    </div>
+                    <small class="text-muted">This statement forms the substantive basis of the official FIR registration.</small>
+                </div>
+            </div>
+
+            <!-- ACTION BUTTONS -->
+            <div class="d-flex justify-content-between align-items-center mb-5">
+                <a href="/fir-management" class="btn btn-outline-secondary">Cancel &amp; Return</a>
+                <button type="submit" class="btn btn-warning fw-bold px-4 py-2 shadow-sm">
+                    <i class="bi bi-check-circle-fill me-1"></i> Register &amp; File FIR
+                </button>
+            </div>
+        </form>
+    </div>
+    """
+    return render_page(body)
+
+
 @app.route('/fir-management/add', methods=['POST'])
 @roles_required(*ROLE_PERMISSIONS['add_fir'])
 def add_fir():
     conn = get_db_connection()
     cur = conn.cursor()
-    station_id = _resolve_station_id(conn, request.form['station_id'])
+    role = session.get('role')
+    if role == 'Police':
+        posting = get_officer_current_posting(conn, user_id=session.get('user_id'), email=session.get('email'))
+        station_id = posting['station_id'] if posting else session.get('police_station_id')
+    else:
+        station_id = _resolve_station_id(conn, request.form['station_id'])
+
     cur.execute("INSERT INTO crimes (crime_type, description, crime_date, crime_time, location, city, state, severity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (request.form['crime_type'], request.form['crime_description'], request.form['crime_date'], request.form.get('crime_time') or None,
                  request.form['location'], request.form['city'], request.form['state'], request.form['severity']))
@@ -3902,6 +5095,20 @@ def add_fir():
 @roles_required(*ROLE_PERMISSIONS['update_fir_status'])
 def update_fir_status(fir_id):
     conn = get_db_connection()
+    role = session.get('role')
+    if role == 'Police':
+        posting = get_officer_current_posting(conn, user_id=session.get('user_id'), email=session.get('email'))
+        officer_station_id = posting['station_id'] if posting else session.get('police_station_id')
+        fir = conn.execute("SELECT station_id FROM FIR WHERE fir_id = ?", (fir_id,)).fetchone()
+        if not fir or fir['station_id'] != officer_station_id:
+            conn.close()
+            return render_page('''
+            <div class="alert alert-danger py-3">
+                <h4 class="alert-heading fw-bold mb-1">403 — Unauthorized Station Access</h4>
+                <p class="mb-0">Access Denied: You cannot update FIR status for records belonging to another police station.</p>
+            </div>
+            <a href="/fir-management" class="btn btn-secondary mt-2">Return to FIR Management</a>
+            ''', 403)
     conn.execute("UPDATE FIR SET status = ? WHERE fir_id = ?", (request.form['status'], fir_id))
     conn.commit()
     conn.close()
@@ -3910,38 +5117,122 @@ def update_fir_status(fir_id):
 
 @app.route('/criminal-records')
 def criminal_records():
+    search_q = request.args.get('q', '').strip()
     conn = get_db_connection()
-    criminals = conn.execute("SELECT * FROM criminals ORDER BY criminal_id DESC").fetchall()
+    if search_q:
+        q_wild = f"%{search_q}%"
+        criminals = conn.execute("""
+            SELECT * FROM criminals 
+            WHERE name LIKE ? OR alias LIKE ? OR notice_reference LIKE ? OR identification_details LIKE ?
+            ORDER BY criminal_id ASC
+        """, (q_wild, q_wild, q_wild, q_wild)).fetchall()
+    else:
+        criminals = conn.execute("SELECT * FROM criminals ORDER BY criminal_id ASC").fetchall()
+
     arrest_context = conn.execute("""
         SELECT crime_head, SUM(persons_arrested) AS arrested, SUM(persons_convicted) AS convicted
         FROM arrest_statistics GROUP BY crime_head ORDER BY arrested DESC LIMIT 10
     """).fetchall() if _table_exists(conn, 'arrest_statistics') else []
     conn.close()
+
+    reset_btn = '<a href="/criminal-records" class="btn btn-outline-secondary">Reset</a>' if search_q else ''
     
-    criminals_html = "".join([f"""
-    <tr>
-        <td>#{cr['criminal_id']}</td>
-        <td class="fw-bold text-danger">{cr['name']}</td>
-        <td>{cr['alias'] or 'N/A'}</td>
-        <td>{cr['gender']}</td>
-        <td>{cr['identification_details'] or 'N/A'}</td>
-        <td><form method="POST" action="/criminal-records/{cr['criminal_id']}/status" class="d-flex gap-1"><select name="status" class="form-select form-select-sm">{_options_html(CRIMINAL_STATUSES, cr['status'])}</select><button class="btn btn-sm btn-outline-primary">Update</button></form></td>
-    </tr>
-    """ for cr in criminals]) or "<tr><td colspan='6' class='text-center text-muted py-4'>No individual criminal dossiers registered. View overall arrest numbers in <a href='/property-arrest-analytics'>Arrest Statistics</a>.</td></tr>"
+    criminals_html = ""
+    for cr_row in criminals:
+        cr = dict(cr_row)
+        view_url = cr.get('notice_dossier_url') or cr.get('cbi_source_url') or 'https://cbi.gov.in/interpol-red-notice'
+        view_btn = f'<a href="{escape(view_url)}" target="_blank" rel="noopener noreferrer" class="btn btn-sm btn-outline-primary py-0 px-2" style="font-size:0.75rem;" title="View Details">View</a>'
+        src_label = escape(cr.get('source') or 'Central Bureau of Investigation (cbi.gov.in)')
+        ref_label = escape(cr['notice_reference']) if cr.get('notice_reference') else (escape(cr['identification_details']) if cr.get('identification_details') else '—')
+        st_badge = 'bg-danger' if cr.get('status') == 'Wanted' else ('bg-success' if cr.get('status') == 'Arrested' else 'bg-secondary')
+
+        criminals_html += f"""
+        <tr>
+            <td class="text-muted fw-bold">{cr['criminal_id']}</td>
+            <td class="fw-semibold text-dark">{escape(cr['name'])}</td>
+            <td><span class="badge bg-light text-dark border">{ref_label}</span></td>
+            <td><span class="badge bg-light text-primary border">{src_label}</span></td>
+            <td><span class="badge {st_badge}">{escape(cr['status'])}</span></td>
+            <td style="white-space: nowrap;">
+                {view_btn}
+            </td>
+        </tr>
+        """
+    if not criminals_html:
+        criminals_html = "<tr><td colspan='6' class='text-center text-muted py-4'>CBI wanted-person data is currently unavailable for this search.</td></tr>"
+
     arrest_rows = "".join(f"<tr><td>{a['crime_head']}</td><td>{a['arrested']:,}</td><td>{a['convicted']:,}</td></tr>" for a in arrest_context) or "<tr><td colspan='3' class='text-center text-muted'>Run the dataset import to show arrest context.</td></tr>"
 
     body = f"""
-    <h2 class="text-secondary mb-3">Criminal Record Dossiers</h2>
-    <div class="card p-4 mb-4">
+    <div class="d-flex justify-content-between align-items-center mb-3">
+        <h2 style="color: #1f2937; font-family: 'Times New Roman', Times, serif; font-weight: bold;">Wanted Suspects &amp; Criminal Records</h2>
+        <span class="badge bg-secondary fs-6">{len(criminals)} Records</span>
+    </div>
+
+    <!-- Search Bar -->
+    <div class="card p-3 mb-4 shadow-sm" style="border: 1px solid #D6cfc4;">
+        <form method="GET" action="/criminal-records" class="row g-2 align-items-center">
+            <div class="col-md-9">
+                <input type="text" name="q" value="{escape(search_q)}" class="form-control" placeholder="Search wanted persons by name, notice reference...">
+            </div>
+            <div class="col-md-3 d-flex gap-2">
+                <button type="submit" class="btn btn-primary flex-grow-1">Search</button>
+                {reset_btn}
+            </div>
+        </form>
+    </div>
+
+    <div class="card mb-4 shadow-sm" style="border: 1px solid #D1D5DB;">
         <div class="table-responsive">
-            <table class="table table-dark table-hover align-middle">
-                <thead><tr><th>ID</th><th>Name</th><th>Alias</th><th>Gender</th><th>Identification Details</th><th>Status</th></tr></thead>
+            <table class="table table-hover align-middle mb-0" style="font-size: 0.85rem;">
+                <thead style="background-color: #F8FAFC;">
+                    <tr>
+                        <th style="width: 60px;">ID</th>
+                        <th>Name</th>
+                        <th>Notice Ref</th>
+                        <th>Source</th>
+                        <th>Status</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
                 <tbody>{criminals_html}</tbody>
             </table>
         </div>
     </div>
-    <div class="row g-4"><div class="col-lg-7"><div class="card p-4"><h4 class="text-info mb-3">NCRB Arrest Context</h4><div class="table-responsive"><table class="table table-dark table-hover"><thead><tr><th>Crime Head</th><th>Arrested</th><th>Convicted</th></tr></thead><tbody>{arrest_rows}</tbody></table></div></div></div>
-    <div class="col-lg-5"><div class="card p-4"><h4 class="text-info mb-3">Add Criminal Record</h4><form method="POST" action="/criminal-records/add"><input class="form-control mb-2" name="name" placeholder="Full name" required><input class="form-control mb-2" name="alias" placeholder="Alias"><div class="row g-2 mb-2"><div class="col"><input type="date" class="form-control" name="date_of_birth"></div><div class="col"><select class="form-select" name="gender"><option>Male</option><option>Female</option><option>Other</option></select></div></div><input class="form-control mb-2" name="address" placeholder="Address"><input class="form-control mb-2" name="phone" placeholder="Phone"><input class="form-control mb-2" name="identification_details" placeholder="Identification details"><select class="form-select mb-3" name="status">{_options_html(CRIMINAL_STATUSES, 'Wanted')}</select><button type="submit" class="btn btn-warning w-100">Add Criminal Record</button></form></div></div></div>
+
+    <div class="row g-4">
+        <div class="col-lg-7">
+            <div class="card p-4 shadow-sm" style="border: 1px solid #D1D5DB;">
+                <h5 class="fw-bold mb-3" style="color: #1f2937;">NCRB Arrest Context</h5>
+                <div class="table-responsive">
+                    <table class="table table-sm table-bordered">
+                        <thead style="background-color: #F8FAFC;">
+                            <tr><th>Crime Head</th><th>Arrested</th><th>Convicted</th></tr>
+                        </thead>
+                        <tbody>{arrest_rows}</tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        <div class="col-lg-5">
+            <div class="card p-4 shadow-sm" style="border: 1px solid #D1D5DB;">
+                <h5 class="fw-bold mb-3" style="color: #1f2937;">Register Departmental Record</h5>
+                <form method="POST" action="/criminal-records/add">
+                    <input class="form-control form-control-sm mb-2" name="name" placeholder="Full name" required>
+                    <input class="form-control form-control-sm mb-2" name="alias" placeholder="Alias">
+                    <div class="row g-2 mb-2">
+                        <div class="col"><input type="date" class="form-control form-control-sm" name="date_of_birth"></div>
+                        <div class="col"><select class="form-select form-select-sm" name="gender"><option>Male</option><option>Female</option><option>Other</option></select></div>
+                    </div>
+                    <input class="form-control form-control-sm mb-2" name="address" placeholder="Address">
+                    <input class="form-control form-control-sm mb-2" name="phone" placeholder="Phone">
+                    <input class="form-control form-control-sm mb-2" name="identification_details" placeholder="Identification / Case details">
+                    <select class="form-select form-select-sm mb-3" name="status">{_options_html(CRIMINAL_STATUSES, 'Wanted')}</select>
+                    <button type="submit" class="btn btn-warning btn-sm w-100 fw-semibold">Add Criminal Record</button>
+                </form>
+            </div>
+        </div>
+    </div>
     """
     return render_page(body)
 
@@ -4038,6 +5329,17 @@ def case_files():
     """
     reg_params = []
     reg_clauses = []
+    role = session.get('role')
+    officer_station_id = None
+    if role == 'Police':
+        posting = get_officer_current_posting(conn, user_id=session.get('user_id'), email=session.get('email'))
+        officer_station_id = posting['station_id'] if posting else session.get('police_station_id')
+        if officer_station_id:
+            reg_clauses.append("f.station_id = ?")
+            reg_params.append(officer_station_id)
+        else:
+            reg_clauses.append("1 = 0")
+
     if search_q:
         reg_clauses.append("(c.case_number LIKE ? OR f.fir_number LIKE ? OR cr.crime_type LIKE ? OR cr.city LIKE ? OR cr.state LIKE ?)")
         q_pat = f"%{search_q}%"
@@ -4145,15 +5447,6 @@ def case_files():
         <span class="badge bg-secondary fs-6">{len(combined_cases)} Total Cases</span>
     </div>
 
-    <!-- Data Classification & Source Distinction Banner -->
-    <div class="card mb-4 p-3 shadow-sm" style="background-color: #f9fafb; border-left: 4px solid #374151; border-color: #dee2e6;">
-        <h6 class="fw-bold mb-1" style="color: #1f2937;">Data Classification &amp; Authority Notice</h6>
-        <p class="small mb-0" style="color: #4b5563;">
-            &bull; <strong>Public CBI Cases:</strong> Individual Regular Cases (RCs) and public FIR records sourced from the Central Bureau of Investigation.<br>
-            &bull; <strong>Portal Registered Cases:</strong> Individual case files linked to verified departmental FIR registrations.<br>
-            &bull; <strong>Official NCRB Statistics:</strong> Aggregated annual crime statistics compiled at the national/state/district level (available in <a href="/fir-management" class="fw-bold" style="color: #1f2937; text-decoration: underline;">FIR Management</a> and <a href="/analytics" class="fw-bold" style="color: #1f2937; text-decoration: underline;">Analytics</a>).
-        </p>
-    </div>
 
     <!-- Search & Filter Bar -->
     <div class="card p-3 mb-4 shadow-sm" style="border: 1px solid #D6cfc4;">
@@ -4220,8 +5513,23 @@ def case_files():
 @roles_required(*ROLE_PERMISSIONS['add_case'])
 def add_case():
     conn = get_db_connection()
+    role = session.get('role')
+    fir_id = request.form['fir_id']
+    if role == 'Police':
+        posting = get_officer_current_posting(conn, user_id=session.get('user_id'), email=session.get('email'))
+        officer_station_id = posting['station_id'] if posting else session.get('police_station_id')
+        fir = conn.execute("SELECT station_id FROM FIR WHERE fir_id = ?", (fir_id,)).fetchone()
+        if not fir or fir['station_id'] != officer_station_id:
+            conn.close()
+            return render_page('''
+            <div class="alert alert-danger py-3">
+                <h4 class="alert-heading fw-bold mb-1">403 — Unauthorized Station Access</h4>
+                <p class="mb-0">Access Denied: You cannot create case files for FIRs registered outside your assigned police precinct.</p>
+            </div>
+            <a href="/case-files" class="btn btn-secondary mt-2">Return to Case Files</a>
+            ''', 403)
     conn.execute("INSERT INTO cases (case_number, fir_id, investigating_officer_id, priority, start_date, remarks) VALUES (?, ?, ?, ?, ?, ?)",
-                 (request.form['case_number'], request.form['fir_id'], request.form.get('investigating_officer_id') or None, request.form.get('priority', 'Medium'), request.form['start_date'], request.form.get('remarks')))
+                 (request.form['case_number'], fir_id, request.form.get('investigating_officer_id') or None, request.form.get('priority', 'Medium'), request.form['start_date'], request.form.get('remarks')))
     conn.commit()
     conn.close()
     return redirect('/case-files')
@@ -4231,6 +5539,20 @@ def add_case():
 @roles_required(*ROLE_PERMISSIONS['update_case_status'])
 def update_case_status(case_id):
     conn = get_db_connection()
+    role = session.get('role')
+    if role == 'Police':
+        posting = get_officer_current_posting(conn, user_id=session.get('user_id'), email=session.get('email'))
+        officer_station_id = posting['station_id'] if posting else session.get('police_station_id')
+        case_item = conn.execute("SELECT f.station_id FROM cases c JOIN FIR f ON c.fir_id = f.fir_id WHERE c.case_id = ?", (case_id,)).fetchone()
+        if not case_item or case_item['station_id'] != officer_station_id:
+            conn.close()
+            return render_page('''
+            <div class="alert alert-danger py-3">
+                <h4 class="alert-heading fw-bold mb-1">403 — Unauthorized Station Access</h4>
+                <p class="mb-0">Access Denied: You cannot update case status for cases belonging to another police station.</p>
+            </div>
+            <a href="/case-files" class="btn btn-secondary mt-2">Return to Case Files</a>
+            ''', 403)
     status = request.form['case_status']
     if status == 'Closed':
         conn.execute("UPDATE cases SET case_status = ?, closing_date = ? WHERE case_id = ?", (status, datetime.date.today().isoformat(), case_id))
@@ -4633,7 +5955,13 @@ def search_fir():
     if request.method == 'POST':
         fir_number = request.form.get('fir_number', '').strip()
         conn = get_db_connection()
-        fir = conn.execute("SELECT fir_number FROM FIR WHERE fir_number = ?", (fir_number,)).fetchone()
+        role = session.get('role')
+        if role == 'Police':
+            posting = get_officer_current_posting(conn, user_id=session.get('user_id'), email=session.get('email'))
+            officer_station_id = posting['station_id'] if posting else session.get('police_station_id')
+            fir = conn.execute("SELECT fir_number FROM FIR WHERE fir_number = ? AND station_id = ?", (fir_number, officer_station_id)).fetchone()
+        else:
+            fir = conn.execute("SELECT fir_number FROM FIR WHERE fir_number = ?", (fir_number,)).fetchone()
         conn.close()
         if fir:
             return redirect(url_for('fir_details', fir_number=fir['fir_number']))
@@ -4664,34 +5992,49 @@ def fir_details(fir_number):
         SELECT f.*, c.crime_type, c.description AS crime_desc,
                v.name AS victim_name, v.age AS victim_age, v.gender AS victim_gender,
                v.address AS victim_address, v.phone AS victim_phone,
-               s.station_name, s.station_address
+               s.station_name, s.address AS station_address
         FROM FIR f
         LEFT JOIN crimes c ON f.crime_id = c.crime_id
         LEFT JOIN victims v ON f.victim_id = v.victim_id
         LEFT JOIN police_stations s ON f.station_id = s.station_id
         WHERE f.fir_number = ?
     ''', (fir_number,)).fetchone()
-    conn.close()
     if not fir:
+        conn.close()
         return render_page('''
         <h3 class="text-danger">FIR not found in the available database.</h3>
         <a href="/search-fir" class="btn btn-primary mt-3">Search FIR</a>
         ''', 404)
-    details_html = f'''<h3 class="mb-4">FIR Details: {fir["fir_number"]}</h3>
+    role = session.get('role')
+    if role == 'Police':
+        posting = get_officer_current_posting(conn, user_id=session.get('user_id'), email=session.get('email'))
+        officer_station_id = posting['station_id'] if posting else session.get('police_station_id')
+        if fir['station_id'] != officer_station_id:
+            conn.close()
+            return render_page('''
+            <div class="alert alert-danger py-3">
+                <h4 class="alert-heading fw-bold mb-1">403 — Unauthorized Station Access</h4>
+                <p class="mb-0">Access Denied: You are not authorized to view or manage FIRs registered outside your assigned police station precinct.</p>
+            </div>
+            <a href="/dashboard/police" class="btn btn-secondary mt-2">Return to Dashboard</a>
+            ''', 403)
+    conn.close()
+    fir_dict = dict(fir)
+    details_html = f'''<h3 class="mb-4">FIR Details: {escape(fir_dict["fir_number"])}</h3>
     <table class="table table-bordered">
-        <tr><th>FIR Number</th><td>{fir["fir_number"]}</td></tr>
-        <tr><th>Filing Date</th><td>{fir["filing_date"]}</td></tr>
-        <tr><th>Status</th><td>{fir["status"]}</td></tr>
-        <tr><th>Crime Type</th><td>{fir.get("crime_type", "")}</td></tr>
-        <tr><th>Crime Description</th><td>{fir.get("crime_desc", "")}</td></tr>
-        <tr><th>Victim Name</th><td>{fir.get("victim_name", "")}</td></tr>
-        <tr><th>Victim Age</th><td>{fir.get("victim_age", "")}</td></tr>
-        <tr><th>Victim Gender</th><td>{fir.get("victim_gender", "")}</td></tr>
-        <tr><th>Victim Phone</th><td>{fir.get("victim_phone", "")}</td></tr>
-        <tr><th>Victim Address</th><td>{fir.get("victim_address", "")}</td></tr>
-        <tr><th>Police Station</th><td>{fir.get("station_name", "")}</td></tr>
-        <tr><th>Station Address</th><td>{fir.get("station_address", "")}</td></tr>
-        <tr><th>FIR Description</th><td>{fir.get("description", "")}</td></tr>
+        <tr><th>FIR Number</th><td>{escape(fir_dict["fir_number"])}</td></tr>
+        <tr><th>Filing Date</th><td>{escape(str(fir_dict.get("filing_date") or ""))}</td></tr>
+        <tr><th>Status</th><td>{escape(fir_dict.get("status") or "")}</td></tr>
+        <tr><th>Crime Type</th><td>{escape(fir_dict.get("crime_type") or "")}</td></tr>
+        <tr><th>Crime Description</th><td>{escape(fir_dict.get("crime_desc") or "")}</td></tr>
+        <tr><th>Victim Name</th><td>{escape(fir_dict.get("victim_name") or "")}</td></tr>
+        <tr><th>Victim Age</th><td>{escape(str(fir_dict.get("victim_age") or ""))}</td></tr>
+        <tr><th>Victim Gender</th><td>{escape(fir_dict.get("victim_gender") or "")}</td></tr>
+        <tr><th>Victim Phone</th><td>{escape(fir_dict.get("victim_phone") or "")}</td></tr>
+        <tr><th>Victim Address</th><td>{escape(fir_dict.get("victim_address") or "")}</td></tr>
+        <tr><th>Police Station</th><td>{escape(fir_dict.get("station_name") or "")}</td></tr>
+        <tr><th>Station Address</th><td>{escape(fir_dict.get("station_address") or "")}</td></tr>
+        <tr><th>FIR Description</th><td>{escape(fir_dict.get("description") or "")}</td></tr>
     </table>
     <a href="/search-fir" class="btn btn-secondary mt-3">Search Another FIR</a>
     '''
@@ -4701,13 +6044,21 @@ def fir_details(fir_number):
 @login_required
 def recent_firs():
     conn = get_db_connection()
-    firs = conn.execute("SELECT fir_number, filing_date FROM FIR ORDER BY filing_date DESC LIMIT 10").fetchall()
+    role = session.get('role')
+    if role == 'Police':
+        posting = get_officer_current_posting(conn, user_id=session.get('user_id'), email=session.get('email'))
+        officer_station_id = posting['station_id'] if posting else session.get('police_station_id')
+        firs = conn.execute("SELECT fir_number, filing_date FROM FIR WHERE station_id = ? ORDER BY filing_date DESC LIMIT 10", (officer_station_id,)).fetchall() if officer_station_id else []
+    else:
+        firs = conn.execute("SELECT fir_number, filing_date FROM FIR ORDER BY filing_date DESC LIMIT 10").fetchall()
     conn.close()
     rows = ''
     for f in firs:
+        fn = escape(f["fir_number"])
+        fd = escape(str(f["filing_date"]))
         rows += f'''<tr>
-            <td><a href="/fir/{{escape(f["fir_number"])}}">{{escape(f["fir_number"])}}</a></td>
-            <td>{{escape(f["filing_date"])}}</td>
+            <td><a href="/fir/{fn}">{fn}</a></td>
+            <td>{fd}</td>
         </tr>'''
     body = f'''<h3 class="mb-4">Recent FIRs</h3>
     <table class="table table-hover">

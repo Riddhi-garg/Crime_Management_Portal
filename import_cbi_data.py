@@ -9,7 +9,6 @@ Usage:
 
 import os
 import csv
-import json
 import sqlite3
 import re
 from datetime import datetime
@@ -140,9 +139,80 @@ def import_cbi_csv(conn: sqlite3.Connection, file_path: Path):
     return imported, updated, skipped
 
 
+def ensure_criminals_table(conn: sqlite3.Connection):
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(criminals)")
+    existing_cols = {row[1] for row in cur.fetchall()}
+    for col_name, col_def in [
+        ('notice_reference', 'TEXT'),
+        ('case_rc_number', 'TEXT'),
+        ('branch', 'TEXT'),
+        ('location', 'TEXT'),
+        ('source', "TEXT DEFAULT 'Central Bureau of Investigation (cbi.gov.in)'"),
+        ('cbi_source_url', 'TEXT'),
+        ('notice_dossier_url', 'TEXT'),
+        ('is_cbi_verified', 'INTEGER DEFAULT 0')
+    ]:
+        if col_name not in existing_cols:
+            cur.execute(f"ALTER TABLE criminals ADD COLUMN {col_name} {col_def}")
+    conn.commit()
+
+
+def import_cbi_wanted_csv(conn: sqlite3.Connection, file_path: Path):
+    """Imports genuine CBI wanted fugitive records from CSV into criminals table."""
+    ensure_criminals_table(conn)
+    imported = 0
+    updated = 0
+    with file_path.open('r', encoding='utf-8-sig', errors='ignore') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            name = (row.get('name') or '').strip()
+            if not name:
+                continue
+            alias = (row.get('alias') or '').strip() or None
+            ref = (row.get('notice_reference') or '').strip() or None
+            category = (row.get('category') or 'Interpol Red Notice').strip()
+            status = (row.get('status') or 'Wanted').strip()
+            source = (row.get('source') or 'Central Bureau of Investigation (cbi.gov.in)').strip()
+            cbi_url = (row.get('cbi_source_url') or 'https://cbi.gov.in/interpol-red-notice').strip()
+            dossier_url = (row.get('notice_dossier_url') or '').strip() or None
+
+            cur = conn.cursor()
+            cur.execute("SELECT criminal_id FROM criminals WHERE name = ? AND (notice_reference = ? OR (notice_reference IS NULL AND ? IS NULL))", (name, ref, ref))
+            existing = cur.fetchone()
+            if existing:
+                cur.execute("""
+                    UPDATE criminals SET
+                        alias = COALESCE(?, alias),
+                        source = ?,
+                        cbi_source_url = ?,
+                        notice_dossier_url = ?,
+                        is_cbi_verified = 1
+                    WHERE criminal_id = ?
+                """, (alias, source, cbi_url, dossier_url, existing[0]))
+                updated += 1
+            else:
+                cur.execute("""
+                    INSERT INTO criminals (
+                        name, alias, gender, identification_details, status,
+                        notice_reference, case_rc_number, branch, location,
+                        source, cbi_source_url, notice_dossier_url, is_cbi_verified
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    name, alias, 'Not specified by CBI',
+                    f"{category} Ref: {ref}" if ref else category,
+                    status, ref, None, None, None,
+                    source, cbi_url, dossier_url, 1
+                ))
+                imported += 1
+    conn.commit()
+    return imported, updated
+
+
 def sync_all_cbi_files(conn: sqlite3.Connection):
-    """Scans data/cbi/ and imports all files into cbi_firs."""
+    """Scans data/cbi/ and imports all files into cbi_firs and criminals."""
     ensure_cbi_table(conn)
+    ensure_criminals_table(conn)
     if not CBI_DIR.is_dir():
         return 0, 0, 0
     csv_files = [f for f in sorted(CBI_DIR.iterdir()) if f.is_file() and f.suffix.lower() == '.csv']
@@ -150,10 +220,15 @@ def sync_all_cbi_files(conn: sqlite3.Connection):
     total_updated = 0
     total_skipped = 0
     for file_path in csv_files:
-        imp, upd, skp = import_cbi_csv(conn, file_path)
-        total_imported += imp
-        total_updated += upd
-        total_skipped += skp
+        if 'wanted' in file_path.name.lower() or 'fugitive' in file_path.name.lower():
+            imp, upd = import_cbi_wanted_csv(conn, file_path)
+            total_imported += imp
+            total_updated += upd
+        else:
+            imp, upd, skp = import_cbi_csv(conn, file_path)
+            total_imported += imp
+            total_updated += upd
+            total_skipped += skp
     return len(csv_files), total_imported, total_updated
 
 
@@ -192,23 +267,30 @@ def main():
 
     total_new = 0
     total_upd = 0
+    ensure_criminals_table(conn)
     for cf in csv_files:
         print(f"\n[PROCESSING] {cf.name} ...")
-        imp, upd, skp = import_cbi_csv(conn, cf)
+        if 'wanted' in cf.name.lower() or 'fugitive' in cf.name.lower():
+            imp, upd = import_cbi_wanted_csv(conn, cf)
+            print(f"  → Wanted Fugitives Newly Imported: {imp} | Updated: {upd}")
+        else:
+            imp, upd, skp = import_cbi_csv(conn, cf)
+            print(f"  → Newly Imported: {imp} | Updated: {upd} | Skipped: {skp}")
         total_new += imp
         total_upd += upd
-        print(f"  → Newly Imported: {imp} | Updated: {upd} | Skipped: {skp}")
 
     total_in_db = conn.execute("SELECT COUNT(*) FROM cbi_firs").fetchone()[0]
+    total_wanted = conn.execute("SELECT COUNT(*) FROM criminals WHERE is_cbi_verified = 1").fetchone()[0]
     conn.close()
 
     print("\n" + "=" * 70)
     print("CBI INGESTION AUDIT REPORT")
     print("=" * 70)
-    print(f"Files Processed:           {len(csv_files)}")
-    print(f"Newly Imported Records:    {total_new}")
-    print(f"Updated Records:           {total_upd}")
-    print(f"Total Rows in cbi_firs:    {total_in_db}")
+    print(f"Files Processed:                {len(csv_files)}")
+    print(f"Newly Imported Records:         {total_new}")
+    print(f"Updated Records:                {total_upd}")
+    print(f"Total Rows in cbi_firs:         {total_in_db}")
+    print(f"Total CBI Wanted in criminals:  {total_wanted}")
     print("=" * 70)
 
 
