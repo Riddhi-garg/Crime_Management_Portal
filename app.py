@@ -6214,10 +6214,44 @@ def ncrb_browse():
     """Redirect legacy /ncrb-data endpoint to the new FIR Management System."""
     return redirect(url_for('fir_management', **request.args))
 
-if __name__ == '__main__':
-    init_db()
-    
+def ensure_port_available(port=5051):
+    """If port is occupied by an old stale process before initial launch, free it."""
+    if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+        return
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(0.5)
+        if sock.connect_ex(('127.0.0.1', port)) == 0:
+            import subprocess
+            try:
+                pids = subprocess.check_output(["lsof", "-t", f"-i:{port}"], stderr=subprocess.DEVNULL).decode().strip().split()
+                my_pid = str(os.getpid())
+                for p in pids:
+                    if p != my_pid:
+                        try:
+                            os.kill(int(p), 9)
+                        except OSError:
+                            pass
+                import time
+                time.sleep(0.5)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    finally:
+        sock.close()
 
-        
-    print("Starting Crime Management Portal (Kaggle/NCRB Version) on http://127.0.0.1:5051")
-    app.run(host='0.0.0.0', port=5051, debug=True)
+
+# Ensure database is initialized upon startup for both WSGI (Gunicorn) and direct execution
+try:
+    init_db()
+except Exception as e:
+    print(f"[WARN] Startup DB initialization notice: {e}")
+
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5051))
+    ensure_port_available(port)
+    print(f"Starting Crime Management Portal (Kaggle/NCRB Version) on http://127.0.0.1:{port}")
+    app.run(host='0.0.0.0', port=port, debug=True)

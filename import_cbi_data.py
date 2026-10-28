@@ -215,6 +215,10 @@ def sync_all_cbi_files(conn: sqlite3.Connection):
     ensure_criminals_table(conn)
     if not CBI_DIR.is_dir():
         return 0, 0, 0
+    cbi_count = conn.execute("SELECT COUNT(*) FROM cbi_firs").fetchone()[0]
+    crim_count = conn.execute("SELECT COUNT(*) FROM criminals WHERE is_cbi_verified = 1").fetchone()[0]
+    if cbi_count > 0 and crim_count > 0:
+        return 0, 0, 0
     csv_files = [f for f in sorted(CBI_DIR.iterdir()) if f.is_file() and f.suffix.lower() == '.csv']
     total_imported = 0
     total_updated = 0

@@ -131,14 +131,16 @@ def sync_ncrb_csvs(conn: sqlite3.Connection):
         return 0, 0
     ensure_table(conn)
     csv_files = [f for f in sorted(NCRB_DIR.iterdir()) if f.is_file() and f.suffix.lower() == '.csv']
+    existing_files = {row[0] for row in conn.execute("SELECT DISTINCT source_file FROM ncrb_raw_data").fetchall()}
+    new_files = [f for f in csv_files if f.name not in existing_files]
     total_new = 0
-    for csv_path in csv_files:
+    for csv_path in new_files:
         imported, _, _, _, _, _ = import_file(conn, csv_path)
         total_new += imported
-    # Ensure all table_name values match TABLE_NAME_MAP
-    for sf, tname in TABLE_NAME_MAP.items():
-        conn.execute("UPDATE ncrb_raw_data SET table_name = ? WHERE source_file = ? AND (table_name IS NULL OR table_name != ?)", (tname, sf, tname))
-    conn.commit()
+    if new_files:
+        for sf, tname in TABLE_NAME_MAP.items():
+            conn.execute("UPDATE ncrb_raw_data SET table_name = ? WHERE source_file = ? AND (table_name IS NULL OR table_name != ?)", (tname, sf, tname))
+        conn.commit()
     return len(csv_files), total_new
 
 
